@@ -8,10 +8,14 @@ Windows側 Ollama (localhost:11434) に接続し、ツール(ファイル読み�
 """
 import json
 import os
+import re
 import subprocess
 import threading
-import urllib.request
 import urllib.error
+import urllib.parse
+import urllib.request
+from html import unescape
+from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -28,7 +32,8 @@ SYSTEM_PROMPT = """You are LocalCoder, an autonomous coding agent running on the
 Workspace directory: {ws}
 
 Rules:
-- You have tools: run_command, read_file, write_file, list_dir. Use them freely without asking permission.
+- You have tools: run_command, read_file, write_file, list_dir, web_search, fetch_url. Use them freely without asking permission.
+- When you need up-to-date information (library usage, API docs, error messages, versions), use web_search first, then fetch_url on the most promising result. Prefer official documentation.
 - Inspect existing files before editing them. Never overwrite a file you have not read.
 - After making changes, VERIFY them by running the code, build, or tests with run_command.
 - Keep working autonomously until the task is fully done; do not stop to ask for confirmation.
@@ -62,7 +67,87 @@ TOOLS = [
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string", "description": "Directory path, default is workspace root"}},
             "required": []}}},
+    {"type": "function", "function": {
+        "name": "web_search",
+        "description": "Search the web (DuckDuckGo). Returns titles, URLs and snippets. Use for documentation, error messages, library usage, current versions.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "Search query"},
+            "max_results": {"type": "integer", "description": "Number of results, default 6"}},
+            "required": ["query"]}}},
+    {"type": "function", "function": {
+        "name": "fetch_url",
+        "description": "Download a web page and return its readable text content (HTML tags stripped). Use after web_search to read a promising result.",
+        "parameters": {"type": "object", "properties": {
+            "url": {"type": "string", "description": "Full URL starting with http:// or https://"}},
+            "required": ["url"]}}},
 ]
+
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+
+
+def http_get(url: str, timeout: int = 25) -> str:
+    req = urllib.request.Request(url, headers={"User-Agent": UA,
+                                               "Accept-Language": "ja,en;q=0.8"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        ctype = r.headers.get("Content-Type", "")
+        data = r.read(2_000_000)
+    m = re.search(r"charset=([\w-]+)", ctype)
+    return data.decode(m.group(1) if m else "utf-8", errors="replace")
+
+
+def web_search(query: str, max_results: int = 6) -> str:
+    html_text = http_get("https://html.duckduckgo.com/html/?q="
+                         + urllib.parse.quote(query))
+    titles = re.findall(
+        r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
+        html_text, re.S)
+    snippets = re.findall(
+        r'class="result__snippet"[^>]*>(.*?)</a>', html_text, re.S)
+    out = []
+    for i, (href, title) in enumerate(titles[:max_results]):
+        um = re.search(r"[?&]uddg=([^&]+)", href)
+        if um:
+            href = urllib.parse.unquote(um.group(1))
+        title = unescape(re.sub(r"<[^>]+>", "", title)).strip()
+        snip = ""
+        if i < len(snippets):
+            snip = unescape(re.sub(r"<[^>]+>", "", snippets[i])).strip()
+        out.append(f"{i + 1}. {title}\n   {href}\n   {snip}")
+    return "\n".join(out) if out else "(no results)"
+
+
+class _TextExtract(HTMLParser):
+    SKIP = {"script", "style", "noscript", "svg", "head"}
+
+    def __init__(self):
+        super().__init__()
+        self.depth = 0
+        self.parts = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.SKIP:
+            self.depth += 1
+
+    def handle_endtag(self, tag):
+        if tag in self.SKIP and self.depth:
+            self.depth -= 1
+
+    def handle_data(self, d):
+        if not self.depth and d.strip():
+            self.parts.append(d.strip())
+
+
+def fetch_url_text(url: str) -> str:
+    if not url.startswith(("http://", "https://")):
+        return "ERROR: URL must start with http:// or https://"
+    html_text = http_get(url)
+    p = _TextExtract()
+    p.feed(html_text)
+    text = "\n".join(p.parts)
+    if len(text) > 10000:
+        text = text[:10000] + "\n...[truncated]..."
+    return text or "(no readable text on this page)"
 
 
 def resolve_path(ws: Path, p: str) -> Path:
@@ -98,6 +183,10 @@ def exec_tool(name: str, args: dict, ws: Path) -> str:
             f = resolve_path(ws, args.get("path") or ".")
             items = sorted(e.name + ("/" if e.is_dir() else "") for e in f.iterdir())
             return "\n".join(items)[:8000] or "(empty)"
+        if name == "web_search":
+            return web_search(args["query"], int(args.get("max_results") or 6))
+        if name == "fetch_url":
+            return fetch_url_text(args["url"])
         return f"ERROR: unknown tool {name}"
     except subprocess.TimeoutExpired:
         return f"ERROR: command timed out ({CMD_TIMEOUT}s)"
