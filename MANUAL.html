@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>LocalCoder 操作マニュアル</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body{font-family:"Segoe UI","Yu Gothic UI","Hiragino Sans",sans-serif;
+  max-width:860px;margin:0 auto;padding:24px 20px 80px;line-height:1.8;color:#2a2d35;background:#fafafa}
+h1{color:#d65a2e;border-bottom:3px solid #d65a2e;padding-bottom:8px;font-size:26px}
+h2{color:#1f3a5f;border-left:6px solid #d65a2e;padding-left:10px;margin-top:44px;font-size:20px}
+h3{color:#1f3a5f;font-size:16px;margin-top:28px}
+code,kbd{background:#eceef2;border-radius:4px;padding:1px 6px;font-size:0.92em}
+kbd{border:1px solid #c5c9d3;border-bottom-width:2px}
+pre{background:#23262e;color:#e6e8ef;padding:14px;border-radius:8px;overflow-x:auto;font-size:13px;line-height:1.5}
+table{border-collapse:collapse;width:100%;margin:12px 0;background:#fff}
+th,td{border:1px solid #d5d8e0;padding:8px 12px;text-align:left;font-size:14px}
+th{background:#eef1f6}
+.tip{background:#e8f5ee;border-left:5px solid #3aa76d;padding:10px 14px;border-radius:0 8px 8px 0;margin:14px 0}
+.warn{background:#fdf0e7;border-left:5px solid #d65a2e;padding:10px 14px;border-radius:0 8px 8px 0;margin:14px 0}
+.screen{background:#12141a;border-radius:10px;padding:14px;color:#e6e8ef;font-size:13px;margin:16px 0;
+  box-shadow:0 4px 14px rgba(0,0,0,.25)}
+.screen .bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;background:#1b1e27;
+  padding:8px 10px;border-radius:8px;margin-bottom:10px}
+.screen .bar b{color:#e8734a}
+.screen .chip{background:#232733;border:1px solid #2e3342;border-radius:6px;padding:3px 8px;font-size:12px}
+.screen .stop{border-color:#e05b5b;color:#e05b5b}
+.screen .u{background:#2a3550;border:1px solid #3a4a70;border-radius:8px;padding:8px 12px;
+  margin:8px 0 8px auto;width:fit-content;max-width:75%}
+.screen .a{background:#1b1e27;border:1px solid #2e3342;border-radius:8px;padding:8px 12px;
+  margin:8px auto 8px 0;width:fit-content;max-width:75%}
+.screen .t{color:#4ac28b;background:#232733;border:1px solid #2e3342;border-radius:8px;
+  padding:6px 12px;margin:8px auto 8px 0;width:fit-content;font-size:12px}
+.screen .in{background:#232733;border:1px solid #2e3342;border-radius:8px;padding:8px 12px;
+  margin-top:10px;color:#8b91a3;display:flex;justify-content:space-between}
+.screen .send{background:#e8734a;color:#fff;border-radius:6px;padding:2px 14px}
+.num{display:inline-block;background:#d65a2e;color:#fff;border-radius:50%;width:22px;height:22px;
+  text-align:center;line-height:22px;font-size:13px;font-weight:700;margin-right:6px}
+footer{margin-top:60px;color:#8b91a3;font-size:12px;border-top:1px solid #d5d8e0;padding-top:12px}
+</style>
+</head>
+<body>
+
+<h1>🛠 LocalCoder 操作マニュアル</h1>
+<p>
+LocalCoder（ローカルコーダー）は、<b>あなたのPCの中だけで動くAIプログラミングアシスタント</b>です。
+チャットで「○○を作って」と頼むと、AIが自動でファイルを作り、プログラムを書き、
+実行して動作確認までしてくれます。
+インターネット上のAIサービス（ChatGPTやClaude）は使わないので、
+<b>利用料はかからず、コードが外部に送られることもありません</b>。
+</p>
+
+<h2>1. 起動する</h2>
+<p>
+デスクトップの <b>LocalCoder.bat</b> をダブルクリックするだけです。
+数秒待つと、専用ウィンドウでチャット画面が開きます。
+</p>
+<div class="warn">
+<b>⚠ 初回や久しぶりに使うとき</b>：最初の返事が来るまで1〜3分かかることがあります。
+これはAIモデル（数GB〜十数GB）をメモリに読み込んでいる時間です。2回目以降は速くなります。
+</div>
+<div class="tip">
+<b>💡 うまく開かないとき</b>：黒い小さなウィンドウ（サーバー）が最小化で起動しています。
+そのまま10秒ほど待ってから、開いた画面で <kbd>F5</kbd>（再読み込み）を押してください。
+</div>
+
+<h2>2. 画面の見方</h2>
+<div class="screen">
+  <div class="bar"><b>🛠 LocalCoder</b>
+    <span class="chip">モデル: gpt-oss:20b ▼</span>
+    <span class="chip">作業フォルダ: /home/fuyuki/pico_dvl/codex</span>
+    <span class="chip">🗑 新規チャット</span>
+    <span class="chip stop">■ 停止</span>
+  </div>
+  <div class="u">電卓プログラムをPythonで作って、テストもして</div>
+  <div class="t">🔧 write_file — calc.py ▸（クリックで詳細）</div>
+  <div class="t">🔧 run_command — python3 calc.py ▸</div>
+  <div class="a">calc.py を作成し、実行して動作を確認しました。四則演算が正しく…</div>
+  <div class="in"><span>やりたいことを日本語で入力…</span><span class="send">送信</span></div>
+</div>
+
+<table>
+<tr><th>部品</th><th>説明</th></tr>
+<tr><td><b>モデル</b></td><td>使うAIの種類。ふだんは <code>gpt-oss:20b</code> のままでOK（→ 5章）</td></tr>
+<tr><td><b>作業フォルダ</b></td><td>AIが作業する場所。<b>ここで指定したフォルダの中しか触れません</b>。
+例：<code>/home/fuyuki/pico_dvl/codex</code>（WSLの中のパスで書きます）</td></tr>
+<tr><td><b>🗑 新規チャット</b></td><td>会話をリセットして最初から。話題を変えるときに押すとAIの調子が良くなります</td></tr>
+<tr><td><b>■ 停止</b></td><td>AIの作業を途中で止めます（暴走したり長すぎるとき用）</td></tr>
+<tr><td><b>🔧 緑のカード</b></td><td>AIが実際に行った操作（ファイル作成・コマンド実行など）。
+クリックすると中身（実行したコマンドや結果）が見られます</td></tr>
+<tr><td><b>灰色の薄い文字</b></td><td>AIの「考え中」の思考メモ。読まなくてOK</td></tr>
+</table>
+
+<h2>3. 基本的な使い方</h2>
+<p>
+<span class="num">1</span>作業フォルダを確認する（新しいプロジェクトなら先に「○○というフォルダを作って、そこで作業して」と頼んでもOK）<br>
+<span class="num">2</span>下の入力欄に、やりたいことを日本語で書く<br>
+<span class="num">3</span><kbd>Enter</kbd> で送信（改行したいときは <kbd>Shift</kbd>+<kbd>Enter</kbd>）<br>
+<span class="num">4</span>あとは見ているだけ。AIがファイルを作り、実行し、エラーが出たら自分で直します<br>
+<span class="num">5</span>最後に日本語でまとめの報告が来ます。続けて「ここを直して」と追加注文もできます
+</p>
+<div class="warn">
+<b>⚠ 確認なしで実行されます</b>：LocalCoderは承認なしの全自動で動く設計です。
+大事なファイルがあるフォルダを作業フォルダにするときは、先にバックアップを取るか、
+gitで管理されているフォルダを使ってください。
+</div>
+
+<h2>4. 上手な頼み方のコツ</h2>
+<p>ローカルAIはChatGPTやClaudeより小さい頭脳なので、頼み方で結果が大きく変わります。</p>
+<table>
+<tr><th>❌ うまくいきにくい</th><th>⭕ うまくいきやすい</th></tr>
+<tr><td>「ゲームを作って」</td><td>「Pythonで数当てゲームを作って。1〜100の乱数を当てる。ヒントで大きい/小さいと表示。作ったら実行して確認して」</td></tr>
+<tr><td>一度に大きな注文</td><td>小分けに注文：「まず画面表示だけ」→「次に得点計算を追加」→「最後に保存機能」</td></tr>
+<tr><td>ずっと同じチャットで別の話題</td><td>話題が変わったら「🗑 新規チャット」を押してから頼む</td></tr>
+<tr><td>失敗した指示をそのまま再送</td><td>「calc.pyの割り算がゼロ除算でエラーになる。直して」のように具体的に指摘</td></tr>
+</table>
+<div class="tip">
+<b>💡 魔法の一言</b>：頼みごとの最後に「<b>作ったら実行して動作確認して</b>」と付けると、
+AIが自分でテストしてエラーを直してから報告してくれます。
+</div>
+
+<h2>5. AIモデルの選び方</h2>
+<table>
+<tr><th>モデル</th><th>特徴</th><th>使いどころ</th></tr>
+<tr><td><code>gpt-oss:20b</code> ★推奨</td><td>賢さと速さのバランスが良く、道具の使い方が確実</td><td>ふだんの開発全般</td></tr>
+<tr><td><code>glm-4.7-flash</code></td><td>より賢いが、このPCでは動作が遅い</td><td>難しい問題でじっくり待てるとき</td></tr>
+<tr><td><code>qwen3:8b</code></td><td>軽くて速いが単純作業向け</td><td>ちょっとしたファイル整理など</td></tr>
+</table>
+<p>その他のモデルも一覧に出ますが、道具（ファイル操作）をうまく使えないものもあります。
+🔧カードが一度も出ずに口だけで「やりました」と言うモデルは向いていません。</p>
+
+<h2>6. 終了する</h2>
+<p>
+チャットウィンドウは <b>✕で閉じるだけ</b>でOKです。<br>
+裏で動いているサーバー（最小化された「LocalCoder Server」ウィンドウ）も止めたい場合は、
+タスクバーからそのウィンドウを開いて✕で閉じてください。
+付けっぱなしでも害はありません（メモリはほぼ使いません）。
+</p>
+
+<h2>7. 困ったときは</h2>
+<table>
+<tr><th>症状</th><th>対処</th></tr>
+<tr><td>画面が開くがモデル一覧が空／「Ollamaに接続できません」</td>
+<td>Ollamaが起動していません。スタートメニューから「Ollama」を起動してから <kbd>F5</kbd></td></tr>
+<tr><td>「サーバに接続できません」と出る</td>
+<td>LocalCoder.bat をもう一度ダブルクリック → 10秒待って <kbd>F5</kbd></td></tr>
+<tr><td>返事が全然来ない</td>
+<td>初回はモデル読み込みで1〜3分かかります。3分以上無反応なら「■停止」→再送信</td></tr>
+<tr><td>「ワークスペースが存在しません」</td>
+<td>作業フォルダの綴りを確認。WSL内のパス（<code>/home/fuyuki/…</code>）で指定します</td></tr>
+<tr><td>AIが同じ失敗を繰り返す・変な出力を続ける</td>
+<td>「■停止」→「🗑新規チャット」→ 頼み方をより具体的にして再挑戦（→ 4章）</td></tr>
+<tr><td>「最大ループ回数に達しました」</td>
+<td>注文が大きすぎます。小分けにして順番に頼んでください</td></tr>
+<tr><td>作った覚えのない変更がある</td>
+<td>🔧カードを開くと全操作の記録が残っています。gitフォルダなら <code>git diff</code> を「見せて」と頼めば変更内容を説明してくれます</td></tr>
+</table>
+
+<h2>8. 仕組み（ざっくり）</h2>
+<p>
+頭脳は Windows側の <b>Ollama</b>（ローカルAI実行ソフト）、
+手足は WSL内の小さなプログラム（<code>~/localcoder/server.py</code>）です。
+チャット画面から注文を受けると、AIに「ファイル読み書き・コマンド実行の道具を貸すから
+自分でやりなさい」と伝え、AIが道具を使うたびに実行して結果を返す…を
+タスク完了まで自動で繰り返しています。全部あなたのPCの中で完結しています。
+</p>
+
+<h2>9. 関連ファイル</h2>
+<table>
+<tr><th>ファイル</th><th>内容</th></tr>
+<tr><td><code>E:\desktop\LocalCoder.bat</code></td><td>起動用アイコン（これをダブルクリック）</td></tr>
+<tr><td><code>\\wsl.localhost\ubuntu-24.04\home\fuyuki\localcoder\</code></td><td>本体一式（エクスプローラーでこのまま開けます）</td></tr>
+<tr><td>　├ <code>server.py</code> / <code>index.html</code></td><td>プログラム本体と画面</td></tr>
+<tr><td>　├ <code>MANUAL.html</code></td><td>このマニュアル</td></tr>
+<tr><td>　├ <code>REBUILD.md</code></td><td>別PCへの移植手順書（AIに渡せば同じ環境を再構築できます）</td></tr>
+<tr><td>　└ <code>README.md</code></td><td>開発者向けの簡易説明</td></tr>
+</table>
+
+<footer>LocalCoder 操作マニュアル — 2026-07-02 作成 / 対象環境: Windows 11 + WSL2 (ubuntu-24.04) + Ollama 0.20.2 + RTX 3070</footer>
+</body>
+</html>

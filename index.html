@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>LocalCoder — ローカルLLMコーディングエージェント</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root{
+  --bg:#12141a; --panel:#1b1e27; --panel2:#232733; --border:#2e3342;
+  --text:#e6e8ef; --dim:#8b91a3; --accent:#e8734a; --green:#4ac28b; --red:#e05b5b;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);
+  font-family:"Segoe UI","Yu Gothic UI",sans-serif;height:100vh;display:flex;flex-direction:column}
+header{display:flex;gap:10px;align-items:center;padding:10px 16px;
+  background:var(--panel);border-bottom:1px solid var(--border);flex-wrap:wrap}
+header h1{font-size:16px;margin:0 8px 0 0;color:var(--accent)}
+label{font-size:12px;color:var(--dim)}
+select,input[type=text]{background:var(--panel2);color:var(--text);border:1px solid var(--border);
+  border-radius:6px;padding:6px 8px;font-size:13px}
+#workspace{width:320px}
+button{background:var(--panel2);color:var(--text);border:1px solid var(--border);
+  border-radius:6px;padding:6px 14px;font-size:13px;cursor:pointer}
+button:hover{border-color:var(--accent)}
+#stopBtn{display:none;border-color:var(--red);color:var(--red)}
+#status{font-size:12px;color:var(--dim);margin-left:auto}
+#chat{flex:1;overflow-y:auto;padding:18px;display:flex;flex-direction:column;gap:12px}
+.msg{max-width:860px;padding:10px 14px;border-radius:10px;line-height:1.55;
+  white-space:pre-wrap;word-break:break-word;font-size:14px}
+.user{align-self:flex-end;background:#2a3550;border:1px solid #3a4a70}
+.assistant{align-self:flex-start;background:var(--panel);border:1px solid var(--border)}
+.assistant.md{white-space:normal}
+.assistant.md pre{background:#0d0f14;padding:10px;border-radius:8px;overflow-x:auto;font-size:13px}
+.assistant.md code{background:#0d0f14;padding:1px 5px;border-radius:4px;font-size:13px}
+.think{align-self:flex-start;color:var(--dim);font-size:12px;max-width:860px;
+  border-left:3px solid var(--border);padding:4px 10px;white-space:pre-wrap}
+details.tool{align-self:flex-start;max-width:860px;width:fit-content;background:var(--panel2);
+  border:1px solid var(--border);border-radius:8px;padding:6px 10px;font-size:13px}
+details.tool summary{cursor:pointer;color:var(--green)}
+details.tool pre{background:#0d0f14;padding:8px;border-radius:6px;overflow-x:auto;
+  max-height:260px;font-size:12px;white-space:pre-wrap}
+.err{align-self:center;color:var(--red);font-size:13px}
+footer{display:flex;gap:10px;padding:12px 16px;background:var(--panel);border-top:1px solid var(--border)}
+#input{flex:1;background:var(--panel2);color:var(--text);border:1px solid var(--border);
+  border-radius:8px;padding:10px;font-size:14px;resize:none;font-family:inherit;min-height:44px;max-height:200px}
+#sendBtn{background:var(--accent);color:#fff;border:none;padding:0 22px;font-weight:600}
+.spin{display:inline-block;width:12px;height:12px;border:2px solid var(--dim);
+  border-top-color:var(--accent);border-radius:50%;animation:sp 1s linear infinite;vertical-align:-2px}
+@keyframes sp{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<header>
+  <h1>🛠 LocalCoder</h1>
+  <label>モデル <select id="model"></select></label>
+  <label>作業フォルダ <input type="text" id="workspace" value="/home/fuyuki/pico_dvl/codex"></label>
+  <button id="newBtn">🗑 新規チャット</button>
+  <button id="stopBtn">■ 停止</button>
+  <span id="status"></span>
+</header>
+<div id="chat"></div>
+<footer>
+  <textarea id="input" placeholder="やりたいことを日本語で入力 (Shift+Enterで改行 / Enterで送信)"></textarea>
+  <button id="sendBtn">送信</button>
+</footer>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script>
+const $=id=>document.getElementById(id);
+const chat=$("chat"), input=$("input"), status=$("status");
+const sid=Math.random().toString(36).slice(2);
+let history=[];      // サーバに渡す完全な会話履歴(tool呼び出し含む)
+let running=false;
+
+function el(tag,cls,text){const e=document.createElement(tag);if(cls)e.className=cls;if(text!==undefined)e.textContent=text;chat.appendChild(e);scroll();return e}
+function scroll(){chat.scrollTop=chat.scrollHeight}
+function md(e,text){
+  if(window.marked){e.classList.add("md");e.innerHTML=marked.parse(text)}
+  else e.textContent=text;
+}
+function setRunning(v){
+  running=v;
+  $("sendBtn").disabled=v;
+  $("stopBtn").style.display=v?"":"none";
+  status.innerHTML=v?'<span class="spin"></span> 実行中…':"";
+}
+
+async function loadModels(){
+  try{
+    const r=await fetch("/api/models"); const d=await r.json();
+    if(d.error){el("div","err",d.error);return}
+    const sel=$("model"); sel.innerHTML="";
+    for(const m of d.models){const o=document.createElement("option");o.value=o.textContent=m;sel.appendChild(o)}
+    const pref=["gpt-oss:20b","glm-4.7-flash:latest","qwen3:8b"];
+    for(const p of pref){if(d.models.includes(p)){sel.value=p;break}}
+  }catch(e){el("div","err","サーバに接続できません: "+e)}
+}
+
+async function send(){
+  const text=input.value.trim();
+  if(!text||running)return;
+  input.value="";
+  el("div","msg user",text);
+  history.push({role:"user",content:text});
+  setRunning(true);
+
+  let curAssistant=null, curThink=null, curText="";
+  try{
+    const resp=await fetch("/api/chat",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({sid,model:$("model").value,workspace:$("workspace").value,messages:history})});
+    const reader=resp.body.getReader(); const dec=new TextDecoder(); let buf="";
+    while(true){
+      const {done,value}=await reader.read();
+      if(done)break;
+      buf+=dec.decode(value,{stream:true});
+      let i;
+      while((i=buf.indexOf("\n\n"))>=0){
+        const line=buf.slice(0,i).trim(); buf=buf.slice(i+2);
+        if(!line.startsWith("data:"))continue;
+        const ev=JSON.parse(line.slice(5));
+        handle(ev);
+      }
+    }
+  }catch(e){el("div","err","通信エラー: "+e)}
+  setRunning(false);
+
+  function handle(ev){
+    if(ev.type==="think"){
+      if(!curThink)curThink=el("div","think","");
+      curThink.textContent+=ev.text; scroll();
+    }else if(ev.type==="token"){
+      curThink=null;
+      if(!curAssistant){curAssistant=el("div","msg assistant","");curText=""}
+      curText+=ev.text; curAssistant.textContent=curText; scroll();
+    }else if(ev.type==="turn_done"){
+      if(curAssistant)md(curAssistant,curText);
+      curAssistant=null; curThink=null; scroll();
+    }else if(ev.type==="tool_start"){
+      const d=document.createElement("details"); d.className="tool"; d.dataset.name=ev.name;
+      const argstr=ev.name==="run_command"?(ev.args.command||""):(ev.args.path||JSON.stringify(ev.args));
+      d.innerHTML="<summary>🔧 "+ev.name+" — <code></code> <span class='spin'></span></summary><pre>実行中…</pre>";
+      d.querySelector("code").textContent=argstr.slice(0,120);
+      chat.appendChild(d); scroll();
+    }else if(ev.type==="tool_end"){
+      const tools=chat.querySelectorAll("details.tool");
+      const d=tools[tools.length-1];
+      if(d){d.querySelector(".spin")?.remove(); d.querySelector("pre").textContent=ev.result}
+      scroll();
+    }else if(ev.type==="history"){
+      history=ev.messages;
+    }else if(ev.type==="error"){
+      el("div","err","⚠ "+ev.message);
+    }
+  }
+}
+
+$("sendBtn").onclick=send;
+input.addEventListener("keydown",e=>{
+  if(e.key==="Enter"&&!e.shiftKey&&!e.isComposing){e.preventDefault();send()}
+});
+$("stopBtn").onclick=()=>fetch("/api/stop",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sid})});
+$("newBtn").onclick=()=>{history=[];chat.innerHTML="";};
+loadModels();
+</script>
+</body>
+</html>
