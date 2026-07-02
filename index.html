@@ -116,7 +116,7 @@ function toolCard(name,argstr,live){
 function setRunning(v){
   running=v;
   $("sendBtn").disabled=v;
-  $("stopBtn").style.display=v?"":"none";
+  $("stopBtn").style.display=v?"inline-block":"none";
   status.innerHTML=v?'<span class="spin"></span> 実行中…':"";
 }
 
