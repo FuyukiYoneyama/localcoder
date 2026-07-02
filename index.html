@@ -24,6 +24,21 @@ button{background:var(--panel2);color:var(--text);border:1px solid var(--border)
 button:hover{border-color:var(--accent)}
 #stopBtn{display:none;border-color:var(--red);color:var(--red)}
 #status{font-size:12px;color:var(--dim);margin-left:auto}
+#layout{flex:1;display:flex;min-height:0}
+#side{width:230px;flex-shrink:0;background:var(--panel);border-right:1px solid var(--border);
+  overflow-y:auto;display:flex;flex-direction:column}
+#sideHead{padding:10px 12px;font-size:12px;color:var(--dim);border-bottom:1px solid var(--border);
+  position:sticky;top:0;background:var(--panel)}
+.sess{padding:8px 10px;border-bottom:1px solid var(--border);cursor:pointer;font-size:13px;
+  display:flex;gap:6px;align-items:flex-start}
+.sess:hover{background:var(--panel2)}
+.sess.active{background:var(--panel2);box-shadow:inset 3px 0 0 var(--accent)}
+.sess .body{flex:1;min-width:0}
+.sess .st{overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;line-height:1.4}
+.sess .sd{color:var(--dim);font-size:11px;margin-top:2px}
+.sess .del{color:var(--dim);padding:0 4px;flex-shrink:0}
+.sess .del:hover{color:var(--red)}
+#maincol{flex:1;display:flex;flex-direction:column;min-width:0}
 #chat{flex:1;overflow-y:auto;padding:18px;display:flex;flex-direction:column;gap:12px}
 .msg{max-width:860px;padding:10px 14px;border-radius:10px;line-height:1.55;
   white-space:pre-wrap;word-break:break-word;font-size:14px}
@@ -54,28 +69,49 @@ footer{display:flex;gap:10px;padding:12px 16px;background:var(--panel);border-to
   <h1>🛠 LocalCoder</h1>
   <label>モデル <select id="model"></select></label>
   <label>作業フォルダ <input type="text" id="workspace" value="/home/fuyuki/pico_dvl/codex"></label>
-  <button id="newBtn">🗑 新規チャット</button>
+  <button id="newBtn">＋ 新規チャット</button>
   <button id="stopBtn">■ 停止</button>
   <span id="status"></span>
 </header>
-<div id="chat"></div>
-<footer>
-  <textarea id="input" placeholder="やりたいことを日本語で入力 (Shift+Enterで改行 / Enterで送信)"></textarea>
-  <button id="sendBtn">送信</button>
-</footer>
+<div id="layout">
+  <aside id="side">
+    <div id="sideHead">📚 履歴（クリックで再開）</div>
+    <div id="sessions"></div>
+  </aside>
+  <div id="maincol">
+    <div id="chat"></div>
+    <footer>
+      <textarea id="input" placeholder="やりたいことを日本語で入力 (Shift+Enterで改行 / Enterで送信)"></textarea>
+      <button id="sendBtn">送信</button>
+    </footer>
+  </div>
+</div>
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <script>
 const $=id=>document.getElementById(id);
 const chat=$("chat"), input=$("input"), status=$("status");
-const sid=Math.random().toString(36).slice(2);
+let sid=newSid();
 let history=[];      // サーバに渡す完全な会話履歴(tool呼び出し含む)
 let running=false;
 
+function newSid(){return Date.now().toString(36)+Math.random().toString(36).slice(2,8)}
 function el(tag,cls,text){const e=document.createElement(tag);if(cls)e.className=cls;if(text!==undefined)e.textContent=text;chat.appendChild(e);scroll();return e}
 function scroll(){chat.scrollTop=chat.scrollHeight}
 function md(e,text){
   if(window.marked){e.classList.add("md");e.innerHTML=marked.parse(text)}
   else e.textContent=text;
+}
+function argSummary(name,args){
+  if(typeof args==="string"){try{args=JSON.parse(args)}catch{return args}}
+  return String(args.command||args.path||args.query||args.url||JSON.stringify(args)).slice(0,120);
+}
+function toolCard(name,argstr,live){
+  const d=document.createElement("details"); d.className="tool";
+  d.innerHTML="<summary>🔧 <b></b> — <code></code>"+(live?" <span class='spin'></span>":"")+"</summary><pre></pre>";
+  d.querySelector("b").textContent=name;
+  d.querySelector("code").textContent=argstr;
+  d.querySelector("pre").textContent=live?"実行中…":"";
+  chat.appendChild(d); scroll(); return d;
 }
 function setRunning(v){
   running=v;
@@ -95,6 +131,68 @@ async function loadModels(){
   }catch(e){el("div","err","サーバに接続できません: "+e)}
 }
 
+// ---------- 履歴サイドバー ----------
+async function loadSessions(){
+  try{
+    const d=await(await fetch("/api/sessions")).json();
+    const box=$("sessions"); box.innerHTML="";
+    for(const s of d.sessions){
+      const item=document.createElement("div");
+      item.className="sess"+(s.sid===sid?" active":"");
+      const dt=new Date(s.updated_at*1000);
+      const ds=`${dt.getMonth()+1}/${dt.getDate()} ${String(dt.getHours()).padStart(2,"0")}:${String(dt.getMinutes()).padStart(2,"0")}`;
+      item.innerHTML="<div class='body'><div class='st'></div><div class='sd'></div></div><span class='del' title='削除'>✕</span>";
+      item.querySelector(".st").textContent=s.title;
+      item.querySelector(".sd").textContent=ds;
+      item.onclick=()=>openSession(s.sid);
+      item.querySelector(".del").onclick=async ev=>{
+        ev.stopPropagation();
+        if(!confirm("この会話を削除しますか？\n"+s.title))return;
+        await fetch("/api/session/delete",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sid:s.sid})});
+        if(s.sid===sid)newChat();
+        loadSessions();
+      };
+      box.appendChild(item);
+    }
+  }catch(e){/* sidebar failure is non-fatal */}
+}
+
+async function openSession(id){
+  if(running)return;
+  try{
+    const d=await(await fetch("/api/session?sid="+encodeURIComponent(id))).json();
+    if(d.error)return;
+    sid=d.sid; history=d.messages||[];
+    if(d.workspace)$("workspace").value=d.workspace;
+    const sel=$("model");
+    if(d.model&&[...sel.options].some(o=>o.value===d.model))sel.value=d.model;
+    renderHistory(history);
+    loadSessions();
+  }catch(e){el("div","err","履歴の読み込みに失敗: "+e)}
+}
+
+function renderHistory(msgs){
+  chat.innerHTML="";
+  const pending=[];
+  for(const m of msgs){
+    if(m.role==="user"){el("div","msg user",m.content)}
+    else if(m.role==="assistant"){
+      if(m.content){const e=el("div","msg assistant","");md(e,m.content)}
+      for(const tc of (m.tool_calls||[])){
+        const fn=tc.function||{};
+        pending.push(toolCard(fn.name||"?",argSummary(fn.name,fn.arguments||{}),false));
+      }
+    }else if(m.role==="tool"){
+      const d=pending.shift();
+      if(d)d.querySelector("pre").textContent=m.content;
+    }
+  }
+  scroll();
+}
+
+function newChat(){sid=newSid();history=[];chat.innerHTML="";loadSessions()}
+
+// ---------- 送信 ----------
 async function send(){
   const text=input.value.trim();
   if(!text||running)return;
@@ -122,6 +220,7 @@ async function send(){
     }
   }catch(e){el("div","err","通信エラー: "+e)}
   setRunning(false);
+  loadSessions();
 
   function handle(ev){
     if(ev.type==="think"){
@@ -135,11 +234,7 @@ async function send(){
       if(curAssistant)md(curAssistant,curText);
       curAssistant=null; curThink=null; scroll();
     }else if(ev.type==="tool_start"){
-      const d=document.createElement("details"); d.className="tool"; d.dataset.name=ev.name;
-      const argstr=ev.name==="run_command"?(ev.args.command||""):(ev.args.path||JSON.stringify(ev.args));
-      d.innerHTML="<summary>🔧 "+ev.name+" — <code></code> <span class='spin'></span></summary><pre>実行中…</pre>";
-      d.querySelector("code").textContent=argstr.slice(0,120);
-      chat.appendChild(d); scroll();
+      toolCard(ev.name,argSummary(ev.name,ev.args),true);
     }else if(ev.type==="tool_end"){
       const tools=chat.querySelectorAll("details.tool");
       const d=tools[tools.length-1];
@@ -158,8 +253,9 @@ input.addEventListener("keydown",e=>{
   if(e.key==="Enter"&&!e.shiftKey&&!e.isComposing){e.preventDefault();send()}
 });
 $("stopBtn").onclick=()=>fetch("/api/stop",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sid})});
-$("newBtn").onclick=()=>{history=[];chat.innerHTML="";};
+$("newBtn").onclick=newChat;
 loadModels();
+loadSessions();
 </script>
 </body>
 </html>

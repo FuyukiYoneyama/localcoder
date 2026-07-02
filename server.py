@@ -11,6 +11,7 @@ import os
 import re
 import subprocess
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -27,6 +28,8 @@ CMD_TIMEOUT = 180      # コマンド実行タイムアウト(秒)
 NUM_CTX = 32768
 
 CANCEL = {}            # sid -> threading.Event
+HISTORY_DIR = ROOT / "history"   # チャット履歴の保存先 (1会話 = 1 JSONファイル)
+HISTORY_DIR.mkdir(exist_ok=True)
 
 SYSTEM_PROMPT = """You are LocalCoder, an autonomous coding agent running on the user's machine.
 Workspace directory: {ws}
@@ -150,6 +153,35 @@ def fetch_url_text(url: str) -> str:
     return text or "(no readable text on this page)"
 
 
+def _safe_sid(sid: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]", "", sid)[:40] or "default"
+
+
+def save_session(sid: str, model: str, workspace: str, messages: list):
+    sid = _safe_sid(sid)
+    title = next((m["content"] for m in messages
+                  if m.get("role") == "user" and m.get("content")), "(無題)")
+    data = {"sid": sid, "title": title[:60], "updated_at": time.time(),
+            "model": model, "workspace": workspace, "messages": messages}
+    (HISTORY_DIR / f"{sid}.json").write_text(
+        json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+
+def list_sessions() -> list:
+    out = []
+    for f in HISTORY_DIR.glob("*.json"):
+        try:
+            d = json.loads(f.read_text(encoding="utf-8"))
+            out.append({"sid": d["sid"], "title": d.get("title", "(無題)"),
+                        "updated_at": d.get("updated_at", 0),
+                        "model": d.get("model", ""),
+                        "workspace": d.get("workspace", "")})
+        except Exception:
+            continue
+    out.sort(key=lambda x: x["updated_at"], reverse=True)
+    return out[:200]
+
+
 def resolve_path(ws: Path, p: str) -> Path:
     full = Path(p) if os.path.isabs(p) else ws / p
     full = full.resolve()
@@ -251,6 +283,16 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"models": [m["name"] for m in data.get("models", [])]})
             except Exception as e:
                 self._json({"error": f"Ollamaに接続できません: {e}"}, 502)
+        elif self.path == "/api/sessions":
+            self._json({"sessions": list_sessions()})
+        elif self.path.startswith("/api/session?"):
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            sid = _safe_sid(q.get("sid", [""])[0])
+            f = HISTORY_DIR / f"{sid}.json"
+            if f.exists():
+                self._json(json.loads(f.read_text(encoding="utf-8")))
+            else:
+                self._json({"error": "not found"}, 404)
         elif self.path == "/api/health":
             self._json({"ok": True})
         else:
@@ -263,6 +305,13 @@ class Handler(BaseHTTPRequestHandler):
             ev = CANCEL.get(body.get("sid", ""))
             if ev:
                 ev.set()
+            self._json({"ok": True})
+            return
+        if self.path == "/api/session/delete":
+            body = self._read_body()
+            f = HISTORY_DIR / f"{_safe_sid(body.get('sid', ''))}.json"
+            if f.exists():
+                f.unlink()
             self._json({"ok": True})
             return
         if self.path == "/api/chat":
@@ -354,6 +403,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._sse({"type": "error", "message": f"{type(e).__name__}: {e}"})
             except Exception:
                 pass
+        finally:
+            # 会話を自動保存 (エラーや途中停止でもそこまでの内容を残す)
+            if len(messages) > 1:
+                try:
+                    save_session(sid, model, str(ws), messages[1:])
+                except Exception:
+                    pass
 
 
 def main():
