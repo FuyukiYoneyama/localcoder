@@ -38,6 +38,9 @@ HISTORY_DIR.mkdir(exist_ok=True)
 # 外部サイトからの no-cors POST はこの値を知り得ないため全て拒否される。
 TOKEN = secrets.token_hex(16)
 HOME = Path.home().resolve()     # ワークスペースはこの配下のみ許可
+# 画面初期表示時の作業フォルダ。個人の作業パスをリポジトリに埋め込まないよう
+# 環境変数で指定する(未設定ならHOME)。index.html配信時にwindow変数として埋め込む。
+DEFAULT_WORKSPACE = os.environ.get("LOCALCODER_DEFAULT_WORKSPACE", str(HOME))
 
 SYSTEM_PROMPT = """You are LocalCoder, an autonomous coding agent running on the user's machine.
 Workspace directory: {ws}
@@ -335,9 +338,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path in ("/", "/index.html"):
             body = (ROOT / "index.html").read_bytes()
-            body = body.replace(
-                b"</head>",
-                b'<script>window.LC_TOKEN="' + TOKEN.encode() + b'";</script></head>', 1)
+            inject = (f'<script>window.LC_TOKEN={json.dumps(TOKEN)};'
+                     f'window.LC_DEFAULT_WORKSPACE={json.dumps(DEFAULT_WORKSPACE)};'
+                     f'</script></head>').encode()
+            body = body.replace(b"</head>", inject, 1)
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))

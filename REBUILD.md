@@ -188,6 +188,9 @@ HISTORY_DIR.mkdir(exist_ok=True)
 # 外部サイトからの no-cors POST はこの値を知り得ないため全て拒否される。
 TOKEN = secrets.token_hex(16)
 HOME = Path.home().resolve()     # ワークスペースはこの配下のみ許可
+# 画面初期表示時の作業フォルダ。個人の作業パスをリポジトリに埋め込まないよう
+# 環境変数で指定する(未設定ならHOME)。index.html配信時にwindow変数として埋め込む。
+DEFAULT_WORKSPACE = os.environ.get("LOCALCODER_DEFAULT_WORKSPACE", str(HOME))
 
 SYSTEM_PROMPT = """You are LocalCoder, an autonomous coding agent running on the user's machine.
 Workspace directory: {ws}
@@ -485,9 +488,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path in ("/", "/index.html"):
             body = (ROOT / "index.html").read_bytes()
-            body = body.replace(
-                b"</head>",
-                b'<script>window.LC_TOKEN="' + TOKEN.encode() + b'";</script></head>', 1)
+            inject = (f'<script>window.LC_TOKEN={json.dumps(TOKEN)};'
+                     f'window.LC_DEFAULT_WORKSPACE={json.dumps(DEFAULT_WORKSPACE)};'
+                     f'</script></head>').encode()
+            body = body.replace(b"</head>", inject, 1)
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -744,7 +748,7 @@ footer{display:flex;gap:10px;padding:12px 16px;background:var(--panel);border-to
 <header>
   <h1>🛠 LocalCoder</h1>
   <label>モデル <select id="model"></select></label>
-  <label>作業フォルダ <input type="text" id="workspace" value="/home/fuyuki/pico_dvl/codex"></label>
+  <label>作業フォルダ <input type="text" id="workspace" placeholder="/home/youruser/project"></label>
   <button id="newBtn">＋ 新規チャット</button>
   <button id="stopBtn">■ 停止</button>
   <span id="status"></span>
@@ -941,6 +945,7 @@ input.addEventListener("keydown",e=>{
 });
 $("stopBtn").onclick=()=>post("/api/stop",{sid});
 $("newBtn").onclick=newChat;
+if(window.LC_DEFAULT_WORKSPACE)$("workspace").value=window.LC_DEFAULT_WORKSPACE;
 loadModels();
 loadSessions();
 </script>
@@ -1057,7 +1062,7 @@ cat ~/lc_test/hello.py   # → print("hello world") ができていれば合格
 |---|---|---|
 | WSLディストロ名 | `ubuntu-24.04` | `wsl -l -v` で確認し bat の `-d` を変更 |
 | デスクトップパス | `E:\desktop`（移動済み） | 通常は `%USERPROFILE%\Desktop`。PowerShellの `[Environment]::GetFolderPath('Desktop')` で確認 |
-| index.html の作業フォルダ初期値 | `/home/fuyuki/pico_dvl/codex` | `#workspace` の `value=` を移植先のホームに変更 |
+| 作業フォルダの初期表示値 | このPCでは`LOCALCODER_DEFAULT_WORKSPACE`環境変数で`/home/fuyuki/pico_dvl/codex`を指定 | 環境変数を移植先のプロジェクトパスに合わせて変更、または未設定のまま(`$HOME`が自動表示される) |
 | Edgeのパス | `C:\Program Files (x86)\Microsoft\Edge\...` | 無ければ bat 最終行を `start "" http://localhost:8765/` に |
 | Ollamaの場所 | Windows側 localhost:11434 | WSL内Ollamaでも同URLで可。別ホストなら環境変数 `LOCALCODER_OLLAMA` |
 | ポート | 8765 | 競合時は環境変数 `LOCALCODER_PORT` |

@@ -68,7 +68,7 @@ footer{display:flex;gap:10px;padding:12px 16px;background:var(--panel);border-to
 <header>
   <h1>🛠 LocalCoder</h1>
   <label>モデル <select id="model"></select></label>
-  <label>作業フォルダ <input type="text" id="workspace" value="/home/fuyuki/pico_dvl/codex"></label>
+  <label>作業フォルダ <input type="text" id="workspace" placeholder="/home/youruser/project"></label>
   <button id="newBtn">＋ 新規チャット</button>
   <button id="stopBtn">■ 停止</button>
   <span id="status"></span>
@@ -265,6 +265,7 @@ input.addEventListener("keydown",e=>{
 });
 $("stopBtn").onclick=()=>post("/api/stop",{sid});
 $("newBtn").onclick=newChat;
+if(window.LC_DEFAULT_WORKSPACE)$("workspace").value=window.LC_DEFAULT_WORKSPACE;
 loadModels();
 loadSessions();
 </script>

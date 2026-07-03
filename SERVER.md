@@ -46,14 +46,23 @@ HISTORY_DIR.mkdir(exist_ok=True)
 # 外部サイトからの no-cors POST はこの値を知り得ないため全て拒否される。
 TOKEN = secrets.token_hex(16)
 HOME = Path.home().resolve()     # ワークスペースはこの配下のみ許可
+# 画面初期表示時の作業フォルダ。個人の作業パスをリポジトリに埋め込まないよう
+# 環境変数で指定する(未設定ならHOME)。index.html配信時にwindow変数として埋め込む。
+DEFAULT_WORKSPACE = os.environ.get("LOCALCODER_DEFAULT_WORKSPACE", str(HOME))
 ```
-（`server.py:36-40`）
+（`server.py:36-43`）
 
 `TOKEN` はプロセス起動のたびに毎回変わる32文字のランダム値。`do_GET`（3節）が
 `index.html`配信時に埋め込み、`_post_ok()`/`_token_ok()`（2節）が検証する。`HOME`は
 `handle_chat()`（4節）でワークスペースの範囲チェックに使う。どちらも「127.0.0.1
 バインドだけでは足りない」という設計判断への対応であり、詳しくは2節・4節・
 5-2節で説明する。
+
+`DEFAULT_WORKSPACE`は画面の作業フォルダ欄に最初から入れておく値。個人の作業パスを
+`index.html`に直書きするとリポジトリ公開時にユーザー名やプロジェクト構成が漏れるため、
+`LOCALCODER_DEFAULT_WORKSPACE`環境変数（起動スクリプト側で機種ごとに設定）から注入する
+方式にした。未設定時は`HOME`にフォールバックするので、リポジトリ標準のindex.htmlは
+特定ユーザーの情報を含まない。
 
 ---
 
@@ -90,7 +99,7 @@ def _post_ok(self) -> bool:
         return False
     return self._token_ok()
 ```
-（`server.py:303-329`）
+（`server.py:306-332`）
 
 なぜこれが要るか: `ThreadingHTTPServer` は `127.0.0.1` にしかバインドしていない
 （7節）が、それだけでは**同じPC上でブラウザが開いている悪意あるWebページ**からの
@@ -144,7 +153,7 @@ def do_GET(self):
     elif self.path == "/api/health":
         ...
 ```
-（`server.py:332-386`）
+（`server.py:335-390`）
 
 ```python
 def do_POST(self):
@@ -159,7 +168,7 @@ def do_POST(self):
         self.handle_chat()
         ...
 ```
-（`server.py:389-410`）
+（`server.py:393-414`）
 
 | メソッド | パス | 役割 |
 |---|---|---|
@@ -184,16 +193,20 @@ def do_POST(self):
 ```python
 if self.path in ("/", "/index.html"):
     body = (ROOT / "index.html").read_bytes()
-    body = body.replace(
-        b"</head>",
-        b'<script>window.LC_TOKEN="' + TOKEN.encode() + b'";</script></head>', 1)
+    inject = (f'<script>window.LC_TOKEN={json.dumps(TOKEN)};'
+             f'window.LC_DEFAULT_WORKSPACE={json.dumps(DEFAULT_WORKSPACE)};'
+             f'</script></head>').encode()
+    body = body.replace(b"</head>", inject, 1)
     self.send_response(200)
     ...
 ```
-（`server.py:336-345`）
+（`server.py:339-345`）
 
 クライアント側（`index.html`）はこの `window.LC_TOKEN` を読み、全POSTで
-`X-LocalCoder-Token` ヘッダとして送り返す（後述）。
+`X-LocalCoder-Token` ヘッダとして送り返す（後述）。同時に埋め込まれる
+`window.LC_DEFAULT_WORKSPACE`（1-1節）は、作業フォルダ欄の初期値として
+ページ読み込み時にJSが1回だけ反映する（値は`json.dumps()`でエスケープしてから
+埋め込むため、パスに引用符等が含まれてもスクリプトインジェクションにならない）。
 
 ### 3-1. 同梱JSの配信 — `/vendor/*.js`
 
@@ -212,7 +225,7 @@ elif self.path.startswith("/vendor/"):
     else:
         self._json({"error": "not found"}, 404)
 ```
-（`server.py:346-358`）
+（`server.py:350-362`）
 
 `index.html`は`marked`/`DOMPurify`を`https://cdn.jsdelivr.net/...`ではなく
 `/vendor/marked.min.js`・`/vendor/purify.min.js`から読み込む。このページには
@@ -235,7 +248,7 @@ elif self.path == "/api/models":
     except Exception as e:
         self._json({"error": f"Ollamaに接続できません: {e}"}, 502)
 ```
-（`server.py:359-365`）
+（`server.py:363-369`）
 
 ---
 
@@ -266,7 +279,7 @@ def handle_chat(self):
     messages = [{"role": "system", "content": SYSTEM_PROMPT.format(ws=ws)}]
     messages += body.get("messages", [])
 ```
-（`server.py:412-431`）
+（`server.py:416-435`）
 
 ここで重要なのは2点:
 
@@ -302,7 +315,7 @@ for it in range(MAX_ITER):
         if chunk.get("done"):
             break
 ```
-（`server.py:434-452`）
+（`server.py:438-456`）
 
 `ollama_stream` は `/api/chat` にJSON Linesでストリーミングする薄いラッパー:
 
@@ -317,7 +330,7 @@ def ollama_stream(payload: dict):
             if line:
                 yield json.loads(line)
 ```
-（`server.py:262-270`）
+（`server.py:265-273`）
 
 チャンクごとに `thinking`（推論過程）・`content`（本文）・`tool_calls`（ツール呼び出し要求）
 の3種が流れてきうる。それぞれをそのままブラウザへSSEで中継する
@@ -359,7 +372,7 @@ for tc in tool_calls:
     messages.append({"role": "tool", "tool_name": name,
                      "name": name, "content": result})
 ```
-（`server.py:454-481`）
+（`server.py:458-485`）
 
 これが **エージェントループの心臓部**：
 1. モデルの応答（`assistant` メッセージ）を履歴に追加
@@ -380,7 +393,7 @@ else:
     self._sse({"type": "error",
                "message": f"最大ループ回数({MAX_ITER})に達しました"})
 ```
-（`server.py:482-484`）
+（`server.py:486-488`）
 
 （この `else` は `for...else` 構文で、`break` されずにループが尽きた場合のみ実行される）
 
@@ -390,7 +403,7 @@ else:
 self._sse({"type": "history", "messages": messages[1:]})
 self._sse({"type": "all_done"})
 ```
-（`server.py:487-488`）
+（`server.py:491-492`）
 
 システムプロンプト（`messages[0]`）を除いた全履歴をクライアントへ返す。
 クライアントはこれを次回リクエストの `messages` としてそのまま送り返すことで
@@ -407,7 +420,7 @@ finally:
         except Exception:
             pass
 ```
-（`server.py:501-507`）
+（`server.py:505-511`）
 
 ---
 
@@ -443,7 +456,7 @@ def exec_tool(name: str, args: dict, ws: Path, cancel=None) -> str:
     except Exception as e:  # noqa: BLE001 - report all tool errors to the model
         return f"ERROR: {type(e).__name__}: {e}"
 ```
-（`server.py:234-259`）
+（`server.py:237-262`）
 
 設計上の要点:
 
@@ -486,7 +499,7 @@ def run_command(cmd: str, ws: Path, cancel) -> str:
         return f"ERROR: command {killed}\n{out}"
     return f"exit_code={p.returncode}\n{out}"
 ```
-（`server.py:202-231`）
+（`server.py:205-234`）
 
 以前は `subprocess.run(..., timeout=CMD_TIMEOUT)` を1回呼ぶだけの実装だったが、
 それだと**停止ボタンを押しても`communicate()`がブロックしたままで、実行中の
@@ -513,7 +526,7 @@ def resolve_path(ws: Path, p: str) -> Path:
         raise ValueError(f"path is outside the workspace: {p}")
     return full
 ```
-（`server.py:193-199`）
+（`server.py:196-202`）
 
 相対パスはワークスペース基準で解決し、絶対パスもいったん `resolve()` して
 シンボリックリンク経由の脱出も含めて正規化した上で、文字列前方一致で
@@ -555,7 +568,7 @@ def web_search(query: str, max_results: int = 6) -> str:
         html_text, re.S)
     ...
 ```
-（`server.py:110-128`）
+（`server.py:113-131`）
 
 正規表現でDuckDuckGoのHTML構造から検索結果のリンク・タイトル・スニペットを
 抜き出しているだけの軽量実装（＝DuckDuckGo側のHTML構造が変わると壊れる）。
@@ -570,10 +583,10 @@ class _TextExtract(HTMLParser):
         if not self.depth and d.strip():
             self.parts.append(d.strip())
 ```
-（`server.py:131-149`）
+（`server.py:134-152`）
 
 `script`/`style`/`svg`/`head` タグの中身は無視しつつ、テキストノードだけを
-収集する。結果は1万文字で切り詰められる（`server.py:159-160`）。
+収集する。結果は1万文字で切り詰められる（`server.py:162-163`）。
 
 `fetch_url` で取得したテキストや `web_search` の結果はそのまま `tool` メッセージの
 `content` としてモデルに渡り、最終的にモデルの応答（Markdown）としてブラウザに
@@ -594,7 +607,7 @@ def main():
     print(f"LocalCoder running: http://localhost:{PORT}  (ollama: {OLLAMA})")
     srv.serve_forever()
 ```
-（`server.py:510-517`）
+（`server.py:514-521`）
 
 `ThreadingHTTPServer` なので、複数タブ・複数セッションからの同時リクエストにも
 スレッド単位で並行対応する。ポートが既に使用中（＝二重起動）の場合はエラーで
