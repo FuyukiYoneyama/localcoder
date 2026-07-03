@@ -87,6 +87,7 @@ footer{display:flex;gap:10px;padding:12px 16px;background:var(--panel);border-to
   </div>
 </div>
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify/dist/purify.min.js"></script>
 <script>
 const $=id=>document.getElementById(id);
 const chat=$("chat"), input=$("input"), status=$("status");
@@ -98,8 +99,13 @@ function newSid(){return Date.now().toString(36)+Math.random().toString(36).slic
 function el(tag,cls,text){const e=document.createElement(tag);if(cls)e.className=cls;if(text!==undefined)e.textContent=text;chat.appendChild(e);scroll();return e}
 function scroll(){chat.scrollTop=chat.scrollHeight}
 function md(e,text){
-  if(window.marked){e.classList.add("md");e.innerHTML=marked.parse(text)}
+  // LLM出力・Webから取得した内容にHTMLが混ざってもXSSにならないようsanitize必須
+  if(window.marked&&window.DOMPurify){e.classList.add("md");e.innerHTML=DOMPurify.sanitize(marked.parse(text))}
   else e.textContent=text;
+}
+function post(url,obj){
+  return fetch(url,{method:"POST",headers:{"Content-Type":"application/json",
+    "X-LocalCoder-Token":window.LC_TOKEN||""},body:JSON.stringify(obj)});
 }
 function argSummary(name,args){
   if(typeof args==="string"){try{args=JSON.parse(args)}catch{return args}}
@@ -148,7 +154,7 @@ async function loadSessions(){
       item.querySelector(".del").onclick=async ev=>{
         ev.stopPropagation();
         if(!confirm("この会話を削除しますか？\n"+s.title))return;
-        await fetch("/api/session/delete",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sid:s.sid})});
+        await post("/api/session/delete",{sid:s.sid});
         if(s.sid===sid)newChat();
         loadSessions();
       };
@@ -203,8 +209,7 @@ async function send(){
 
   let curAssistant=null, curThink=null, curText="";
   try{
-    const resp=await fetch("/api/chat",{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({sid,model:$("model").value,workspace:$("workspace").value,messages:history})});
+    const resp=await post("/api/chat",{sid,model:$("model").value,workspace:$("workspace").value,messages:history});
     const reader=resp.body.getReader(); const dec=new TextDecoder(); let buf="";
     while(true){
       const {done,value}=await reader.read();
@@ -252,7 +257,7 @@ $("sendBtn").onclick=send;
 input.addEventListener("keydown",e=>{
   if(e.key==="Enter"&&!e.shiftKey&&!e.isComposing){e.preventDefault();send()}
 });
-$("stopBtn").onclick=()=>fetch("/api/stop",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sid})});
+$("stopBtn").onclick=()=>post("/api/stop",{sid});
 $("newBtn").onclick=newChat;
 loadModels();
 loadSessions();
