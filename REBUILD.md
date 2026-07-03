@@ -950,10 +950,28 @@ loadSessions();
 
 ### ③ デスクトップの `LocalCoder.bat`（Windows側）
 
-⚠ **このファイルはASCII文字のみで書くこと。** 日本語コメントをUTF-8で書くと、
+2種類ある。**mirroredネットワークが使える機種は「標準版」で十分**（このリポジトリの
+動作確認PCも標準版を使用中）。**WSLがNAT構成（mirrored非対応）の機種、または標準版が
+ダブルクリックしても無反応になる機種**は「ASCII安全版＋LocalCoder.ps1」を使う。
+
+**標準版**（mirroredネットワーク機。「1-2」のmirrored設定が入っていれば動く）:
+
+```bat
+@echo off
+rem LocalCoder — ローカルLLM(Ollama)コーディングエージェント起動
+rem サーバーが既に起動していれば二重起動しない(server.py側で処理)
+start "LocalCoder Server" /min wsl -d ubuntu-24.04 -- bash -lc "python3 ~/localcoder/server.py"
+ping -n 3 127.0.0.1 >nul
+start "" "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" --app=http://localhost:8765/
+```
+
+**ASCII安全版＋`LocalCoder.ps1`**（NAT構成機、または日本語コメント入りbatが
+ダブルクリックしても何も起きない機種向け）:
+
+⚠ **bat本体はASCII文字のみで書くこと。** 日本語コメントをUTF-8で書くと、
 日本語版Windowsの`cmd.exe`（既定でShift-JISとして解釈する）がバイト列を誤読し、
 コメントの途中を別コマンドとして実行しようとして壊れる（実際に発生した事例は
-「8. 実施例ログ」参照）。
+「8. 実施例ログ 6番」参照）。
 
 ```bat
 @echo off
@@ -964,10 +982,10 @@ wsl -d ubuntu-24.04 -- true
 powershell -NoProfile -File "\\wsl.localhost\<distro>\home\<user>\localcoder\LocalCoder.ps1"
 ```
 
-（`LocalCoder.ps1`を使わず素朴に起動する場合は、`start "LocalCoder Server" /min wsl -d ubuntu-24.04 -- bash -lc "python3 ~/localcoder/server.py"` の後に
-`start "" "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" --app=http://localhost:8765/`
-を続ける。ただしWindows 10 + NAT構成のWSLではOllamaへの経路を別途用意する必要があるため
-（「1-2. WSL→Windows Ollama の接続経路」参照）、`LocalCoder.ps1`方式を推奨する）
+`LocalCoder.ps1`（リポジトリ同梱）はゲートウェイIPの自動検出→必要ならOllamaをそのIPで
+再bind→WSL内でserver.py起動→Edgeでアプリウィンドウを開く、を一括で行う
+（Windows 10 + NAT構成のWSLでOllamaへの経路を確保する実装。詳細は「8. 実施例ログ」）。
+mirrored機ではこの経路は不要。
 
 ### ④ `~/localcoder/vendor/`（同梱JS、CDNは使わない）
 
