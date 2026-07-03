@@ -300,6 +300,15 @@ class Handler(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length", 0))
         return json.loads(self.rfile.read(n) or b"{}")
 
+    def _host_ok(self) -> bool:
+        """Host がローカル以外 → DNSリバインディング攻撃なので拒否。GET/POST共通。"""
+        host = (self.headers.get("Host") or "").split(":")[0]
+        return host in ("localhost", "127.0.0.1")
+
+    def _token_ok(self) -> bool:
+        return secrets.compare_digest(
+            self.headers.get("X-LocalCoder-Token", ""), TOKEN)
+
     def _post_ok(self) -> bool:
         """POST の CSRF / DNSリバインディング対策。
 
@@ -308,8 +317,7 @@ class Handler(BaseHTTPRequestHandler):
         - Content-Type が application/json 以外 → no-cors で送れる単純リクエスト
         - トークン不一致 → このページを経由しないリクエスト
         """
-        host = (self.headers.get("Host") or "").split(":")[0]
-        if host not in ("localhost", "127.0.0.1"):
+        if not self._host_ok():
             return False
         origin = self.headers.get("Origin")
         if origin:
@@ -318,11 +326,13 @@ class Handler(BaseHTTPRequestHandler):
         ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip()
         if ctype != "application/json":
             return False
-        return secrets.compare_digest(
-            self.headers.get("X-LocalCoder-Token", ""), TOKEN)
+        return self._token_ok()
 
     # ---------- GET ----------
     def do_GET(self):
+        if not self._host_ok():
+            self._json({"error": "forbidden"}, 403)
+            return
         if self.path in ("/", "/index.html"):
             body = (ROOT / "index.html").read_bytes()
             body = body.replace(
@@ -333,6 +343,19 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+        elif self.path.startswith("/vendor/"):
+            # 同梱JS(marked/DOMPurify)の静的配信。CDN依存を排除しオフラインでも動く
+            name = self.path[len("/vendor/"):]
+            f = ROOT / "vendor" / name
+            if re.fullmatch(r"[\w.-]+\.js", name) and f.is_file():
+                body = f.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/javascript; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self._json({"error": "not found"}, 404)
         elif self.path == "/api/models":
             try:
                 with urllib.request.urlopen(OLLAMA + "/api/tags", timeout=10) as r:
@@ -341,8 +364,15 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._json({"error": f"Ollamaに接続できません: {e}"}, 502)
         elif self.path == "/api/sessions":
+            # 履歴はプロンプト・ツール結果・ファイル内容を含むためトークン必須
+            if not self._token_ok():
+                self._json({"error": "forbidden"}, 403)
+                return
             self._json({"sessions": list_sessions()})
         elif self.path.startswith("/api/session?"):
+            if not self._token_ok():
+                self._json({"error": "forbidden"}, 403)
+                return
             q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             sid = _safe_sid(q.get("sid", [""])[0])
             f = HISTORY_DIR / f"{sid}.json"

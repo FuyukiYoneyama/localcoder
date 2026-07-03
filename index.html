@@ -86,8 +86,10 @@ footer{display:flex;gap:10px;padding:12px 16px;background:var(--panel);border-to
     </footer>
   </div>
 </div>
-<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/dompurify/dist/purify.min.js"></script>
+<!-- CDNではなく同梱JSを配信 (vendor/ 内、バージョンは *.version 参照)。
+     外部CDNのJSはこのページの権限(=コマンド実行)を持ってしまうため使わない -->
+<script src="/vendor/marked.min.js"></script>
+<script src="/vendor/purify.min.js"></script>
 <script>
 const $=id=>document.getElementById(id);
 const chat=$("chat"), input=$("input"), status=$("status");
@@ -106,6 +108,10 @@ function md(e,text){
 function post(url,obj){
   return fetch(url,{method:"POST",headers:{"Content-Type":"application/json",
     "X-LocalCoder-Token":window.LC_TOKEN||""},body:JSON.stringify(obj)});
+}
+function getAuth(url){
+  // 履歴系GETはプライベートな内容を返すためトークン必須
+  return fetch(url,{headers:{"X-LocalCoder-Token":window.LC_TOKEN||""}});
 }
 function argSummary(name,args){
   if(typeof args==="string"){try{args=JSON.parse(args)}catch{return args}}
@@ -140,7 +146,7 @@ async function loadModels(){
 // ---------- 履歴サイドバー ----------
 async function loadSessions(){
   try{
-    const d=await(await fetch("/api/sessions")).json();
+    const d=await(await getAuth("/api/sessions")).json();
     const box=$("sessions"); box.innerHTML="";
     for(const s of d.sessions){
       const item=document.createElement("div");
@@ -166,7 +172,7 @@ async function loadSessions(){
 async function openSession(id){
   if(running)return;
   try{
-    const d=await(await fetch("/api/session?sid="+encodeURIComponent(id))).json();
+    const d=await(await getAuth("/api/session?sid="+encodeURIComponent(id))).json();
     if(d.error)return;
     sid=d.sid; history=d.messages||[];
     if(d.workspace)$("workspace").value=d.workspace;
