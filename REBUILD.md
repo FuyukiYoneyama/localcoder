@@ -419,8 +419,9 @@ def list_subdirs(path: str) -> dict:
         p = HOME
     if not p.is_dir() or not under_home(p):
         p = HOME
-    dirs = sorted(e.name for e in p.iterdir()
-                  if e.is_dir() and not e.name.startswith("."))
+    dirs = sorted((e.name for e in p.iterdir()
+                  if e.is_dir() and not e.name.startswith(".")),
+                  key=str.lower)
     parent = str(p.parent) if p != HOME and under_home(p.parent) else None
     return {"path": str(p), "parent": parent, "dirs": dirs}
 

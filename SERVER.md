@@ -99,7 +99,7 @@ def _post_ok(self) -> bool:
         return False
     return self._token_ok()
 ```
-（`server.py:522-548`）
+（`server.py:523-549`）
 
 なぜこれが要るか: `ThreadingHTTPServer` は `127.0.0.1` にしかバインドしていない
 （7節）が、それだけでは**同じPC上でブラウザが開いている悪意あるWebページ**からの
@@ -153,7 +153,7 @@ def do_GET(self):
     elif self.path == "/api/health":
         ...
 ```
-（`server.py:551-613`）
+（`server.py:552-614`）
 
 ```python
 def do_POST(self):
@@ -168,7 +168,7 @@ def do_POST(self):
         self.handle_chat()
         ...
 ```
-（`server.py:616-637`）
+（`server.py:617-638`）
 
 | メソッド | パス | 役割 |
 |---|---|---|
@@ -200,7 +200,7 @@ if self.path in ("/", "/index.html"):
     self.send_response(200)
     ...
 ```
-（`server.py:555-561`）
+（`server.py:556-562`）
 
 クライアント側（`index.html`）はこの `window.LC_TOKEN` を読み、全POSTで
 `X-LocalCoder-Token` ヘッダとして送り返す（後述）。同時に埋め込まれる
@@ -225,7 +225,7 @@ elif self.path.startswith("/vendor/"):
     else:
         self._json({"error": "not found"}, 404)
 ```
-（`server.py:566-578`）
+（`server.py:567-579`）
 
 `index.html`は`marked`/`DOMPurify`を`https://cdn.jsdelivr.net/...`ではなく
 `/vendor/marked.min.js`・`/vendor/purify.min.js`から読み込む。このページには
@@ -248,7 +248,7 @@ elif self.path == "/api/models":
     except Exception as e:
         self._json({"error": f"Ollamaに接続できません: {e}"}, 502)
 ```
-（`server.py:579-585`）
+（`server.py:580-586`）
 
 ### 3-2. 作業フォルダ選択ダイアログ — `/api/browse`
 
@@ -263,7 +263,7 @@ elif self.path.startswith("/api/browse"):
     q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
     self._json(list_subdirs(q.get("path", [""])[0]))
 ```
-（`server.py:586-592`）
+（`server.py:587-593`）
 
 ブラウザ標準の`<input type="file" webkitdirectory>`はセキュリティ上、選択した
 フォルダの絶対パスを返さない（相対パスのファイル一覧しか取れない）ため、作業
@@ -301,7 +301,7 @@ def handle_chat(self):
     messages = [{"role": "system", "content": SYSTEM_PROMPT.format(ws=ws)}]
     messages += body.get("messages", [])
 ```
-（`server.py:639-658`）
+（`server.py:640-659`）
 
 ここで重要なのは2点:
 
@@ -339,7 +339,7 @@ for it in range(MAX_ITER):
         if chunk.get("done"):
             break
 ```
-（`server.py:661-681`）
+（`server.py:662-682`）
 
 反復の先頭で毎回 `compact_history()`（4-4節）を通しているのは、リクエスト開始時に
 長すぎる履歴が来た場合と、ツール結果が反復のたびに積み上がって途中で予算を超える
@@ -358,7 +358,7 @@ def ollama_stream(payload: dict):
             if line:
                 yield json.loads(line)
 ```
-（`server.py:326-334`）
+（`server.py:327-335`）
 
 （`ollama_ask` は履歴要約用の非ストリーミング問い合わせ。4-4節参照。）
 
@@ -402,7 +402,7 @@ for tc in tool_calls:
     messages.append({"role": "tool", "tool_name": name,
                      "name": name, "content": result})
 ```
-（`server.py:683-710`）
+（`server.py:684-711`）
 
 これが **エージェントループの心臓部**：
 1. モデルの応答（`assistant` メッセージ）を履歴に追加
@@ -423,7 +423,7 @@ else:
     self._sse({"type": "error",
                "message": f"最大ループ回数({MAX_ITER})に達しました"})
 ```
-（`server.py:711-713`）
+（`server.py:712-714`）
 
 （この `else` は `for...else` 構文で、`break` されずにループが尽きた場合のみ実行される）
 
@@ -433,7 +433,7 @@ else:
 self._sse({"type": "history", "messages": messages[1:]})
 self._sse({"type": "all_done"})
 ```
-（`server.py:716-717`）
+（`server.py:717-718`）
 
 システムプロンプト（`messages[0]`）を除いた全履歴をクライアントへ返す。
 クライアントはこれを次回リクエストの `messages` としてそのまま送り返すことで
@@ -450,7 +450,7 @@ finally:
         except Exception:
             pass
 ```
-（`server.py:730-736`）
+（`server.py:731-737`）
 
 ### 4-4. 履歴の自動圧縮 — `compact_history`
 
@@ -486,7 +486,7 @@ SUMMARIZE_INPUT_TOKENS = NUM_CTX // 2  # 要約1回の入力上限 (超えたら
 トークン数は `estimate_text_tokens()` で概算する（ASCII=4文字/トークン、日本語等の
 非ASCII=1文字/トークン）。厳密ではないが、圧縮の発動判定には十分な精度。
 
-**要約入力自体の肥大対策**（`summarize_old()`, `server.py:402-426`）: 要約対象の
+**要約入力自体の肥大対策**（`summarize_old()`, `server.py:423-447`）: 要約対象の
 ログが `NUM_CTX` を超えると、要約プロンプト自体の前方（=要約指示）が ollama に
 切り捨てられ、モデルがログをオウム返しするだけの壊れた「要約」を返す——という
 欠陥が実際に発生した。対策として、(a) 各メッセージを先頭7割+末尾3割の1000文字に
@@ -548,7 +548,7 @@ def exec_tool(name: str, args: dict, ws: Path, cancel=None) -> str:
     except Exception as e:  # noqa: BLE001 - report all tool errors to the model
         return f"ERROR: {type(e).__name__}: {e}"
 ```
-（`server.py:275-323`、edit_fileのエラーメッセージ等は抜粋）
+（`server.py:276-324`、edit_fileのエラーメッセージ等は抜粋）
 
 設計上の要点:
 
@@ -599,7 +599,7 @@ def run_command(cmd: str, ws: Path, cancel) -> str:
         return f"ERROR: command {killed}\n{out}"
     return f"exit_code={p.returncode}\n{out}"
 ```
-（`server.py:243-272`）
+（`server.py:244-273`）
 
 以前は `subprocess.run(..., timeout=CMD_TIMEOUT)` を1回呼ぶだけの実装だったが、
 それだと**停止ボタンを押しても`communicate()`がブロックしたままで、実行中の
@@ -646,17 +646,23 @@ def list_subdirs(path: str) -> dict:
         p = HOME
     if not p.is_dir() or not under_home(p):
         p = HOME
-    dirs = sorted(e.name for e in p.iterdir()
-                  if e.is_dir() and not e.name.startswith("."))
+    dirs = sorted((e.name for e in p.iterdir()
+                  if e.is_dir() and not e.name.startswith(".")),
+                  key=str.lower)
     parent = str(p.parent) if p != HOME and under_home(p.parent) else None
     return {"path": str(p), "parent": parent, "dirs": dirs}
 ```
-（`server.py:223-240`）
+（`server.py:223-241`）
 
 範囲外や存在しないパスは黙って`HOME`にフォールバックする（GUI側は毎回サーバーの
 返す`path`を正として画面を更新するので、フォールバックが起きても不整合にならない）。
 隠しディレクトリ（`.`始まり、`.git`等）は一覧から除外し、`HOME`自身では`parent`が
 `None`になり「上へ」を出さない。`/api/browse`（3節）がこの関数を呼ぶ。
+
+並び順は `key=str.lower` で大文字小文字を無視する。素の`sorted()`はUnicode
+コードポイント順（大文字A-Zが小文字a-zより前）になるため、例えば
+`MP3Player`が`arm-gnu-toolchain`より前に来てしまい、人が期待する辞書順
+（大文字小文字を区別しない名前順）にならない。
 
 相対パスはワークスペース基準で解決し、絶対パスもいったん `resolve()` して
 シンボリックリンク経由の脱出も含めて正規化した上で、文字列前方一致で
@@ -737,7 +743,7 @@ def main():
     print(f"LocalCoder running: http://localhost:{PORT}  (ollama: {OLLAMA})")
     srv.serve_forever()
 ```
-（`server.py:739-746`）
+（`server.py:740-747`）
 
 `ThreadingHTTPServer` なので、複数タブ・複数セッションからの同時リクエストにも
 スレッド単位で並行対応する。ポートが既に使用中（＝二重起動）の場合はエラーで
