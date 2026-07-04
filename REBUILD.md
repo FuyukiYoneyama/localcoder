@@ -121,6 +121,15 @@ SSEイベントでGUIに🗜表示）。**要約入力自体の肥大に注意**
 壊れないよう境界を手前にずらす。検証: 冒頭に埋めた固有情報（コードネーム）が
 56868→7746トークンへの圧縮を生き残り、モデルが正答することを確認済み。
 
+**フォルダ選択ダイアログの設計ノート**: ブラウザ標準の`<input type="file" webkitdirectory>`は
+セキュリティ上の理由で絶対パスを返さない（相対パスのファイル一覧しか取れない）ため、
+作業フォルダ選択には使えない。代わりにサーバー側に`GET /api/browse?path=...`
+（要トークン、`$HOME`配下のみ許可・範囲外は`$HOME`にフォールバック、隠しディレクトリは
+除外）を追加し、GUI側にモーダル式のディレクトリブラウザを実装した
+（`list_subdirs()`, `server.py`参照）。「📁 参照」ボタン→現在の作業フォルダ欄の値を
+起点に一覧表示→ディレクトリクリックで下降、「.. (上へ)」でHOMEまで上昇可、
+「このフォルダを選択」で確定、という単純なナビゲーション。
+
 **edit_fileの設計ノート**: 完全一致のfind/replace（old_string→new_string、
 `replace_all`オプション付き）。既存ファイルの部分修正で全文書き換え（write_file）を
 使うと、大きいファイルほど出力トークンを浪費し、小型モデルは途中の行を書き換え忘れて
@@ -394,6 +403,26 @@ def resolve_path(ws: Path, p: str) -> Path:
     if not (str(full) == str(ws) or str(full).startswith(str(ws) + os.sep)):
         raise ValueError(f"path is outside the workspace: {p}")
     return full
+
+
+def under_home(p: Path) -> bool:
+    p = p.resolve()
+    return p == HOME or str(p).startswith(str(HOME) + os.sep)
+
+
+def list_subdirs(path: str) -> dict:
+    """作業フォルダ選択ダイアログ用。$HOME配下のサブディレクトリのみ一覧する。"""
+    p = Path(path or DEFAULT_WORKSPACE).expanduser()
+    try:
+        p = p.resolve()
+    except OSError:
+        p = HOME
+    if not p.is_dir() or not under_home(p):
+        p = HOME
+    dirs = sorted(e.name for e in p.iterdir()
+                  if e.is_dir() and not e.name.startswith("."))
+    parent = str(p.parent) if p != HOME and under_home(p.parent) else None
+    return {"path": str(p), "parent": parent, "dirs": dirs}
 
 
 def run_command(cmd: str, ws: Path, cancel) -> str:
@@ -739,6 +768,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"models": [m["name"] for m in data.get("models", [])]})
             except Exception as e:
                 self._json({"error": f"Ollamaに接続できません: {e}"}, 502)
+        elif self.path.startswith("/api/browse"):
+            # フォルダ選択ダイアログ用。ディレクトリ構造の開示のためトークン必須
+            if not self._token_ok():
+                self._json({"error": "forbidden"}, 403)
+                return
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            self._json(list_subdirs(q.get("path", [""])[0]))
         elif self.path == "/api/sessions":
             # 履歴はプロンプト・ツール結果・ファイル内容を含むためトークン必須
             if not self._token_ok():
@@ -966,6 +1002,24 @@ footer{display:flex;gap:10px;padding:12px 16px;background:var(--panel);border-to
 .spin{display:inline-block;width:12px;height:12px;border:2px solid var(--dim);
   border-top-color:var(--accent);border-radius:50%;animation:sp 1s linear infinite;vertical-align:-2px}
 @keyframes sp{to{transform:rotate(360deg)}}
+#browseBtn{padding:6px 10px}
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;
+  align-items:center;justify-content:center;z-index:100}
+.modal{background:var(--panel);border:1px solid var(--border);border-radius:10px;
+  width:520px;max-width:92vw;max-height:80vh;display:flex;flex-direction:column;
+  box-shadow:0 10px 40px rgba(0,0,0,.4)}
+.modal h3{margin:0;padding:12px 16px;font-size:14px;border-bottom:1px solid var(--border);
+  color:var(--accent)}
+.modal .curpath{padding:8px 16px;font-size:12px;color:var(--dim);word-break:break-all;
+  border-bottom:1px solid var(--border)}
+.modal .dirlist{flex:1;overflow-y:auto;padding:6px 0}
+.modal .direntry{padding:8px 16px;cursor:pointer;font-size:13px;display:flex;gap:8px;align-items:center}
+.modal .direntry:hover{background:var(--panel2)}
+.modal .direntry.up{color:var(--dim)}
+.modal .empty{padding:16px;color:var(--dim);font-size:13px}
+.modal .modal-footer{display:flex;gap:8px;justify-content:flex-end;padding:10px 16px;
+  border-top:1px solid var(--border)}
+.modal .modal-footer button.primary{background:var(--accent);color:#fff;border:none}
 </style>
 </head>
 <body>
@@ -973,10 +1027,22 @@ footer{display:flex;gap:10px;padding:12px 16px;background:var(--panel);border-to
   <h1>🛠 LocalCoder</h1>
   <label>モデル <select id="model"></select></label>
   <label>作業フォルダ <input type="text" id="workspace" placeholder="/home/youruser/project"></label>
+  <button id="browseBtn" title="フォルダを選ぶ">📁 参照</button>
   <button id="newBtn">＋ 新規チャット</button>
   <button id="stopBtn">■ 停止</button>
   <span id="status"></span>
 </header>
+<div id="browseModal" class="modal-overlay" style="display:none">
+  <div class="modal">
+    <h3>📁 作業フォルダを選ぶ</h3>
+    <div class="curpath" id="browsePath"></div>
+    <div class="dirlist" id="browseList"></div>
+    <div class="modal-footer">
+      <button id="browseCancel">キャンセル</button>
+      <button id="browseSelect" class="primary">このフォルダを選択</button>
+    </div>
+  </div>
+</div>
 <div id="layout">
   <aside id="side">
     <div id="sideHead">📚 履歴（クリックで再開）</div>
@@ -1174,6 +1240,46 @@ $("newBtn").onclick=newChat;
 if(window.LC_DEFAULT_WORKSPACE)$("workspace").value=window.LC_DEFAULT_WORKSPACE;
 loadModels();
 loadSessions();
+
+// ---------- フォルダ選択ダイアログ ----------
+let browsePath="";
+async function openBrowse(){
+  $("browseModal").style.display="flex";
+  await browseTo($("workspace").value.trim());
+}
+async function browseTo(path){
+  try{
+    const d=await(await getAuth("/api/browse?path="+encodeURIComponent(path||""))).json();
+    if(d.error){el("div","err","フォルダ一覧の取得に失敗: "+d.error);return}
+    browsePath=d.path;
+    $("browsePath").textContent=d.path;
+    const list=$("browseList"); list.innerHTML="";
+    if(d.parent){
+      const up=document.createElement("div");
+      up.className="direntry up"; up.textContent="⬆ .. (上へ)";
+      up.onclick=()=>browseTo(d.parent);
+      list.appendChild(up);
+    }
+    if(!d.dirs.length&&!d.parent){
+      list.innerHTML+="<div class='empty'>サブフォルダはありません</div>";
+    }
+    for(const name of d.dirs){
+      const it=document.createElement("div");
+      it.className="direntry"; it.textContent="📁 "+name;
+      it.onclick=()=>browseTo(d.path+"/"+name);
+      list.appendChild(it);
+    }
+  }catch(e){el("div","err","フォルダ一覧の取得に失敗: "+e)}
+}
+$("browseBtn").onclick=openBrowse;
+$("browseCancel").onclick=()=>{$("browseModal").style.display="none"};
+$("browseSelect").onclick=()=>{
+  $("workspace").value=browsePath;
+  $("browseModal").style.display="none";
+};
+$("browseModal").addEventListener("click",e=>{
+  if(e.target===$("browseModal"))$("browseModal").style.display="none";
+});
 </script>
 </body>
 </html>

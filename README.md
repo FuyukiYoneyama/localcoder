@@ -40,8 +40,9 @@ wsl -d ubuntu-24.04 -- bash -lc "python3 ~/localcoder/server.py"
 ## 使い方
 
 1. 画面上部でモデルを選択 (推奨: gpt-oss:20b。ツール呼び出しが最も安定)
-2. 作業フォルダを指定 (例: /home/youruser/project。未入力時は環境変数
-   `LOCALCODER_DEFAULT_WORKSPACE`の値、無ければ`$HOME`が自動で入る)
+2. 作業フォルダを指定。手入力のほか「📁 参照」ボタンでフォルダ選択ダイアログが
+   開く (`$HOME`配下のみ移動可能)。未入力時は環境変数
+   `LOCALCODER_DEFAULT_WORKSPACE`の値、無ければ`$HOME`が自動で入る
 3. やりたいことを日本語で入力して送信
 4. エージェントが自動でファイル作成・編集・コマンド実行・検証まで行う
    (承認プロンプトは一切なし。ツール実行内容は 🔧 カードで確認できる)

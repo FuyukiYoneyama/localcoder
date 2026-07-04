@@ -220,6 +220,26 @@ def resolve_path(ws: Path, p: str) -> Path:
     return full
 
 
+def under_home(p: Path) -> bool:
+    p = p.resolve()
+    return p == HOME or str(p).startswith(str(HOME) + os.sep)
+
+
+def list_subdirs(path: str) -> dict:
+    """作業フォルダ選択ダイアログ用。$HOME配下のサブディレクトリのみ一覧する。"""
+    p = Path(path or DEFAULT_WORKSPACE).expanduser()
+    try:
+        p = p.resolve()
+    except OSError:
+        p = HOME
+    if not p.is_dir() or not under_home(p):
+        p = HOME
+    dirs = sorted(e.name for e in p.iterdir()
+                  if e.is_dir() and not e.name.startswith("."))
+    parent = str(p.parent) if p != HOME and under_home(p.parent) else None
+    return {"path": str(p), "parent": parent, "dirs": dirs}
+
+
 def run_command(cmd: str, ws: Path, cancel) -> str:
     # start_new_session=True でプロセスグループを分離し、キャンセル/タイムアウト時に
     # killpg でパイプの先やバックグラウンド子プロセスまで確実に止める
@@ -563,6 +583,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"models": [m["name"] for m in data.get("models", [])]})
             except Exception as e:
                 self._json({"error": f"Ollamaに接続できません: {e}"}, 502)
+        elif self.path.startswith("/api/browse"):
+            # フォルダ選択ダイアログ用。ディレクトリ構造の開示のためトークン必須
+            if not self._token_ok():
+                self._json({"error": "forbidden"}, 403)
+                return
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            self._json(list_subdirs(q.get("path", [""])[0]))
         elif self.path == "/api/sessions":
             # 履歴はプロンプト・ツール結果・ファイル内容を含むためトークン必須
             if not self._token_ok():

@@ -99,7 +99,7 @@ def _post_ok(self) -> bool:
         return False
     return self._token_ok()
 ```
-（`server.py:502-528`）
+（`server.py:522-548`）
 
 なぜこれが要るか: `ThreadingHTTPServer` は `127.0.0.1` にしかバインドしていない
 （7節）が、それだけでは**同じPC上でブラウザが開いている悪意あるWebページ**からの
@@ -153,7 +153,7 @@ def do_GET(self):
     elif self.path == "/api/health":
         ...
 ```
-（`server.py:531-586`）
+（`server.py:551-613`）
 
 ```python
 def do_POST(self):
@@ -168,7 +168,7 @@ def do_POST(self):
         self.handle_chat()
         ...
 ```
-（`server.py:589-610`）
+（`server.py:616-637`）
 
 | メソッド | パス | 役割 |
 |---|---|---|
@@ -200,7 +200,7 @@ if self.path in ("/", "/index.html"):
     self.send_response(200)
     ...
 ```
-（`server.py:535-541`）
+（`server.py:555-561`）
 
 クライアント側（`index.html`）はこの `window.LC_TOKEN` を読み、全POSTで
 `X-LocalCoder-Token` ヘッダとして送り返す（後述）。同時に埋め込まれる
@@ -225,7 +225,7 @@ elif self.path.startswith("/vendor/"):
     else:
         self._json({"error": "not found"}, 404)
 ```
-（`server.py:546-558`）
+（`server.py:566-578`）
 
 `index.html`は`marked`/`DOMPurify`を`https://cdn.jsdelivr.net/...`ではなく
 `/vendor/marked.min.js`・`/vendor/purify.min.js`から読み込む。このページには
@@ -248,7 +248,29 @@ elif self.path == "/api/models":
     except Exception as e:
         self._json({"error": f"Ollamaに接続できません: {e}"}, 502)
 ```
-（`server.py:559-565`）
+（`server.py:579-585`）
+
+### 3-2. 作業フォルダ選択ダイアログ — `/api/browse`
+
+GUIの「📁 参照」ボタンが叩くエンドポイント:
+
+```python
+elif self.path.startswith("/api/browse"):
+    # フォルダ選択ダイアログ用。ディレクトリ構造の開示のためトークン必須
+    if not self._token_ok():
+        self._json({"error": "forbidden"}, 403)
+        return
+    q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+    self._json(list_subdirs(q.get("path", [""])[0]))
+```
+（`server.py:586-592`）
+
+ブラウザ標準の`<input type="file" webkitdirectory>`はセキュリティ上、選択した
+フォルダの絶対パスを返さない（相対パスのファイル一覧しか取れない）ため、作業
+フォルダの選択には使えない。かわりにこのエンドポイントで`$HOME`配下のディレクトリ
+構造をサーバー側から返し、`index.html`側にモーダル式のブラウザを実装している
+（5-2節`list_subdirs()`参照）。ディレクトリ構造もプライベートな情報なので、
+履歴系と同様にトークンを要求する。
 
 ---
 
@@ -279,7 +301,7 @@ def handle_chat(self):
     messages = [{"role": "system", "content": SYSTEM_PROMPT.format(ws=ws)}]
     messages += body.get("messages", [])
 ```
-（`server.py:612-631`）
+（`server.py:639-658`）
 
 ここで重要なのは2点:
 
@@ -317,7 +339,7 @@ for it in range(MAX_ITER):
         if chunk.get("done"):
             break
 ```
-（`server.py:634-654`）
+（`server.py:661-681`）
 
 反復の先頭で毎回 `compact_history()`（4-4節）を通しているのは、リクエスト開始時に
 長すぎる履歴が来た場合と、ツール結果が反復のたびに積み上がって途中で予算を超える
@@ -336,7 +358,9 @@ def ollama_stream(payload: dict):
             if line:
                 yield json.loads(line)
 ```
-（`server.py:306-314`）
+（`server.py:326-334`）
+
+（`ollama_ask` は履歴要約用の非ストリーミング問い合わせ。4-4節参照。）
 
 チャンクごとに `thinking`（推論過程）・`content`（本文）・`tool_calls`（ツール呼び出し要求）
 の3種が流れてきうる。それぞれをそのままブラウザへSSEで中継する
@@ -378,7 +402,7 @@ for tc in tool_calls:
     messages.append({"role": "tool", "tool_name": name,
                      "name": name, "content": result})
 ```
-（`server.py:656-683`）
+（`server.py:683-710`）
 
 これが **エージェントループの心臓部**：
 1. モデルの応答（`assistant` メッセージ）を履歴に追加
@@ -399,7 +423,7 @@ else:
     self._sse({"type": "error",
                "message": f"最大ループ回数({MAX_ITER})に達しました"})
 ```
-（`server.py:684-686`）
+（`server.py:711-713`）
 
 （この `else` は `for...else` 構文で、`break` されずにループが尽きた場合のみ実行される）
 
@@ -409,7 +433,7 @@ else:
 self._sse({"type": "history", "messages": messages[1:]})
 self._sse({"type": "all_done"})
 ```
-（`server.py:689-690`）
+（`server.py:716-717`）
 
 システムプロンプト（`messages[0]`）を除いた全履歴をクライアントへ返す。
 クライアントはこれを次回リクエストの `messages` としてそのまま送り返すことで
@@ -426,7 +450,7 @@ finally:
         except Exception:
             pass
 ```
-（`server.py:703-709`）
+（`server.py:730-736`）
 
 ### 4-4. 履歴の自動圧縮 — `compact_history`
 
@@ -524,7 +548,7 @@ def exec_tool(name: str, args: dict, ws: Path, cancel=None) -> str:
     except Exception as e:  # noqa: BLE001 - report all tool errors to the model
         return f"ERROR: {type(e).__name__}: {e}"
 ```
-（`server.py:255-303`、edit_fileのエラーメッセージ等は抜粋）
+（`server.py:275-323`、edit_fileのエラーメッセージ等は抜粋）
 
 設計上の要点:
 
@@ -575,7 +599,7 @@ def run_command(cmd: str, ws: Path, cancel) -> str:
         return f"ERROR: command {killed}\n{out}"
     return f"exit_code={p.returncode}\n{out}"
 ```
-（`server.py:223-252`）
+（`server.py:243-272`）
 
 以前は `subprocess.run(..., timeout=CMD_TIMEOUT)` を1回呼ぶだけの実装だったが、
 それだと**停止ボタンを押しても`communicate()`がブロックしたままで、実行中の
@@ -603,6 +627,36 @@ def resolve_path(ws: Path, p: str) -> Path:
     return full
 ```
 （`server.py:214-220`）
+
+作業フォルダ選択ダイアログ用に、`resolve_path`の直後に類似ロジックの
+ディレクトリ一覧関数がある:
+
+```python
+def under_home(p: Path) -> bool:
+    p = p.resolve()
+    return p == HOME or str(p).startswith(str(HOME) + os.sep)
+
+
+def list_subdirs(path: str) -> dict:
+    """作業フォルダ選択ダイアログ用。$HOME配下のサブディレクトリのみ一覧する。"""
+    p = Path(path or DEFAULT_WORKSPACE).expanduser()
+    try:
+        p = p.resolve()
+    except OSError:
+        p = HOME
+    if not p.is_dir() or not under_home(p):
+        p = HOME
+    dirs = sorted(e.name for e in p.iterdir()
+                  if e.is_dir() and not e.name.startswith("."))
+    parent = str(p.parent) if p != HOME and under_home(p.parent) else None
+    return {"path": str(p), "parent": parent, "dirs": dirs}
+```
+（`server.py:223-240`）
+
+範囲外や存在しないパスは黙って`HOME`にフォールバックする（GUI側は毎回サーバーの
+返す`path`を正として画面を更新するので、フォールバックが起きても不整合にならない）。
+隠しディレクトリ（`.`始まり、`.git`等）は一覧から除外し、`HOME`自身では`parent`が
+`None`になり「上へ」を出さない。`/api/browse`（3節）がこの関数を呼ぶ。
 
 相対パスはワークスペース基準で解決し、絶対パスもいったん `resolve()` して
 シンボリックリンク経由の脱出も含めて正規化した上で、文字列前方一致で
@@ -683,7 +737,7 @@ def main():
     print(f"LocalCoder running: http://localhost:{PORT}  (ollama: {OLLAMA})")
     srv.serve_forever()
 ```
-（`server.py:712-719`）
+（`server.py:739-746`）
 
 `ThreadingHTTPServer` なので、複数タブ・複数セッションからの同時リクエストにも
 スレッド単位で並行対応する。ポートが既に使用中（＝二重起動）の場合はエラーで
