@@ -50,8 +50,10 @@ wsl -d ubuntu-24.04 -- bash -lc "python3 ~/localcoder/server.py"
 
 - `server.py` — HTTPサーバー + エージェントループ (Ollama /api/chat + tools)
 - `index.html` — チャットGUI (SSEストリーミング表示)
-- ツール: run_command / read_file / write_file / list_dir / web_search / fetch_url
+- ツール: run_command / read_file / write_file / edit_file / list_dir / web_search / fetch_url
   - ファイル操作は作業フォルダ内に制限
+  - edit_file は完全一致のfind/replace。既存ファイルの部分修正は全文書き換えでなく
+    こちらが優先される (トークン節約 + 書き換え漏れ事故の防止)
   - コマンドは作業フォルダをcwdとして実行 (タイムアウト180秒)
   - web_search は DuckDuckGo (無料・APIキー不要)、fetch_url はページ本文取得
 

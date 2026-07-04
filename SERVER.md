@@ -99,7 +99,7 @@ def _post_ok(self) -> bool:
         return False
     return self._token_ok()
 ```
-（`server.py:306-332`）
+（`server.py:339-365`）
 
 なぜこれが要るか: `ThreadingHTTPServer` は `127.0.0.1` にしかバインドしていない
 （7節）が、それだけでは**同じPC上でブラウザが開いている悪意あるWebページ**からの
@@ -153,7 +153,7 @@ def do_GET(self):
     elif self.path == "/api/health":
         ...
 ```
-（`server.py:335-390`）
+（`server.py:368-423`）
 
 ```python
 def do_POST(self):
@@ -168,7 +168,7 @@ def do_POST(self):
         self.handle_chat()
         ...
 ```
-（`server.py:393-414`）
+（`server.py:426-447`）
 
 | メソッド | パス | 役割 |
 |---|---|---|
@@ -200,7 +200,7 @@ if self.path in ("/", "/index.html"):
     self.send_response(200)
     ...
 ```
-（`server.py:339-345`）
+（`server.py:372-378`）
 
 クライアント側（`index.html`）はこの `window.LC_TOKEN` を読み、全POSTで
 `X-LocalCoder-Token` ヘッダとして送り返す（後述）。同時に埋め込まれる
@@ -225,7 +225,7 @@ elif self.path.startswith("/vendor/"):
     else:
         self._json({"error": "not found"}, 404)
 ```
-（`server.py:350-362`）
+（`server.py:383-395`）
 
 `index.html`は`marked`/`DOMPurify`を`https://cdn.jsdelivr.net/...`ではなく
 `/vendor/marked.min.js`・`/vendor/purify.min.js`から読み込む。このページには
@@ -248,7 +248,7 @@ elif self.path == "/api/models":
     except Exception as e:
         self._json({"error": f"Ollamaに接続できません: {e}"}, 502)
 ```
-（`server.py:363-369`）
+（`server.py:396-402`）
 
 ---
 
@@ -279,7 +279,7 @@ def handle_chat(self):
     messages = [{"role": "system", "content": SYSTEM_PROMPT.format(ws=ws)}]
     messages += body.get("messages", [])
 ```
-（`server.py:416-435`）
+（`server.py:449-468`）
 
 ここで重要なのは2点:
 
@@ -315,7 +315,7 @@ for it in range(MAX_ITER):
         if chunk.get("done"):
             break
 ```
-（`server.py:438-456`）
+（`server.py:471-489`）
 
 `ollama_stream` は `/api/chat` にJSON Linesでストリーミングする薄いラッパー:
 
@@ -330,7 +330,7 @@ def ollama_stream(payload: dict):
             if line:
                 yield json.loads(line)
 ```
-（`server.py:265-273`）
+（`server.py:298-306`）
 
 チャンクごとに `thinking`（推論過程）・`content`（本文）・`tool_calls`（ツール呼び出し要求）
 の3種が流れてきうる。それぞれをそのままブラウザへSSEで中継する
@@ -372,7 +372,7 @@ for tc in tool_calls:
     messages.append({"role": "tool", "tool_name": name,
                      "name": name, "content": result})
 ```
-（`server.py:458-485`）
+（`server.py:491-518`）
 
 これが **エージェントループの心臓部**：
 1. モデルの応答（`assistant` メッセージ）を履歴に追加
@@ -393,7 +393,7 @@ else:
     self._sse({"type": "error",
                "message": f"最大ループ回数({MAX_ITER})に達しました"})
 ```
-（`server.py:486-488`）
+（`server.py:519-521`）
 
 （この `else` は `for...else` 構文で、`break` されずにループが尽きた場合のみ実行される）
 
@@ -403,7 +403,7 @@ else:
 self._sse({"type": "history", "messages": messages[1:]})
 self._sse({"type": "all_done"})
 ```
-（`server.py:491-492`）
+（`server.py:524-525`）
 
 システムプロンプト（`messages[0]`）を除いた全履歴をクライアントへ返す。
 クライアントはこれを次回リクエストの `messages` としてそのまま送り返すことで
@@ -420,13 +420,13 @@ finally:
         except Exception:
             pass
 ```
-（`server.py:505-511`）
+（`server.py:538-544`）
 
 ---
 
 ## 5. ツール実行 — `exec_tool` / `run_command`
 
-`exec_tool` が6種のツール名を振り分ける:
+`exec_tool` が7種のツール名を振り分ける:
 
 ```python
 def exec_tool(name: str, args: dict, ws: Path, cancel=None) -> str:
@@ -444,6 +444,20 @@ def exec_tool(name: str, args: dict, ws: Path, cancel=None) -> str:
             f.parent.mkdir(parents=True, exist_ok=True)
             f.write_text(args["content"])
             return f"OK: wrote {len(args['content'])} chars to {args['path']}"
+        if name == "edit_file":
+            f = resolve_path(ws, args["path"])
+            old, new = args["old_string"], args["new_string"]
+            ...  # 空文字/同一文字列/ファイル不存在チェック
+            t = f.read_text(errors="replace")
+            n = t.count(old)
+            if n == 0:
+                return ("ERROR: old_string not found in file. Use read_file to see "
+                        ...)
+            if n > 1 and not args.get("replace_all"):
+                return (f"ERROR: old_string occurs {n} times. ..."
+                        ...)
+            f.write_text(t.replace(old, new))
+            return (f"OK: replaced ...")
         if name == "list_dir":
             f = resolve_path(ws, args.get("path") or ".")
             items = sorted(e.name + ("/" if e.is_dir() else "") for e in f.iterdir())
@@ -456,14 +470,22 @@ def exec_tool(name: str, args: dict, ws: Path, cancel=None) -> str:
     except Exception as e:  # noqa: BLE001 - report all tool errors to the model
         return f"ERROR: {type(e).__name__}: {e}"
 ```
-（`server.py:237-262`）
+（`server.py:247-295`、edit_fileのエラーメッセージ等は抜粋）
 
 設計上の要点:
 
 - **例外は握りつぶさずモデルに返す**（`except Exception as e: return f"ERROR: ..."`）。
   これにより、例えば `python` コマンドが無い環境でエラーが返ると、モデルが
   `python3` に自分で切り替えて再試行する、といった自己回復的な挙動が生まれる。
-- **read_file / write_file / list_dir はすべて `resolve_path()` を経由** する（5-2節）。
+- **read_file / write_file / edit_file / list_dir はすべて `resolve_path()` を経由**
+  する（5-2節）。
+- **edit_file は既存ファイルの部分修正専用**。全文書き換え（write_file）だと大きい
+  ファイルほど出力トークンを浪費し、小型モデルは途中の行を書き換え忘れて壊しやすい
+  ため、システムプロンプトで edit_file 優先に誘導している。old_string は完全一致かつ
+  一意でなければならず、0件/複数件ヒット時のエラーメッセージには「read_fileで正確に
+  コピーせよ」「文脈を足して一意にせよ／replace_all=trueにせよ」「無理なら
+  write_fileで書き直せ」という次の一手が書いてあり、失敗してもモデルが自力で
+  回復できるようにしてある。
 
 ### 5-1. `run_command` — 停止ボタンとタイムアウトを実効化する
 
@@ -499,7 +521,7 @@ def run_command(cmd: str, ws: Path, cancel) -> str:
         return f"ERROR: command {killed}\n{out}"
     return f"exit_code={p.returncode}\n{out}"
 ```
-（`server.py:205-234`）
+（`server.py:215-244`）
 
 以前は `subprocess.run(..., timeout=CMD_TIMEOUT)` を1回呼ぶだけの実装だったが、
 それだと**停止ボタンを押しても`communicate()`がブロックしたままで、実行中の
@@ -526,7 +548,7 @@ def resolve_path(ws: Path, p: str) -> Path:
         raise ValueError(f"path is outside the workspace: {p}")
     return full
 ```
-（`server.py:196-202`）
+（`server.py:206-212`）
 
 相対パスはワークスペース基準で解決し、絶対パスもいったん `resolve()` して
 シンボリックリンク経由の脱出も含めて正規化した上で、文字列前方一致で
@@ -568,7 +590,7 @@ def web_search(query: str, max_results: int = 6) -> str:
         html_text, re.S)
     ...
 ```
-（`server.py:113-131`）
+（`server.py:123-141`）
 
 正規表現でDuckDuckGoのHTML構造から検索結果のリンク・タイトル・スニペットを
 抜き出しているだけの軽量実装（＝DuckDuckGo側のHTML構造が変わると壊れる）。
@@ -583,10 +605,10 @@ class _TextExtract(HTMLParser):
         if not self.depth and d.strip():
             self.parts.append(d.strip())
 ```
-（`server.py:134-152`）
+（`server.py:144-162`）
 
 `script`/`style`/`svg`/`head` タグの中身は無視しつつ、テキストノードだけを
-収集する。結果は1万文字で切り詰められる（`server.py:162-163`）。
+収集する。結果は1万文字で切り詰められる（`server.py:172-173`）。
 
 `fetch_url` で取得したテキストや `web_search` の結果はそのまま `tool` メッセージの
 `content` としてモデルに渡り、最終的にモデルの応答（Markdown）としてブラウザに
@@ -607,7 +629,7 @@ def main():
     print(f"LocalCoder running: http://localhost:{PORT}  (ollama: {OLLAMA})")
     srv.serve_forever()
 ```
-（`server.py:514-521`）
+（`server.py:547-554`）
 
 `ThreadingHTTPServer` なので、複数タブ・複数セッションからの同時リクエストにも
 スレッド単位で並行対応する。ポートが既に使用中（＝二重起動）の場合はエラーで

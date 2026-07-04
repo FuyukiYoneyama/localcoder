@@ -99,11 +99,21 @@ Start-Process "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe" -ArgumentList "serv
 LLMがツール呼び出しを返したら承認なしで即実行 → 結果を履歴に追加して再問い合わせ →
 ツール呼び出しがなくなる（=タスク完了）まで最大40回繰り返す。
 
-**ツール6種**: `run_command`（bash実行, cwd=作業フォルダ, 180秒タイムアウト、停止ボタン/
-タイムアウトでプロセスグループごとkill）/ `read_file` / `write_file` / `list_dir`
-（ファイル系は作業フォルダ外へのアクセスを拒否）/ `web_search`（DuckDuckGo HTML版の
+**ツール7種**: `run_command`（bash実行, cwd=作業フォルダ, 180秒タイムアウト、停止ボタン/
+タイムアウトでプロセスグループごとkill）/ `read_file` / `write_file` / `edit_file` /
+`list_dir`（ファイル系は作業フォルダ外へのアクセスを拒否）/ `web_search`（DuckDuckGo HTML版の
 スクレイピング、APIキー不要・無料）/ `fetch_url`（ページ取得→HTMLタグ除去テキスト、10KB上限）。
 作業フォルダ自体も `$HOME` 配下でなければリクエストが拒否される。
+
+**edit_fileの設計ノート**: 完全一致のfind/replace（old_string→new_string、
+`replace_all`オプション付き）。既存ファイルの部分修正で全文書き換え（write_file）を
+使うと、大きいファイルほど出力トークンを浪費し、小型モデルは途中の行を書き換え忘れて
+ファイルを壊しやすい。そのためシステムプロンプトで「部分修正はedit_file優先、
+write_fileは新規作成か全面書き換えのみ」と誘導している。小型モデルは完全一致の
+old_stringを作るのが苦手な場合があるため、失敗時のエラーメッセージに次の一手
+（read_fileで正確にコピーせよ／一意になるまで文脈を足せ／諦めてwrite_fileにせよ）を
+書いてあり、モデルが自己回復できる。gpt-oss:20bでは「PORT変更とDEBUG変更を
+edit_file 2回でピンポイント修正→read_fileで検証」という理想的な挙動を確認済み。
 
 **POST APIはCSRFトークン必須**: 起動ごとに生成するランダムトークンを`index.html`配信時に
 埋め込み、全POSTで `X-LocalCoder-Token` ヘッダ＋Origin/Host/Content-Type検証を行う
@@ -196,7 +206,8 @@ SYSTEM_PROMPT = """You are LocalCoder, an autonomous coding agent running on the
 Workspace directory: {ws}
 
 Rules:
-- You have tools: run_command, read_file, write_file, list_dir, web_search, fetch_url. Use them freely without asking permission.
+- You have tools: run_command, read_file, write_file, edit_file, list_dir, web_search, fetch_url. Use them freely without asking permission.
+- To change part of an existing file, prefer edit_file (exact find & replace) instead of rewriting the whole file with write_file. Use write_file only for new files or complete rewrites.
 - When you need up-to-date information (library usage, API docs, error messages, versions), use web_search first, then fetch_url on the most promising result. Prefer official documentation.
 - Inspect existing files before editing them. Never overwrite a file you have not read.
 - After making changes, VERIFY them by running the code, build, or tests with run_command.
@@ -225,6 +236,15 @@ TOOLS = [
             "path": {"type": "string", "description": "File path (relative to workspace or absolute)"},
             "content": {"type": "string", "description": "Full file content to write"}},
             "required": ["path", "content"]}}},
+    {"type": "function", "function": {
+        "name": "edit_file",
+        "description": "Edit an existing text file by exact string replacement. Preferred over write_file for changing part of a file: cheaper and safer than rewriting the whole file. old_string must match the file content exactly, including whitespace and indentation.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "File path (relative to workspace or absolute)"},
+            "old_string": {"type": "string", "description": "Exact existing text to find. Must be unique in the file unless replace_all is true."},
+            "new_string": {"type": "string", "description": "Text to replace it with"},
+            "replace_all": {"type": "boolean", "description": "Replace every occurrence (default false)"}},
+            "required": ["path", "old_string", "new_string"]}}},
     {"type": "function", "function": {
         "name": "list_dir",
         "description": "List files and directories at a path.",
@@ -399,6 +419,29 @@ def exec_tool(name: str, args: dict, ws: Path, cancel=None) -> str:
             f.parent.mkdir(parents=True, exist_ok=True)
             f.write_text(args["content"])
             return f"OK: wrote {len(args['content'])} chars to {args['path']}"
+        if name == "edit_file":
+            f = resolve_path(ws, args["path"])
+            old, new = args["old_string"], args["new_string"]
+            if not old:
+                return "ERROR: old_string must not be empty"
+            if old == new:
+                return "ERROR: old_string and new_string are identical"
+            if not f.is_file():
+                return f"ERROR: file not found: {args['path']}"
+            t = f.read_text(errors="replace")
+            n = t.count(old)
+            if n == 0:
+                return ("ERROR: old_string not found in file. Use read_file to see "
+                        "the current content and copy the exact text including "
+                        "whitespace and indentation. If matching is too hard, "
+                        "rewrite the file with write_file instead.")
+            if n > 1 and not args.get("replace_all"):
+                return (f"ERROR: old_string occurs {n} times. Include more "
+                        "surrounding lines to make it unique, or set "
+                        "replace_all=true to replace every occurrence.")
+            f.write_text(t.replace(old, new))
+            return (f"OK: replaced {n if args.get('replace_all') else 1} "
+                    f"occurrence(s) in {args['path']}")
         if name == "list_dir":
             f = resolve_path(ws, args.get("path") or ".")
             items = sorted(e.name + ("/" if e.is_dir() else "") for e in f.iterdir())

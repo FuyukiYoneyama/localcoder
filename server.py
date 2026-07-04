@@ -46,7 +46,8 @@ SYSTEM_PROMPT = """You are LocalCoder, an autonomous coding agent running on the
 Workspace directory: {ws}
 
 Rules:
-- You have tools: run_command, read_file, write_file, list_dir, web_search, fetch_url. Use them freely without asking permission.
+- You have tools: run_command, read_file, write_file, edit_file, list_dir, web_search, fetch_url. Use them freely without asking permission.
+- To change part of an existing file, prefer edit_file (exact find & replace) instead of rewriting the whole file with write_file. Use write_file only for new files or complete rewrites.
 - When you need up-to-date information (library usage, API docs, error messages, versions), use web_search first, then fetch_url on the most promising result. Prefer official documentation.
 - Inspect existing files before editing them. Never overwrite a file you have not read.
 - After making changes, VERIFY them by running the code, build, or tests with run_command.
@@ -75,6 +76,15 @@ TOOLS = [
             "path": {"type": "string", "description": "File path (relative to workspace or absolute)"},
             "content": {"type": "string", "description": "Full file content to write"}},
             "required": ["path", "content"]}}},
+    {"type": "function", "function": {
+        "name": "edit_file",
+        "description": "Edit an existing text file by exact string replacement. Preferred over write_file for changing part of a file: cheaper and safer than rewriting the whole file. old_string must match the file content exactly, including whitespace and indentation.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "File path (relative to workspace or absolute)"},
+            "old_string": {"type": "string", "description": "Exact existing text to find. Must be unique in the file unless replace_all is true."},
+            "new_string": {"type": "string", "description": "Text to replace it with"},
+            "replace_all": {"type": "boolean", "description": "Replace every occurrence (default false)"}},
+            "required": ["path", "old_string", "new_string"]}}},
     {"type": "function", "function": {
         "name": "list_dir",
         "description": "List files and directories at a path.",
@@ -249,6 +259,29 @@ def exec_tool(name: str, args: dict, ws: Path, cancel=None) -> str:
             f.parent.mkdir(parents=True, exist_ok=True)
             f.write_text(args["content"])
             return f"OK: wrote {len(args['content'])} chars to {args['path']}"
+        if name == "edit_file":
+            f = resolve_path(ws, args["path"])
+            old, new = args["old_string"], args["new_string"]
+            if not old:
+                return "ERROR: old_string must not be empty"
+            if old == new:
+                return "ERROR: old_string and new_string are identical"
+            if not f.is_file():
+                return f"ERROR: file not found: {args['path']}"
+            t = f.read_text(errors="replace")
+            n = t.count(old)
+            if n == 0:
+                return ("ERROR: old_string not found in file. Use read_file to see "
+                        "the current content and copy the exact text including "
+                        "whitespace and indentation. If matching is too hard, "
+                        "rewrite the file with write_file instead.")
+            if n > 1 and not args.get("replace_all"):
+                return (f"ERROR: old_string occurs {n} times. Include more "
+                        "surrounding lines to make it unique, or set "
+                        "replace_all=true to replace every occurrence.")
+            f.write_text(t.replace(old, new))
+            return (f"OK: replaced {n if args.get('replace_all') else 1} "
+                    f"occurrence(s) in {args['path']}")
         if name == "list_dir":
             f = resolve_path(ws, args.get("path") or ".")
             items = sorted(e.name + ("/" if e.is_dir() else "") for e in f.iterdir())
