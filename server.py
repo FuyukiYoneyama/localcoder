@@ -29,6 +29,14 @@ MAX_ITER = 40          # 1リクエストあたりの最大ツールループ回
 CMD_TIMEOUT = 180      # コマンド実行タイムアウト(秒)
 NUM_CTX = 32768
 
+# --- 履歴の自動圧縮 (コンテキスト溢れ対策) ---
+RESERVE_TOKENS = 8192   # 生成(thinking含む)+システムプロンプト用に確保する分
+KEEP_RECENT_MSGS = 6    # 要約時に原文のまま残す直近メッセージ数
+KEEP_RECENT_TOOLS = 4   # 切り詰めずに残す直近のツール結果数
+TOOL_TRIM_CHARS = 500   # 古いツール結果の切り詰め後サイズ
+MSG_EXCERPT_CHARS = 1000            # 要約入力で1メッセージから取る最大文字数
+SUMMARIZE_INPUT_TOKENS = NUM_CTX // 2  # 要約1回の入力上限 (超えたら分割要約)
+
 CANCEL = {}            # sid -> threading.Event
 HISTORY_DIR = ROOT / "history"   # チャット履歴の保存先 (1会話 = 1 JSONファイル)
 HISTORY_DIR.mkdir(exist_ok=True)
@@ -306,6 +314,161 @@ def ollama_stream(payload: dict):
                 yield json.loads(line)
 
 
+def ollama_ask(model: str, prompt: str) -> str:
+    """非ストリーミングの単発問い合わせ (履歴要約用)。"""
+    payload = {"model": model, "stream": False,
+               "messages": [{"role": "user", "content": prompt}],
+               "options": {"num_ctx": NUM_CTX}}
+    req = urllib.request.Request(OLLAMA + "/api/chat",
+                                 data=json.dumps(payload).encode(),
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=600) as r:
+        return json.loads(r.read()).get("message", {}).get("content", "")
+
+
+# ---------- 履歴の自動圧縮 ----------
+def estimate_text_tokens(t: str) -> int:
+    """トークン数の概算。ASCIIは4文字/トークン、日本語等の非ASCIIは1文字/トークンで見積もる。"""
+    ascii_n = sum(1 for c in t if ord(c) < 128)
+    return ascii_n // 4 + (len(t) - ascii_n)
+
+
+def estimate_tokens(messages: list) -> int:
+    total = 0
+    for m in messages:
+        total += 8  # メッセージ枠のオーバーヘッド
+        text = str(m.get("content") or "")
+        if m.get("tool_calls"):
+            text += json.dumps(m["tool_calls"], ensure_ascii=False)
+        total += estimate_text_tokens(text)
+    return total
+
+
+def _excerpt(t: str, limit: int = MSG_EXCERPT_CHARS) -> str:
+    """長文を先頭7割+末尾3割の抜粋にする (要約入力の肥大防止)。"""
+    if len(t) <= limit:
+        return t
+    return t[:limit * 7 // 10] + "\n…[中略]…\n" + t[-(limit * 3 // 10):]
+
+
+def trim_old_tool_results(messages: list) -> bool:
+    """直近KEEP_RECENT_TOOLS件を除くツール結果を切り詰める(圧縮の第1段階・安価)。"""
+    tool_idx = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
+    changed = False
+    for i in tool_idx[:-KEEP_RECENT_TOOLS] if len(tool_idx) > KEEP_RECENT_TOOLS else []:
+        c = messages[i].get("content") or ""
+        if len(c) > TOOL_TRIM_CHARS:
+            messages[i]["content"] = (c[:TOOL_TRIM_CHARS]
+                                      + "\n...[古いツール結果のため切り詰め]...")
+            changed = True
+    return changed
+
+
+def render_transcript(messages: list) -> str:
+    """要約プロンプト用に会話を平文化する。各メッセージは抜粋化して肥大を防ぐ。"""
+    parts = []
+    for m in messages:
+        role = m.get("role", "?")
+        c = str(m.get("content") or "")
+        if m.get("tool_calls"):
+            calls = ", ".join(
+                f"{tc.get('function', {}).get('name', '?')}"
+                f"({json.dumps(tc.get('function', {}).get('arguments', {}), ensure_ascii=False)[:200]})"
+                for tc in m["tool_calls"])
+            c = (c + f"\n[ツール呼び出し: {calls}]").strip()
+        if role == "tool":
+            c = f"[{m.get('tool_name', 'tool')}の結果] {c[:800]}"
+        else:
+            c = _excerpt(c)
+        parts.append(f"### {role}\n{c}")
+    return "\n\n".join(parts)
+
+
+SUMMARIZE_PROMPT = """以下はコーディングエージェントとユーザーの会話ログである。
+今後の作業を継続するために必要な情報だけを日本語で簡潔に要約せよ。必ず含めること:
+- ユーザーの目的・指示・好み (「覚えておいて」と言われた事項は一字一句そのまま)
+- 作成/変更したファイル (パス付き) とその内容の要点
+- 判明した重要な技術的事実・決定事項
+- 未完了の作業・次にやること
+出力は要約本文のみ。前置きや締めの文は不要。
+
+--- 会話ログ ---
+{log}
+--- ログここまで ---
+
+上記ログを冒頭の指示に従って日本語で要約せよ。出力は要約本文のみ。"""
+
+
+def summarize_old(old: list, model: str) -> str:
+    """古いメッセージ群を要約する。入力が要約1回の上限を超える場合は分割して各々要約。
+
+    (要約入力自体がnum_ctxを超えるとollamaがプロンプト前方=指示部分を切り捨てて
+    しまい、要約が壊れる。必ず1回分をSUMMARIZE_INPUT_TOKENS以内に収める)
+    """
+    chunks, cur, cur_tok = [], [], 0
+    for m in old:
+        tok = estimate_text_tokens(render_transcript([m]))
+        if cur and cur_tok + tok > SUMMARIZE_INPUT_TOKENS:
+            chunks.append(cur)
+            cur, cur_tok = [], 0
+        cur.append(m)
+        cur_tok += tok
+    if cur:
+        chunks.append(cur)
+    parts = []
+    for ch in chunks:
+        s = ollama_ask(model, SUMMARIZE_PROMPT.format(
+            log=render_transcript(ch))).strip()
+        if s:
+            parts.append(s)
+    if not parts:
+        raise ValueError("empty summary")
+    return "\n\n".join(parts)
+
+
+def compact_history(messages: list, model: str, sse) -> list:
+    """messages(先頭はsystem)が予算を超えていたら圧縮して返す。超えていなければそのまま。
+
+    第1段階: 古いツール結果の切り詰め (安価・LLM不使用)
+    第2段階: 直近KEEP_RECENT_MSGS件を残して古い部分をLLMで要約し1メッセージに置換
+    要約失敗時: 古い部分を単純に省略 (最後の手段。文脈は失われるが溢れて壊れるよりよい)
+    """
+    budget = NUM_CTX - RESERVE_TOKENS
+    est = estimate_tokens(messages)
+    if est <= budget:
+        return messages
+
+    trim_old_tool_results(messages)
+    est2 = estimate_tokens(messages)
+    if est2 <= budget:
+        sse({"type": "compact",
+             "message": f"古いツール結果を切り詰めました (推定 {est}→{est2} トークン)"})
+        return messages
+
+    body = messages[1:]
+    split = len(body) - KEEP_RECENT_MSGS
+    # toolメッセージは直前のassistant(tool_calls)とペアなので、境界がtoolなら手前へずらす
+    while split > 0 and body[split].get("role") == "tool":
+        split -= 1
+    if split <= 0:
+        return messages  # 直近メッセージだけで予算超過。これ以上は縮められない
+    old, recent = body[:split], body[split:]
+
+    sse({"type": "compact", "message": "履歴が長いため古い部分を要約しています…"})
+    try:
+        summary = summarize_old(old, model)
+        marker = ("【自動要約】ここまでの会話が長くなったため、"
+                  "古い部分は以下の要約に置き換えられた:\n" + summary)
+    except Exception as e:
+        marker = ("【自動省略】以前の会話は長すぎたため省略された "
+                  f"(要約も失敗: {type(e).__name__})。必要な情報は改めて確認すること。")
+    compacted = [messages[0], {"role": "user", "content": marker}, *recent]
+    est3 = estimate_tokens(compacted)
+    sse({"type": "compact",
+         "message": f"履歴を圧縮しました (推定 {est}→{est3} トークン)"})
+    return compacted
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -469,6 +632,8 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             for it in range(MAX_ITER):
+                # 予算超過時は自動圧縮 (リクエスト開始時とツール結果肥大時の両方を守る)
+                messages = compact_history(messages, model, self._sse)
                 payload = {"model": model, "messages": messages, "tools": TOOLS,
                            "stream": True, "options": {"num_ctx": NUM_CTX}}
                 content, thinking, tool_calls = "", "", []

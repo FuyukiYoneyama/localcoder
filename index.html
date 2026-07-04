@@ -251,6 +251,8 @@ async function send(){
       const d=tools[tools.length-1];
       if(d){d.querySelector(".spin")?.remove(); d.querySelector("pre").textContent=ev.result}
       scroll();
+    }else if(ev.type==="compact"){
+      el("div","think","🗜 "+ev.message);
     }else if(ev.type==="history"){
       history=ev.messages;
     }else if(ev.type==="error"){
