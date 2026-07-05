@@ -48,7 +48,7 @@ CANCEL = {}            # sid -> threading.Event
 HISTORY_DIR = ROOT / "history"   # チャット履歴の保存先 (1会話 = 1 JSONファイル)
 HISTORY_DIR.mkdir(exist_ok=True)
 ```
-（`server.py:48-50`）
+（`server.py:53-55`）
 
 ### 1-1. 起動ごとのCSRFトークンとワークスペース境界
 
@@ -62,7 +62,7 @@ HOME = Path.home().resolve()     # ワークスペースはこの配下のみ許
 # 環境変数で指定する(未設定ならHOME)。index.html配信時にwindow変数として埋め込む。
 DEFAULT_WORKSPACE = os.environ.get("LOCALCODER_DEFAULT_WORKSPACE", str(HOME))
 ```
-（`server.py:52-59`）
+（`server.py:57-64`）
 
 `TOKEN` はプロセス起動のたびに毎回変わる32文字のランダム値。`do_GET`（3節）が
 `index.html`配信時に埋め込み、`_post_ok()`/`_token_ok()`（2節）が検証する。`HOME`は
@@ -111,7 +111,7 @@ def _post_ok(self) -> bool:
         return False
     return self._token_ok()
 ```
-（`server.py:546-572`）
+（`server.py:625-651`）
 
 なぜこれが要るか: `ThreadingHTTPServer` は `127.0.0.1` にしかバインドしていない
 （7節）が、それだけでは**同じPC上でブラウザが開いている悪意あるWebページ**からの
@@ -165,7 +165,7 @@ def do_GET(self):
     elif self.path == "/api/health":
         ...
 ```
-（`server.py:575-637`）
+（`server.py:654-716`）
 
 ```python
 def do_POST(self):
@@ -180,7 +180,7 @@ def do_POST(self):
         self.handle_chat()
         ...
 ```
-（`server.py:640-661`）
+（`server.py:719-740`）
 
 | メソッド | パス | 役割 |
 |---|---|---|
@@ -212,7 +212,7 @@ if self.path in ("/", "/index.html"):
     self.send_response(200)
     ...
 ```
-（`server.py:579-585`）
+（`server.py:658-664`）
 
 クライアント側（`index.html`）はこの `window.LC_TOKEN` を読み、全POSTで
 `X-LocalCoder-Token` ヘッダとして送り返す（後述）。同時に埋め込まれる
@@ -237,7 +237,7 @@ elif self.path.startswith("/vendor/"):
     else:
         self._json({"error": "not found"}, 404)
 ```
-（`server.py:590-602`）
+（`server.py:669-681`）
 
 `index.html`は`marked`/`DOMPurify`を`https://cdn.jsdelivr.net/...`ではなく
 `/vendor/marked.min.js`・`/vendor/purify.min.js`から読み込む。このページには
@@ -260,7 +260,7 @@ elif self.path == "/api/models":
     except Exception as e:
         self._json({"error": f"Ollamaに接続できません: {e}"}, 502)
 ```
-（`server.py:603-609`）
+（`server.py:682-688`）
 
 ### 3-2. 作業フォルダ選択ダイアログ — `/api/browse`
 
@@ -275,7 +275,7 @@ elif self.path.startswith("/api/browse"):
     q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
     self._json(list_subdirs(q.get("path", [""])[0]))
 ```
-（`server.py:610-616`）
+（`server.py:689-695`）
 
 ブラウザ標準の`<input type="file" webkitdirectory>`はセキュリティ上、選択した
 フォルダの絶対パスを返さない（相対パスのファイル一覧しか取れない）ため、作業
@@ -315,7 +315,7 @@ def handle_chat(self):
     messages = [{"role": "system", "content": SYSTEM_PROMPT.format(ws=ws)}]
     messages += body.get("messages", [])
 ```
-（`server.py:663-681`）
+（`server.py:742-760`）
 
 ここで重要なのは2点:
 
@@ -334,7 +334,14 @@ def handle_chat(self):
 for it in range(MAX_ITER):
     # 予算超過時は自動圧縮 (リクエスト開始時とツール結果肥大時の両方を守る)
     messages = compact_history(messages, model, self._sse)
-    payload = {"model": model, "messages": messages, "tools": TOOLS,
+    # 作業状態ダッシュボードはOllama呼び出し1回分にのみ差し込む使い捨て
+    # メッセージ。保存される会話履歴(messages)自体には加えない。
+    work_state = build_work_state(messages[1:])
+    call_messages = messages
+    if work_state:
+        call_messages = messages + [
+            {"role": "user", "content": WORK_STATE_PREFIX + work_state}]
+    payload = {"model": model, "messages": call_messages, "tools": TOOLS,
                "stream": True, "options": {"num_ctx": NUM_CTX}}
     content, thinking, tool_calls = "", "", []
     try:
@@ -365,11 +372,124 @@ for it in range(MAX_ITER):
             continue
         raise
 ```
-（`server.py:689-721`）
+（`server.py:768-807`）
 
 反復の先頭で毎回 `compact_history()`（4-4節）を通しているのは、リクエスト開始時に
 長すぎる履歴が来た場合と、ツール結果が反復のたびに積み上がって途中で予算を超える
 場合の両方に対応するため（予算内なら何もしない）。
+
+**作業状態ダッシュボード（`build_work_state`, 4-1a節参照）**: 続けて
+`work_state = build_work_state(messages[1:])` を計算し、非空なら
+`messages`本体ではなく`call_messages`という別変数に一時的に追加する。
+`payload["messages"]`にはこの`call_messages`を使うが、応答受信後に
+`messages.append(amsg)`するのは元の`messages`のほう（4-2節）——つまり
+ダッシュボードは**その回のOllama呼び出しにだけ**見え、保存される会話履歴や
+次回リクエストの`history`には一切残らない使い捨ての情報である。
+
+### 4-1a. 作業状態ダッシュボード — `build_work_state`
+
+会話ログの要約（4-4節）とは別に、「変更したファイル」「直近の実行コマンドと
+結果」「同じコマンドの繰り返し失敗」を**LLMを使わず機械的に**履歴から
+抽出して短い文字列にする:
+
+```python
+def _iter_tool_calls_with_results(messages: list):
+    """(ツール名, 引数dict, 結果文字列またはNone) を発生順にyieldする。
+
+    assistantのtool_callsと、直後に続くtoolメッセージ群(同じ順序)を突き合わせる。
+    """
+    i, n = 0, len(messages)
+    while i < n:
+        m = messages[i]
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            j = i + 1
+            for tc in m["tool_calls"]:
+                fn = tc.get("function", {})
+                name = fn.get("name", "?")
+                args = fn.get("arguments") or {}
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args or "{}")
+                    except json.JSONDecodeError:
+                        args = {}
+                result = None
+                if j < n and messages[j].get("role") == "tool":
+                    result = messages[j].get("content", "")
+                    j += 1
+                yield name, args, result
+            i = j
+        else:
+            i += 1
+
+
+def build_work_state(messages: list) -> str:
+    changed_files = []
+    commands = []  # (command, result_or_None) を発生順に
+    for name, args, result in _iter_tool_calls_with_results(messages):
+        if name in ("write_file", "edit_file"):
+            path = args.get("path")
+            if path and path not in changed_files:
+                changed_files.append(path)
+        elif name == "run_command":
+            commands.append((args.get("command", ""), result))
+
+    lines = []
+    if changed_files:
+        lines.append("変更したファイル: " + ", ".join(changed_files))
+
+    recent = commands[-RECENT_COMMANDS_SHOWN:]
+    if recent:
+        lines.append("直近の実行コマンド:")
+        for cmd, result in recent:
+            r = result or ""
+            ok = r.startswith("exit_code=0")
+            status = "OK" if ok else "失敗/要確認"
+            first_line = r.splitlines()[0] if r else "(結果なし)"
+            lines.append(f"  - `{cmd}` → {status} ({first_line[:80]})")
+
+    if len(commands) >= FAIL_REPEAT_THRESHOLD:
+        tail = commands[-FAIL_REPEAT_THRESHOLD:]
+        same_cmd = len({c for c, _ in tail}) == 1
+        all_failed = all(not (r or "").startswith("exit_code=0") for _, r in tail)
+        if same_cmd and all_failed:
+            lines.append(
+                f"⚠ 同じコマンド「{tail[-1][0]}」が直近{FAIL_REPEAT_THRESHOLD}回連続で"
+                "失敗しています。同じアプローチを繰り返さず、根本原因を洗い出すか"
+                "別の仮説を試してください。")
+
+    return "\n".join(lines)
+```
+（`server.py:478-549`）
+
+`_iter_tool_calls_with_results`は、`assistant`メッセージの`tool_calls`配列と、
+その直後に続く`tool`ロールのメッセージ列を**同じ順序で**突き合わせる
+（`exec_tool`が`for tc in tool_calls:`で1つずつ実行し、その都度
+`messages.append({"role":"tool",...})`しているため、必ずこの順序で並ぶ——4-2節）。
+
+`build_work_state`が拾う3種の情報:
+1. **変更ファイル一覧**: `write_file`/`edit_file`の`path`引数を出現順・重複なしで収集
+2. **直近`RECENT_COMMANDS_SHOWN`(5)件のコマンドと結果**: `run_command`の結果が
+   `exit_code=0`で始まるかどうかで成功/失敗を判定し、結果の先頭行を添える
+3. **繰り返し失敗の警告**: 直近`FAIL_REPEAT_THRESHOLD`(3)件が**同一コマンド**かつ
+   **全て失敗**なら、同じアプローチを繰り返さず根本原因を洗い直すよう促す一文を追加
+
+なぜ機械的に(LLMを使わず)行うか: 要約(`summarize_old`)と同じ土俵でLLMに
+「今何が起きているか」を書かせると、要約自体が不正確になるリスクをそのまま
+引き継ぐ。ここで拾う3種の情報はいずれもプログラムで確定的に導出できる事実
+（ファイルパスの文字列、コマンドの終了コード）なので、コード側で機械的に
+組み立てる方が安価かつ100%正確になる。目的・サブタスク・「どの仮説が
+外れたか」といった意味的な判断はLLMに頼らざるを得ないため、今回はあえて
+対象外にした（ユーザーとの設計議論の結論。詳細はREBUILD.md参照）。
+
+圧縮済み(`compact_history`が要約に置き換えた)古い部分は`tool_calls`構造が
+失われているため、この関数は**直近の非圧縮ウィンドウのみ**を反映する。
+古い変更点は要約の自然文側（`SUMMARIZE_PROMPT`）に残る。
+
+検証: 単体テスト10件（空履歴・ファイル抽出・コマンド結果表示・3回連続失敗の
+検知・2回では未検知・別コマンド成功後は誤検知しない・`messages`本体を
+書き換えないこと）に加え、実際のgpt-oss:20bで通常タスク（hello.py作成）が
+従来通り動くこと、`cmake ..`を3回連続失敗させた履歴から続行させた場合に
+4回目も同じコマンドを盲目的に繰り返さなかったことを確認済み。
 
 **Ollama呼び出し失敗時の自動再試行**: `ollama_stream(payload)`は`urlopen()`を
 内部で呼ぶため、Ollama側がHTTP 500やタイムアウト・接続断で応答すると
@@ -400,7 +520,7 @@ def ollama_stream(payload: dict):
             if line:
                 yield json.loads(line)
 ```
-（`server.py:350-358`）
+（`server.py:355-363`）
 
 （`ollama_ask` は履歴要約用の非ストリーミング問い合わせ。4-4節参照。）
 
@@ -458,7 +578,7 @@ for tc in tool_calls:
     messages.append({"role": "tool", "tool_name": name,
                      "name": name, "content": result})
 ```
-（`server.py:723-764`）
+（`server.py:809-850`）
 
 これが **エージェントループの心臓部**：
 1. モデルの応答（`assistant` メッセージ）を履歴に追加
@@ -496,7 +616,7 @@ else:
     self._sse({"type": "error",
                "message": f"最大ループ回数({MAX_ITER})に達しました"})
 ```
-（`server.py:765-768`）
+（`server.py:851-854`）
 
 （この `else` は `for...else` 構文で、`break` されずにループが尽きた場合のみ実行される）
 
@@ -506,7 +626,7 @@ else:
 self._sse({"type": "history", "messages": messages[1:]})
 self._sse({"type": "all_done"})
 ```
-（`server.py:771-772`）
+（`server.py:857-858`）
 
 システムプロンプト（`messages[0]`）を除いた全履歴をクライアントへ返す。
 クライアントはこれを次回リクエストの `messages` としてそのまま送り返すことで
@@ -527,7 +647,7 @@ finally:
         except Exception:
             pass
 ```
-（`server.py:787-796`）
+（`server.py:873-882`）
 
 `turn_started_at`は`handle_chat()`冒頭（`server.py:661`）で取得する受信時刻。
 `turn_status`は初期値`"completed"`で、以降の各終了経路で上書きされる:
@@ -539,7 +659,7 @@ finally:
 `save_session()`自体は元々毎回ファイル全体を上書きする実装のため、単純に
 `turns`キーを追加しただけでは前回までの記録が消える。そのため保存前に既存
 ファイルがあれば`turns`配列を読み出し、そこに今回の`turn`をappendしてから
-書き戻す（`server.py:200-219`）。個々の`messages`配列には一切手を入れず、
+書き戻す（`server.py:205-224`）。個々の`messages`配列には一切手を入れず、
 独立した`turns`配列にのみ時刻を記録することで、Ollamaに送るメッセージの
 スキーマにも`compact_history()`のトークン見積もりにも影響を与えない。
 
@@ -558,7 +678,7 @@ TOOL_TRIM_CHARS = 500   # 古いツール結果の切り詰め後サイズ
 MSG_EXCERPT_CHARS = 1000            # 要約入力で1メッセージから取る最大文字数
 SUMMARIZE_INPUT_TOKENS = NUM_CTX // 2  # 要約1回の入力上限 (超えたら分割要約)
 ```
-（`server.py:41-46`）
+（`server.py:46-51`）
 
 処理は2段階＋フォールバック:
 
@@ -577,7 +697,7 @@ SUMMARIZE_INPUT_TOKENS = NUM_CTX // 2  # 要約1回の入力上限 (超えたら
 トークン数は `estimate_text_tokens()` で概算する（ASCII=4文字/トークン、日本語等の
 非ASCII=1文字/トークン）。厳密ではないが、圧縮の発動判定には十分な精度。
 
-**要約入力自体の肥大対策**（`summarize_old()`, `server.py:446-470`）: 要約対象の
+**要約入力自体の肥大対策**（`summarize_old()`, `server.py:451-475`）: 要約対象の
 ログが `NUM_CTX` を超えると、要約プロンプト自体の前方（=要約指示）が ollama に
 切り捨てられ、モデルがログをオウム返しするだけの壊れた「要約」を返す——という
 欠陥が実際に発生した。対策として、(a) 各メッセージを先頭7割+末尾3割の1000文字に
@@ -639,7 +759,7 @@ def exec_tool(name: str, args: dict, ws: Path, cancel=None) -> str:
     except Exception as e:  # noqa: BLE001 - report all tool errors to the model
         return f"ERROR: {type(e).__name__}: {e}"
 ```
-（`server.py:299-347`、edit_fileのエラーメッセージ等は抜粋）
+（`server.py:304-352`、edit_fileのエラーメッセージ等は抜粋）
 
 設計上の要点:
 
@@ -690,7 +810,7 @@ def run_command(cmd: str, ws: Path, cancel) -> str:
         return f"ERROR: command {killed}\n{out}"
     return f"exit_code={p.returncode}\n{out}"
 ```
-（`server.py:267-296`）
+（`server.py:272-301`）
 
 以前は `subprocess.run(..., timeout=CMD_TIMEOUT)` を1回呼ぶだけの実装だったが、
 それだと**停止ボタンを押しても`communicate()`がブロックしたままで、実行中の
@@ -717,7 +837,7 @@ def resolve_path(ws: Path, p: str) -> Path:
         raise ValueError(f"path is outside the workspace: {p}")
     return full
 ```
-（`server.py:237-243`）
+（`server.py:242-248`）
 
 作業フォルダ選択ダイアログ用に、`resolve_path`の直後に類似ロジックの
 ディレクトリ一覧関数がある:
@@ -743,7 +863,7 @@ def list_subdirs(path: str) -> dict:
     parent = str(p.parent) if p != HOME and under_home(p.parent) else None
     return {"path": str(p), "parent": parent, "dirs": dirs}
 ```
-（`server.py:246-264`）
+（`server.py:251-269`）
 
 範囲外や存在しないパスは黙って`HOME`にフォールバックする（GUI側は毎回サーバーの
 返す`path`を正として画面を更新するので、フォールバックが起きても不整合にならない）。
@@ -795,7 +915,7 @@ def web_search(query: str, max_results: int = 6) -> str:
         html_text, re.S)
     ...
 ```
-（`server.py:142-160`）
+（`server.py:147-165`）
 
 正規表現でDuckDuckGoのHTML構造から検索結果のリンク・タイトル・スニペットを
 抜き出しているだけの軽量実装（＝DuckDuckGo側のHTML構造が変わると壊れる）。
@@ -810,10 +930,10 @@ class _TextExtract(HTMLParser):
         if not self.depth and d.strip():
             self.parts.append(d.strip())
 ```
-（`server.py:163-181`）
+（`server.py:168-186`）
 
 `script`/`style`/`svg`/`head` タグの中身は無視しつつ、テキストノードだけを
-収集する。結果は1万文字で切り詰められる（`server.py:191-192`）。
+収集する。結果は1万文字で切り詰められる（`server.py:196-197`）。
 
 `fetch_url` で取得したテキストや `web_search` の結果はそのまま `tool` メッセージの
 `content` としてモデルに渡り、最終的にモデルの応答（Markdown）としてブラウザに
@@ -834,7 +954,7 @@ def main():
     print(f"LocalCoder running: http://localhost:{PORT}  (ollama: {OLLAMA})")
     srv.serve_forever()
 ```
-（`server.py:799-806`）
+（`server.py:885-892`）
 
 `ThreadingHTTPServer` なので、複数タブ・複数セッションからの同時リクエストにも
 スレッド単位で並行対応する。ポートが既に使用中（＝二重起動）の場合はエラーで
