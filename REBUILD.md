@@ -121,6 +121,21 @@ SSEイベントでGUIに🗜表示）。**要約入力自体の肥大に注意**
 壊れないよう境界を手前にずらす。検証: 冒頭に埋めた固有情報（コードネーム）が
 56868→7746トークンへの圧縮を生き残り、モデルが正答することを確認済み。
 
+**空応答自動回復の設計ノート**: ローカルモデル（特にgpt-oss:20b）は、ビルド失敗など
+行き詰まった状況で、本文なし・ツール呼び出しなしという「空応答」を返してターンを
+静かに終えることがある。この場合サーバーは正常終了として扱うため、ユーザーには
+何も表示されず、実質的に停止したように見えてしまう（実際に本番で遭遇し、
+セッション履歴ファイルの最後のassistantメッセージがcontent=""であることで確認した
+バグ）。対策として、`content`が空かつ`tool_calls`も無いターンを検出したら、
+`EMPTY_RETRY_LIMIT`(1)回まで自動で「続けてください」という合成ユーザーメッセージ
+（`EMPTY_RESPONSE_NUDGE`、`(システム自動継続)`と明記して会話履歴上も見分けられる
+ようにする）を追加してループを継続する。それでも空応答なら諦めて
+`{"type": "notice", "message": "⚠ ..."}` をGUIに送りユーザーに手動介入を促す
+（`server.py`参照）。モックテストで両ケース（1回の自動継続で回復／2回とも空で
+警告して停止）を検証済み。無限ループの心配はない: `empty_retries`は
+`handle_chat`のローカル変数なのでユーザーの1メッセージごとにリセットされ、
+かつ`EMPTY_RETRY_LIMIT`で上限を切っている。
+
 **フォルダ選択ダイアログの設計ノート**: ブラウザ標準の`<input type="file" webkitdirectory>`は
 セキュリティ上の理由で絶対パスを返さない（相対パスのファイル一覧しか取れない）ため、
 作業フォルダ選択には使えない。代わりにサーバー側に`GET /api/browse?path=...`
@@ -211,6 +226,11 @@ OLLAMA = os.environ.get("LOCALCODER_OLLAMA", "http://localhost:11434")
 PORT = int(os.environ.get("LOCALCODER_PORT", "8765"))
 ROOT = Path(__file__).resolve().parent
 MAX_ITER = 40          # 1リクエストあたりの最大ツールループ回数
+EMPTY_RETRY_LIMIT = 1  # モデルが本文なし・ツール呼び出しなしで終える"空応答"時、
+                       # 自動で続行を促す回数の上限 (それでも空ならユーザーに通知して停止)
+EMPTY_RESPONSE_NUDGE = ("(システム自動継続) 直前の応答が空でした。作業が完了して"
+                        "いるなら結果を要約し、未完了ならツールを使って作業を"
+                        "続けてください。")
 CMD_TIMEOUT = 180      # コマンド実行タイムアウト(秒)
 NUM_CTX = 32768
 
@@ -842,6 +862,7 @@ class Handler(BaseHTTPRequestHandler):
 
         messages = [{"role": "system", "content": SYSTEM_PROMPT.format(ws=ws)}]
         messages += body.get("messages", [])
+        empty_retries = 0
 
         try:
             for it in range(MAX_ITER):
@@ -873,6 +894,19 @@ class Handler(BaseHTTPRequestHandler):
                 self._sse({"type": "turn_done"})
 
                 if not tool_calls:
+                    if not content.strip() and empty_retries < EMPTY_RETRY_LIMIT:
+                        # 本文なし・ツール呼び出しなしで終える"空応答"は、ユーザーには
+                        # 何も起きていないように見えて実質的に停止してしまう。
+                        # 1回だけ自動で続行を促し、それでも空なら諦めて通知する。
+                        empty_retries += 1
+                        self._sse({"type": "notice",
+                                   "message": "モデルが空の応答を返したため、続行を促しています…"})
+                        messages.append({"role": "user", "content": EMPTY_RESPONSE_NUDGE})
+                        continue
+                    if not content.strip():
+                        self._sse({"type": "notice",
+                                   "message": "⚠ モデルが空の応答のまま停止しました。"
+                                              "具体的な指示を送って続けさせてください。"})
                     break
 
                 for tc in tool_calls:
@@ -996,6 +1030,8 @@ details.tool summary{cursor:pointer;color:var(--green)}
 details.tool pre{background:#0d0f14;padding:8px;border-radius:6px;overflow-x:auto;
   max-height:260px;font-size:12px;white-space:pre-wrap}
 .err{align-self:center;color:var(--red);font-size:13px}
+.notice{align-self:center;color:#e0b04a;background:#2a2418;border:1px solid #4a3f24;
+  border-radius:8px;padding:6px 14px;font-size:13px}
 footer{display:flex;gap:10px;padding:12px 16px;background:var(--panel);border-top:1px solid var(--border)}
 #input{flex:1;background:var(--panel2);color:var(--text);border:1px solid var(--border);
   border-radius:8px;padding:10px;font-size:14px;resize:none;font-family:inherit;min-height:44px;max-height:200px}
@@ -1224,6 +1260,8 @@ async function send(){
       scroll();
     }else if(ev.type==="compact"){
       el("div","think","🗜 "+ev.message);
+    }else if(ev.type==="notice"){
+      el("div","notice","🔔 "+ev.message);
     }else if(ev.type==="history"){
       history=ev.messages;
     }else if(ev.type==="error"){

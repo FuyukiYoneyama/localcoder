@@ -15,16 +15,23 @@ OLLAMA = os.environ.get("LOCALCODER_OLLAMA", "http://localhost:11434")
 PORT = int(os.environ.get("LOCALCODER_PORT", "8765"))
 ROOT = Path(__file__).resolve().parent
 MAX_ITER = 40          # 1リクエストあたりの最大ツールループ回数
+EMPTY_RETRY_LIMIT = 1  # モデルが本文なし・ツール呼び出しなしで終える"空応答"時、
+                       # 自動で続行を促す回数の上限 (それでも空ならユーザーに通知して停止)
+EMPTY_RESPONSE_NUDGE = ("(システム自動継続) 直前の応答が空でした。作業が完了して"
+                        "いるなら結果を要約し、未完了ならツールを使って作業を"
+                        "続けてください。")
 CMD_TIMEOUT = 180      # コマンド実行タイムアウト(秒)
 NUM_CTX = 32768
 ```
-（`server.py:25-30`）
+（`server.py:25-35`）
 
 - `OLLAMA` / `PORT` は環境変数で上書き可能。デフォルトはどちらもlocalhost想定。
   WSLからWindows側Ollamaへ別経路で繋ぐ場合は `LOCALCODER_OLLAMA=http://<IP>:11434` を
   指定して起動する（実例は `REBUILD.md` の「8. 実施例ログ」参照）。
 - `MAX_ITER=40` は「ユーザー1メッセージに対して、モデル発話→ツール実行を最大何往復
   許すか」の上限。無限ループでサーバーが固まるのを防ぐ安全弁。
+- `EMPTY_RETRY_LIMIT` / `EMPTY_RESPONSE_NUDGE` はモデルが本文なし・ツール呼び出し
+  なしの「空応答」で黙って止まった時の自動回復用（4-2節で詳説）。
 - `CMD_TIMEOUT=180` は `run_command` ツール1回あたりのタイムアウト。
 - `NUM_CTX=32768` はOllamaへ送るコンテキスト長。小型モデル・低VRAM機では
   `16384` 等に下げる調整ポイント。
@@ -36,7 +43,7 @@ CANCEL = {}            # sid -> threading.Event
 HISTORY_DIR = ROOT / "history"   # チャット履歴の保存先 (1会話 = 1 JSONファイル)
 HISTORY_DIR.mkdir(exist_ok=True)
 ```
-（`server.py:40-42`）
+（`server.py:45-47`）
 
 ### 1-1. 起動ごとのCSRFトークンとワークスペース境界
 
@@ -50,7 +57,7 @@ HOME = Path.home().resolve()     # ワークスペースはこの配下のみ許
 # 環境変数で指定する(未設定ならHOME)。index.html配信時にwindow変数として埋め込む。
 DEFAULT_WORKSPACE = os.environ.get("LOCALCODER_DEFAULT_WORKSPACE", str(HOME))
 ```
-（`server.py:44-51`）
+（`server.py:49-56`）
 
 `TOKEN` はプロセス起動のたびに毎回変わる32文字のランダム値。`do_GET`（3節）が
 `index.html`配信時に埋め込み、`_post_ok()`/`_token_ok()`（2節）が検証する。`HOME`は
@@ -99,7 +106,7 @@ def _post_ok(self) -> bool:
         return False
     return self._token_ok()
 ```
-（`server.py:523-549`）
+（`server.py:528-554`）
 
 なぜこれが要るか: `ThreadingHTTPServer` は `127.0.0.1` にしかバインドしていない
 （7節）が、それだけでは**同じPC上でブラウザが開いている悪意あるWebページ**からの
@@ -153,7 +160,7 @@ def do_GET(self):
     elif self.path == "/api/health":
         ...
 ```
-（`server.py:552-614`）
+（`server.py:557-619`）
 
 ```python
 def do_POST(self):
@@ -168,7 +175,7 @@ def do_POST(self):
         self.handle_chat()
         ...
 ```
-（`server.py:617-638`）
+（`server.py:622-643`）
 
 | メソッド | パス | 役割 |
 |---|---|---|
@@ -200,7 +207,7 @@ if self.path in ("/", "/index.html"):
     self.send_response(200)
     ...
 ```
-（`server.py:556-562`）
+（`server.py:561-567`）
 
 クライアント側（`index.html`）はこの `window.LC_TOKEN` を読み、全POSTで
 `X-LocalCoder-Token` ヘッダとして送り返す（後述）。同時に埋め込まれる
@@ -225,7 +232,7 @@ elif self.path.startswith("/vendor/"):
     else:
         self._json({"error": "not found"}, 404)
 ```
-（`server.py:567-579`）
+（`server.py:572-584`）
 
 `index.html`は`marked`/`DOMPurify`を`https://cdn.jsdelivr.net/...`ではなく
 `/vendor/marked.min.js`・`/vendor/purify.min.js`から読み込む。このページには
@@ -248,7 +255,7 @@ elif self.path == "/api/models":
     except Exception as e:
         self._json({"error": f"Ollamaに接続できません: {e}"}, 502)
 ```
-（`server.py:580-586`）
+（`server.py:585-591`）
 
 ### 3-2. 作業フォルダ選択ダイアログ — `/api/browse`
 
@@ -263,7 +270,7 @@ elif self.path.startswith("/api/browse"):
     q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
     self._json(list_subdirs(q.get("path", [""])[0]))
 ```
-（`server.py:587-593`）
+（`server.py:592-598`）
 
 ブラウザ標準の`<input type="file" webkitdirectory>`はセキュリティ上、選択した
 フォルダの絶対パスを返さない（相対パスのファイル一覧しか取れない）ため、作業
@@ -301,7 +308,7 @@ def handle_chat(self):
     messages = [{"role": "system", "content": SYSTEM_PROMPT.format(ws=ws)}]
     messages += body.get("messages", [])
 ```
-（`server.py:640-659`）
+（`server.py:645-664`）
 
 ここで重要なのは2点:
 
@@ -339,7 +346,7 @@ for it in range(MAX_ITER):
         if chunk.get("done"):
             break
 ```
-（`server.py:662-682`）
+（`server.py:668-688`）
 
 反復の先頭で毎回 `compact_history()`（4-4節）を通しているのは、リクエスト開始時に
 長すぎる履歴が来た場合と、ツール結果が反復のたびに積み上がって途中で予算を超える
@@ -358,7 +365,7 @@ def ollama_stream(payload: dict):
             if line:
                 yield json.loads(line)
 ```
-（`server.py:327-335`）
+（`server.py:332-340`）
 
 （`ollama_ask` は履歴要約用の非ストリーミング問い合わせ。4-4節参照。）
 
@@ -380,6 +387,19 @@ messages.append(amsg)
 self._sse({"type": "turn_done"})
 
 if not tool_calls:
+    if not content.strip() and empty_retries < EMPTY_RETRY_LIMIT:
+        # 本文なし・ツール呼び出しなしで終える"空応答"は、ユーザーには
+        # 何も起きていないように見えて実質的に停止してしまう。
+        # 1回だけ自動で続行を促し、それでも空なら諦めて通知する。
+        empty_retries += 1
+        self._sse({"type": "notice",
+                   "message": "モデルが空の応答を返したため、続行を促しています…"})
+        messages.append({"role": "user", "content": EMPTY_RESPONSE_NUDGE})
+        continue
+    if not content.strip():
+        self._sse({"type": "notice",
+                   "message": "⚠ モデルが空の応答のまま停止しました。"
+                              "具体的な指示を送って続けさせてください。"})
     break
 
 for tc in tool_calls:
@@ -402,11 +422,12 @@ for tc in tool_calls:
     messages.append({"role": "tool", "tool_name": name,
                      "name": name, "content": result})
 ```
-（`server.py:684-711`）
+（`server.py:690-730`）
 
 これが **エージェントループの心臓部**：
 1. モデルの応答（`assistant` メッセージ）を履歴に追加
-2. `tool_calls` が無ければ「タスク完了」とみなしループを抜ける
+2. `tool_calls` が無ければ「タスク完了」とみなしループを抜ける——ただし本文も
+   空なら「空応答」（下記）として扱う
 3. あれば `exec_tool(name, args, ws, ev)` で実際に実行し、結果を `role: "tool"`
    メッセージとして履歴に追加。**キャンセル用の `ev` を渡す**ことで、
    `run_command`（5-1節）が実行中でも停止ボタンに反応できるようにしている
@@ -416,6 +437,21 @@ for tc in tool_calls:
 `tool_name` と `name` を両方入れているのは、Ollamaのバージョン間でtoolメッセージの
 キー名が変わった経緯を吸収するため。
 
+**空応答からの自動回復**: ローカルモデル（特にgpt-oss:20b）は、ビルド失敗など
+行き詰まった状況で本文なし・ツール呼び出しなしという「空応答」を返し、ターンを
+静かに終えることがある。これは`if not tool_calls: break`にそのまま入ってしまうと、
+サーバーは正常終了として`all_done`を返すため、**ユーザーには何も起きていないよう
+に見えて実質的に停止する**（実運用で遭遇し、保存済みセッションの最後の
+assistantメッセージが`content=""`であることで確認したバグ）。対策として、
+`content`が空文字かつ`tool_calls`も無い場合は`EMPTY_RETRY_LIMIT`(1)回まで、
+「続けてください」という合成`user`メッセージ（`EMPTY_RESPONSE_NUDGE`。
+`(システム自動継続)`と明記し、会話履歴を見返したときに人間の発言と区別できる
+ようにしてある）を追加して`continue`し、ループを継続する。それでも空応答なら
+諦めて`{"type": "notice", "message": "⚠ ..."}`をGUIに送り、ユーザーに手動介入を
+促して`break`する。`empty_retries`は`handle_chat`のローカル変数なので
+ユーザーの1メッセージごとにリセットされ、`EMPTY_RETRY_LIMIT`で上限も切って
+あるため無限ループの心配はない。
+
 `MAX_ITER` 回を超えてもツール呼び出しが続く場合はエラーを返す:
 
 ```python
@@ -423,7 +459,7 @@ else:
     self._sse({"type": "error",
                "message": f"最大ループ回数({MAX_ITER})に達しました"})
 ```
-（`server.py:712-714`）
+（`server.py:732-733`）
 
 （この `else` は `for...else` 構文で、`break` されずにループが尽きた場合のみ実行される）
 
@@ -433,7 +469,7 @@ else:
 self._sse({"type": "history", "messages": messages[1:]})
 self._sse({"type": "all_done"})
 ```
-（`server.py:717-718`）
+（`server.py:736-737`）
 
 システムプロンプト（`messages[0]`）を除いた全履歴をクライアントへ返す。
 クライアントはこれを次回リクエストの `messages` としてそのまま送り返すことで
@@ -450,7 +486,7 @@ finally:
         except Exception:
             pass
 ```
-（`server.py:731-737`）
+（`server.py:750-756`）
 
 ### 4-4. 履歴の自動圧縮 — `compact_history`
 
@@ -467,7 +503,7 @@ TOOL_TRIM_CHARS = 500   # 古いツール結果の切り詰め後サイズ
 MSG_EXCERPT_CHARS = 1000            # 要約入力で1メッセージから取る最大文字数
 SUMMARIZE_INPUT_TOKENS = NUM_CTX // 2  # 要約1回の入力上限 (超えたら分割要約)
 ```
-（`server.py:33-38`）
+（`server.py:38-43`）
 
 処理は2段階＋フォールバック:
 
@@ -486,7 +522,7 @@ SUMMARIZE_INPUT_TOKENS = NUM_CTX // 2  # 要約1回の入力上限 (超えたら
 トークン数は `estimate_text_tokens()` で概算する（ASCII=4文字/トークン、日本語等の
 非ASCII=1文字/トークン）。厳密ではないが、圧縮の発動判定には十分な精度。
 
-**要約入力自体の肥大対策**（`summarize_old()`, `server.py:423-447`）: 要約対象の
+**要約入力自体の肥大対策**（`summarize_old()`, `server.py:428-452`）: 要約対象の
 ログが `NUM_CTX` を超えると、要約プロンプト自体の前方（=要約指示）が ollama に
 切り捨てられ、モデルがログをオウム返しするだけの壊れた「要約」を返す——という
 欠陥が実際に発生した。対策として、(a) 各メッセージを先頭7割+末尾3割の1000文字に
@@ -548,7 +584,7 @@ def exec_tool(name: str, args: dict, ws: Path, cancel=None) -> str:
     except Exception as e:  # noqa: BLE001 - report all tool errors to the model
         return f"ERROR: {type(e).__name__}: {e}"
 ```
-（`server.py:276-324`、edit_fileのエラーメッセージ等は抜粋）
+（`server.py:281-329`、edit_fileのエラーメッセージ等は抜粋）
 
 設計上の要点:
 
@@ -599,7 +635,7 @@ def run_command(cmd: str, ws: Path, cancel) -> str:
         return f"ERROR: command {killed}\n{out}"
     return f"exit_code={p.returncode}\n{out}"
 ```
-（`server.py:244-273`）
+（`server.py:249-278`）
 
 以前は `subprocess.run(..., timeout=CMD_TIMEOUT)` を1回呼ぶだけの実装だったが、
 それだと**停止ボタンを押しても`communicate()`がブロックしたままで、実行中の
@@ -626,7 +662,7 @@ def resolve_path(ws: Path, p: str) -> Path:
         raise ValueError(f"path is outside the workspace: {p}")
     return full
 ```
-（`server.py:214-220`）
+（`server.py:219-225`）
 
 作業フォルダ選択ダイアログ用に、`resolve_path`の直後に類似ロジックの
 ディレクトリ一覧関数がある:
@@ -652,7 +688,7 @@ def list_subdirs(path: str) -> dict:
     parent = str(p.parent) if p != HOME and under_home(p.parent) else None
     return {"path": str(p), "parent": parent, "dirs": dirs}
 ```
-（`server.py:223-241`）
+（`server.py:228-246`）
 
 範囲外や存在しないパスは黙って`HOME`にフォールバックする（GUI側は毎回サーバーの
 返す`path`を正として画面を更新するので、フォールバックが起きても不整合にならない）。
@@ -704,7 +740,7 @@ def web_search(query: str, max_results: int = 6) -> str:
         html_text, re.S)
     ...
 ```
-（`server.py:131-149`）
+（`server.py:136-154`）
 
 正規表現でDuckDuckGoのHTML構造から検索結果のリンク・タイトル・スニペットを
 抜き出しているだけの軽量実装（＝DuckDuckGo側のHTML構造が変わると壊れる）。
@@ -719,10 +755,10 @@ class _TextExtract(HTMLParser):
         if not self.depth and d.strip():
             self.parts.append(d.strip())
 ```
-（`server.py:152-170`）
+（`server.py:157-175`）
 
 `script`/`style`/`svg`/`head` タグの中身は無視しつつ、テキストノードだけを
-収集する。結果は1万文字で切り詰められる（`server.py:180-181`）。
+収集する。結果は1万文字で切り詰められる（`server.py:185-186`）。
 
 `fetch_url` で取得したテキストや `web_search` の結果はそのまま `tool` メッセージの
 `content` としてモデルに渡り、最終的にモデルの応答（Markdown）としてブラウザに
@@ -743,7 +779,7 @@ def main():
     print(f"LocalCoder running: http://localhost:{PORT}  (ollama: {OLLAMA})")
     srv.serve_forever()
 ```
-（`server.py:740-747`）
+（`server.py:759-766`）
 
 `ThreadingHTTPServer` なので、複数タブ・複数セッションからの同時リクエストにも
 スレッド単位で並行対応する。ポートが既に使用中（＝二重起動）の場合はエラーで

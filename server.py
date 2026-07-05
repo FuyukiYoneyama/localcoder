@@ -26,6 +26,11 @@ OLLAMA = os.environ.get("LOCALCODER_OLLAMA", "http://localhost:11434")
 PORT = int(os.environ.get("LOCALCODER_PORT", "8765"))
 ROOT = Path(__file__).resolve().parent
 MAX_ITER = 40          # 1リクエストあたりの最大ツールループ回数
+EMPTY_RETRY_LIMIT = 1  # モデルが本文なし・ツール呼び出しなしで終える"空応答"時、
+                       # 自動で続行を促す回数の上限 (それでも空ならユーザーに通知して停止)
+EMPTY_RESPONSE_NUDGE = ("(システム自動継続) 直前の応答が空でした。作業が完了して"
+                        "いるなら結果を要約し、未完了ならツールを使って作業を"
+                        "続けてください。")
 CMD_TIMEOUT = 180      # コマンド実行タイムアウト(秒)
 NUM_CTX = 32768
 
@@ -657,6 +662,7 @@ class Handler(BaseHTTPRequestHandler):
 
         messages = [{"role": "system", "content": SYSTEM_PROMPT.format(ws=ws)}]
         messages += body.get("messages", [])
+        empty_retries = 0
 
         try:
             for it in range(MAX_ITER):
@@ -688,6 +694,19 @@ class Handler(BaseHTTPRequestHandler):
                 self._sse({"type": "turn_done"})
 
                 if not tool_calls:
+                    if not content.strip() and empty_retries < EMPTY_RETRY_LIMIT:
+                        # 本文なし・ツール呼び出しなしで終える"空応答"は、ユーザーには
+                        # 何も起きていないように見えて実質的に停止してしまう。
+                        # 1回だけ自動で続行を促し、それでも空なら諦めて通知する。
+                        empty_retries += 1
+                        self._sse({"type": "notice",
+                                   "message": "モデルが空の応答を返したため、続行を促しています…"})
+                        messages.append({"role": "user", "content": EMPTY_RESPONSE_NUDGE})
+                        continue
+                    if not content.strip():
+                        self._sse({"type": "notice",
+                                   "message": "⚠ モデルが空の応答のまま停止しました。"
+                                              "具体的な指示を送って続けさせてください。"})
                     break
 
                 for tc in tool_calls:
