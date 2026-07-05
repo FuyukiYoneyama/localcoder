@@ -75,6 +75,12 @@ wsl -d ubuntu-24.04 -- bash -lc "python3 ~/localcoder/server.py"
   終わった時刻を`history/<sid>.json`の`turns`配列に記録する
   (`{started_at, ended_at, status}`。statusは`completed`/`stopped`/`max_iter`/
   `error`/`disconnected`)。GPU負荷の記録などと突き合わせて後から確認できる
+- システムプロンプトの信頼性強化: 実運用で「与えられた正確な値を使わず別の値を
+  捏造する」「ビルド検証をせず『次にユーザーがcmake/makeを実行してください』と
+  丸投げする」という失敗パターンが繰り返し観測されたため、SYSTEM_PROMPTに
+  「与えられた正確な値はそのまま使う」「存在を確信できないライブラリ/関数名/
+  パスは検証してから使う」「タスク完了は自分で実行して確認してから」という
+  規律を明記した
 
 ## 前提
 

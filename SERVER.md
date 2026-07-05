@@ -111,7 +111,7 @@ def _post_ok(self) -> bool:
         return False
     return self._token_ok()
 ```
-（`server.py:543-569`）
+（`server.py:546-572`）
 
 なぜこれが要るか: `ThreadingHTTPServer` は `127.0.0.1` にしかバインドしていない
 （7節）が、それだけでは**同じPC上でブラウザが開いている悪意あるWebページ**からの
@@ -165,7 +165,7 @@ def do_GET(self):
     elif self.path == "/api/health":
         ...
 ```
-（`server.py:572-634`）
+（`server.py:575-637`）
 
 ```python
 def do_POST(self):
@@ -180,7 +180,7 @@ def do_POST(self):
         self.handle_chat()
         ...
 ```
-（`server.py:637-658`）
+（`server.py:640-661`）
 
 | メソッド | パス | 役割 |
 |---|---|---|
@@ -212,7 +212,7 @@ if self.path in ("/", "/index.html"):
     self.send_response(200)
     ...
 ```
-（`server.py:576-582`）
+（`server.py:579-585`）
 
 クライアント側（`index.html`）はこの `window.LC_TOKEN` を読み、全POSTで
 `X-LocalCoder-Token` ヘッダとして送り返す（後述）。同時に埋め込まれる
@@ -237,7 +237,7 @@ elif self.path.startswith("/vendor/"):
     else:
         self._json({"error": "not found"}, 404)
 ```
-（`server.py:587-599`）
+（`server.py:590-602`）
 
 `index.html`は`marked`/`DOMPurify`を`https://cdn.jsdelivr.net/...`ではなく
 `/vendor/marked.min.js`・`/vendor/purify.min.js`から読み込む。このページには
@@ -260,7 +260,7 @@ elif self.path == "/api/models":
     except Exception as e:
         self._json({"error": f"Ollamaに接続できません: {e}"}, 502)
 ```
-（`server.py:600-606`）
+（`server.py:603-609`）
 
 ### 3-2. 作業フォルダ選択ダイアログ — `/api/browse`
 
@@ -275,7 +275,7 @@ elif self.path.startswith("/api/browse"):
     q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
     self._json(list_subdirs(q.get("path", [""])[0]))
 ```
-（`server.py:607-613`）
+（`server.py:610-616`）
 
 ブラウザ標準の`<input type="file" webkitdirectory>`はセキュリティ上、選択した
 フォルダの絶対パスを返さない（相対パスのファイル一覧しか取れない）ため、作業
@@ -315,7 +315,7 @@ def handle_chat(self):
     messages = [{"role": "system", "content": SYSTEM_PROMPT.format(ws=ws)}]
     messages += body.get("messages", [])
 ```
-（`server.py:660-678`）
+（`server.py:663-681`）
 
 ここで重要なのは2点:
 
@@ -365,7 +365,7 @@ for it in range(MAX_ITER):
             continue
         raise
 ```
-（`server.py:686-718`）
+（`server.py:689-721`）
 
 反復の先頭で毎回 `compact_history()`（4-4節）を通しているのは、リクエスト開始時に
 長すぎる履歴が来た場合と、ツール結果が反復のたびに積み上がって途中で予算を超える
@@ -400,7 +400,7 @@ def ollama_stream(payload: dict):
             if line:
                 yield json.loads(line)
 ```
-（`server.py:347-355`）
+（`server.py:350-358`）
 
 （`ollama_ask` は履歴要約用の非ストリーミング問い合わせ。4-4節参照。）
 
@@ -458,7 +458,7 @@ for tc in tool_calls:
     messages.append({"role": "tool", "tool_name": name,
                      "name": name, "content": result})
 ```
-（`server.py:720-761`）
+（`server.py:723-764`）
 
 これが **エージェントループの心臓部**：
 1. モデルの応答（`assistant` メッセージ）を履歴に追加
@@ -496,7 +496,7 @@ else:
     self._sse({"type": "error",
                "message": f"最大ループ回数({MAX_ITER})に達しました"})
 ```
-（`server.py:762-765`）
+（`server.py:765-768`）
 
 （この `else` は `for...else` 構文で、`break` されずにループが尽きた場合のみ実行される）
 
@@ -506,7 +506,7 @@ else:
 self._sse({"type": "history", "messages": messages[1:]})
 self._sse({"type": "all_done"})
 ```
-（`server.py:768-769`）
+（`server.py:771-772`）
 
 システムプロンプト（`messages[0]`）を除いた全履歴をクライアントへ返す。
 クライアントはこれを次回リクエストの `messages` としてそのまま送り返すことで
@@ -527,7 +527,7 @@ finally:
         except Exception:
             pass
 ```
-（`server.py:784-793`）
+（`server.py:787-796`）
 
 `turn_started_at`は`handle_chat()`冒頭（`server.py:661`）で取得する受信時刻。
 `turn_status`は初期値`"completed"`で、以降の各終了経路で上書きされる:
@@ -539,7 +539,7 @@ finally:
 `save_session()`自体は元々毎回ファイル全体を上書きする実装のため、単純に
 `turns`キーを追加しただけでは前回までの記録が消える。そのため保存前に既存
 ファイルがあれば`turns`配列を読み出し、そこに今回の`turn`をappendしてから
-書き戻す（`server.py:197-216`）。個々の`messages`配列には一切手を入れず、
+書き戻す（`server.py:200-219`）。個々の`messages`配列には一切手を入れず、
 独立した`turns`配列にのみ時刻を記録することで、Ollamaに送るメッセージの
 スキーマにも`compact_history()`のトークン見積もりにも影響を与えない。
 
@@ -577,7 +577,7 @@ SUMMARIZE_INPUT_TOKENS = NUM_CTX // 2  # 要約1回の入力上限 (超えたら
 トークン数は `estimate_text_tokens()` で概算する（ASCII=4文字/トークン、日本語等の
 非ASCII=1文字/トークン）。厳密ではないが、圧縮の発動判定には十分な精度。
 
-**要約入力自体の肥大対策**（`summarize_old()`, `server.py:443-467`）: 要約対象の
+**要約入力自体の肥大対策**（`summarize_old()`, `server.py:446-470`）: 要約対象の
 ログが `NUM_CTX` を超えると、要約プロンプト自体の前方（=要約指示）が ollama に
 切り捨てられ、モデルがログをオウム返しするだけの壊れた「要約」を返す——という
 欠陥が実際に発生した。対策として、(a) 各メッセージを先頭7割+末尾3割の1000文字に
@@ -639,7 +639,7 @@ def exec_tool(name: str, args: dict, ws: Path, cancel=None) -> str:
     except Exception as e:  # noqa: BLE001 - report all tool errors to the model
         return f"ERROR: {type(e).__name__}: {e}"
 ```
-（`server.py:296-344`、edit_fileのエラーメッセージ等は抜粋）
+（`server.py:299-347`、edit_fileのエラーメッセージ等は抜粋）
 
 設計上の要点:
 
@@ -690,7 +690,7 @@ def run_command(cmd: str, ws: Path, cancel) -> str:
         return f"ERROR: command {killed}\n{out}"
     return f"exit_code={p.returncode}\n{out}"
 ```
-（`server.py:264-293`）
+（`server.py:267-296`）
 
 以前は `subprocess.run(..., timeout=CMD_TIMEOUT)` を1回呼ぶだけの実装だったが、
 それだと**停止ボタンを押しても`communicate()`がブロックしたままで、実行中の
@@ -717,7 +717,7 @@ def resolve_path(ws: Path, p: str) -> Path:
         raise ValueError(f"path is outside the workspace: {p}")
     return full
 ```
-（`server.py:234-240`）
+（`server.py:237-243`）
 
 作業フォルダ選択ダイアログ用に、`resolve_path`の直後に類似ロジックの
 ディレクトリ一覧関数がある:
@@ -743,7 +743,7 @@ def list_subdirs(path: str) -> dict:
     parent = str(p.parent) if p != HOME and under_home(p.parent) else None
     return {"path": str(p), "parent": parent, "dirs": dirs}
 ```
-（`server.py:243-261`）
+（`server.py:246-264`）
 
 範囲外や存在しないパスは黙って`HOME`にフォールバックする（GUI側は毎回サーバーの
 返す`path`を正として画面を更新するので、フォールバックが起きても不整合にならない）。
@@ -795,7 +795,7 @@ def web_search(query: str, max_results: int = 6) -> str:
         html_text, re.S)
     ...
 ```
-（`server.py:139-157`）
+（`server.py:142-160`）
 
 正規表現でDuckDuckGoのHTML構造から検索結果のリンク・タイトル・スニペットを
 抜き出しているだけの軽量実装（＝DuckDuckGo側のHTML構造が変わると壊れる）。
@@ -810,10 +810,10 @@ class _TextExtract(HTMLParser):
         if not self.depth and d.strip():
             self.parts.append(d.strip())
 ```
-（`server.py:160-178`）
+（`server.py:163-181`）
 
 `script`/`style`/`svg`/`head` タグの中身は無視しつつ、テキストノードだけを
-収集する。結果は1万文字で切り詰められる（`server.py:188-189`）。
+収集する。結果は1万文字で切り詰められる（`server.py:191-192`）。
 
 `fetch_url` で取得したテキストや `web_search` の結果はそのまま `tool` メッセージの
 `content` としてモデルに渡り、最終的にモデルの応答（Markdown）としてブラウザに
@@ -834,7 +834,7 @@ def main():
     print(f"LocalCoder running: http://localhost:{PORT}  (ollama: {OLLAMA})")
     srv.serve_forever()
 ```
-（`server.py:796-803`）
+（`server.py:799-806`）
 
 `ThreadingHTTPServer` なので、複数タブ・複数セッションからの同時リクエストにも
 スレッド単位で並行対応する。ポートが既に使用中（＝二重起動）の場合はエラーで
