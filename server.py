@@ -194,14 +194,26 @@ def _safe_sid(sid: str) -> str:
     return re.sub(r"[^A-Za-z0-9_-]", "", sid)[:40] or "default"
 
 
-def save_session(sid: str, model: str, workspace: str, messages: list):
+def save_session(sid: str, model: str, workspace: str, messages: list,
+                  turn: dict | None = None):
     sid = _safe_sid(sid)
     title = next((m["content"] for m in messages
                   if m.get("role") == "user" and m.get("content")), "(無題)")
+    path = HISTORY_DIR / f"{sid}.json"
+    # turns: プロンプト受信〜完了/中断までの時刻ログ。既存ファイルがあれば読み継ぐ
+    # (save_sessionは毎回ファイル全体を上書きするため、ここで読まないと消えてしまう)。
+    turns = []
+    if path.exists():
+        try:
+            turns = json.loads(path.read_text(encoding="utf-8")).get("turns", [])
+        except Exception:
+            turns = []
+    if turn is not None:
+        turns.append(turn)
     data = {"sid": sid, "title": title[:60], "updated_at": time.time(),
-            "model": model, "workspace": workspace, "messages": messages}
-    (HISTORY_DIR / f"{sid}.json").write_text(
-        json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            "model": model, "workspace": workspace, "messages": messages,
+            "turns": turns}
+    path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
 
 
 def list_sessions() -> list:
@@ -646,6 +658,8 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"error": "not found"}, 404)
 
     def handle_chat(self):
+        turn_started_at = time.time()  # プロンプト受信時刻 (中断/完了時刻とセットで記録する)
+        turn_status = "completed"
         body = self._read_body()
         model = body.get("model", "gpt-oss:20b")
         ws = Path(body.get("workspace", "~")).expanduser()
@@ -678,6 +692,7 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     for chunk in ollama_stream(payload):
                         if ev.is_set():
+                            turn_status = "stopped"
                             self._sse({"type": "error", "message": "停止しました"})
                             return
                         msg = chunk.get("message", {})
@@ -726,6 +741,7 @@ class Handler(BaseHTTPRequestHandler):
 
                 for tc in tool_calls:
                     if ev.is_set():
+                        turn_status = "stopped"
                         self._sse({"type": "error", "message": "停止しました"})
                         return
                     fn = tc.get("function", {})
@@ -744,6 +760,7 @@ class Handler(BaseHTTPRequestHandler):
                     messages.append({"role": "tool", "tool_name": name,
                                      "name": name, "content": result})
             else:
+                turn_status = "max_iter"
                 self._sse({"type": "error",
                            "message": f"最大ループ回数({MAX_ITER})に達しました"})
 
@@ -751,22 +768,27 @@ class Handler(BaseHTTPRequestHandler):
             self._sse({"type": "history", "messages": messages[1:]})
             self._sse({"type": "all_done"})
         except (BrokenPipeError, ConnectionResetError):
-            pass  # client disconnected
+            turn_status = "disconnected"
         except urllib.error.URLError as e:
+            turn_status = "error"
             try:
                 self._sse({"type": "error", "message": f"Ollama接続エラー: {e}"})
             except Exception:
                 pass
         except Exception as e:  # noqa: BLE001
+            turn_status = "error"
             try:
                 self._sse({"type": "error", "message": f"{type(e).__name__}: {e}"})
             except Exception:
                 pass
         finally:
             # 会話を自動保存 (エラーや途中停止でもそこまでの内容を残す)
+            # あわせて「プロンプトを受けてから完了/中断するまで」の時刻も記録する
+            turn = {"started_at": turn_started_at, "ended_at": time.time(),
+                    "status": turn_status}
             if len(messages) > 1:
                 try:
-                    save_session(sid, model, str(ws), messages[1:])
+                    save_session(sid, model, str(ws), messages[1:], turn=turn)
                 except Exception:
                     pass
 

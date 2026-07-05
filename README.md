@@ -71,6 +71,10 @@ wsl -d ubuntu-24.04 -- bash -lc "python3 ~/localcoder/server.py"
   通知 (ブラウザのNotification API) で知らせる。他の作業（タスクマネージャーで
   GPU/CPU監視等）をしながらでも完了に気付ける。ユーザーが「■停止」を押した
   場合は通知しない
+- 作業時刻の記録: プロンプトを受け取った時刻と、完了/停止/エラーで処理が
+  終わった時刻を`history/<sid>.json`の`turns`配列に記録する
+  (`{started_at, ended_at, status}`。statusは`completed`/`stopped`/`max_iter`/
+  `error`/`disconnected`)。GPU負荷の記録などと突き合わせて後から確認できる
 
 ## 前提
 
