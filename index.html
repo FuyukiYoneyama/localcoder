@@ -236,6 +236,30 @@ function renderHistory(msgs){
 
 function newChat(){sid=newSid();history=[];chat.innerHTML="";loadSessions()}
 
+// ---------- 完了ノーティス (ベル音 + デスクトップ通知) ----------
+if(window.Notification&&Notification.permission==="default"){
+  Notification.requestPermission();
+}
+function playBell(){
+  try{
+    const ctx=new (window.AudioContext||window.webkitAudioContext)();
+    const o=ctx.createOscillator(), g=ctx.createGain();
+    o.connect(g); g.connect(ctx.destination);
+    o.type="sine"; o.frequency.value=880; g.gain.value=0.001;
+    g.gain.exponentialRampToValueAtTime(0.2, ctx.currentTime+0.01);
+    g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime+0.35);
+    o.start(); o.stop(ctx.currentTime+0.4);
+  }catch(e){/* 音が出せない環境でも無視 */}
+}
+function notifyDone(body){
+  playBell();
+  if(window.Notification&&Notification.permission==="granted"){
+    try{new Notification("🛠 LocalCoder — 入力待ちです",{body:(body||"").slice(0,200)})}
+    catch(e){}
+  }
+}
+let stoppedByUser=false;
+
 // ---------- 送信 ----------
 async function send(){
   const text=input.value.trim();
@@ -244,6 +268,7 @@ async function send(){
   el("div","msg user",text);
   history.push({role:"user",content:text});
   setRunning(true);
+  stoppedByUser=false;
 
   let curAssistant=null, curThink=null, curText="";
   try{
@@ -264,6 +289,7 @@ async function send(){
   }catch(e){el("div","err","通信エラー: "+e)}
   setRunning(false);
   loadSessions();
+  if(!stoppedByUser)notifyDone(curText||"作業が完了し、入力待ちに戻りました。");
 
   function handle(ev){
     if(ev.type==="think"){
@@ -299,7 +325,7 @@ $("sendBtn").onclick=send;
 input.addEventListener("keydown",e=>{
   if(e.key==="Enter"&&!e.shiftKey&&!e.isComposing){e.preventDefault();send()}
 });
-$("stopBtn").onclick=()=>post("/api/stop",{sid});
+$("stopBtn").onclick=()=>{stoppedByUser=true;post("/api/stop",{sid})};
 $("newBtn").onclick=newChat;
 if(window.LC_DEFAULT_WORKSPACE)$("workspace").value=window.LC_DEFAULT_WORKSPACE;
 loadModels();

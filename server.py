@@ -25,7 +25,7 @@ from pathlib import Path
 OLLAMA = os.environ.get("LOCALCODER_OLLAMA", "http://localhost:11434")
 PORT = int(os.environ.get("LOCALCODER_PORT", "8765"))
 ROOT = Path(__file__).resolve().parent
-MAX_ITER = 40          # 1リクエストあたりの最大ツールループ回数
+MAX_ITER = 80          # 1リクエストあたりの最大ツールループ回数
 EMPTY_RETRY_LIMIT = 1  # モデルが本文なし・ツール呼び出しなしで終える"空応答"時、
                        # 自動で続行を促す回数の上限 (それでも空ならユーザーに通知して停止)
 EMPTY_RESPONSE_NUDGE = ("(システム自動継続) 直前の応答が空でした。作業が完了して"

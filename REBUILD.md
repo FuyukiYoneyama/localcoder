@@ -97,7 +97,7 @@ Start-Process "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe" -ArgumentList "serv
 
 **エージェントループの動作**: ユーザー入力 → LLMに tools 付きで問い合わせ →
 LLMがツール呼び出しを返したら承認なしで即実行 → 結果を履歴に追加して再問い合わせ →
-ツール呼び出しがなくなる（=タスク完了）まで最大40回繰り返す。
+ツール呼び出しがなくなる（=タスク完了）まで最大80回繰り返す。
 
 **ツール7種**: `run_command`（bash実行, cwd=作業フォルダ, 180秒タイムアウト、停止ボタン/
 タイムアウトでプロセスグループごとkill）/ `read_file` / `write_file` / `edit_file` /
@@ -149,6 +149,19 @@ ollama_stream(payload):` を`try/except urllib.error.URLError`で囲み、
 モックテストで回復ケース（1回失敗→再試行で成功）と行き詰まりケース（2回とも
 失敗→通知後に通常のエラー表示で停止、呼び出しは2回で打ち切り）の両方を
 検証済み。
+
+**完了ノーティスの設計ノート**: ユーザーがタスクマネージャーでGPU/CPU監視をしながら
+待つなど、画面から目を離している間に処理が終わっても気付けない、という要望への
+対応。`index.html`側で`/api/chat`のストリーム読み取りループが終わった直後
+（成功・エラー・停止いずれの経路でも通る`send()`関数の共通末尾）に`notifyDone()`
+を呼ぶ。中身は2つ: (1) Web Audio APIで生成する短いベル音（外部音声ファイル不要、
+`OscillatorNode`+`GainNode`で880Hzのサイン波を0.4秒フェードアウト）、(2) ブラウザ標準
+の`Notification` API によるデスクトップ通知（ページ読み込み時に`Notification.
+requestPermission()`を1回呼んでおく）。デスクトップ通知はウィンドウがフォーカスを
+失っていても表示されるため、まさに「他の作業をしながら気付きたい」という要望に合う。
+ユーザー自身が「■停止」を押した場合は`stoppedByUser`フラグで通知を抑制する
+（自分で止めた操作についてわざわざ知らせる必要はないため）。サーバー側の変更は
+不要（完全にクライアント側`index.html`のみで完結する機能）。
 
 **フォルダ選択ダイアログの設計ノート**: ブラウザ標準の`<input type="file" webkitdirectory>`は
 セキュリティ上の理由で絶対パスを返さない（相対パスのファイル一覧しか取れない）ため、
@@ -239,7 +252,7 @@ from pathlib import Path
 OLLAMA = os.environ.get("LOCALCODER_OLLAMA", "http://localhost:11434")
 PORT = int(os.environ.get("LOCALCODER_PORT", "8765"))
 ROOT = Path(__file__).resolve().parent
-MAX_ITER = 40          # 1リクエストあたりの最大ツールループ回数
+MAX_ITER = 80          # 1リクエストあたりの最大ツールループ回数
 EMPTY_RETRY_LIMIT = 1  # モデルが本文なし・ツール呼び出しなしで終える"空応答"時、
                        # 自動で続行を促す回数の上限 (それでも空ならユーザーに通知して停止)
 EMPTY_RESPONSE_NUDGE = ("(システム自動継続) 直前の応答が空でした。作業が完了して"
@@ -1240,6 +1253,30 @@ function renderHistory(msgs){
 
 function newChat(){sid=newSid();history=[];chat.innerHTML="";loadSessions()}
 
+// ---------- 完了ノーティス (ベル音 + デスクトップ通知) ----------
+if(window.Notification&&Notification.permission==="default"){
+  Notification.requestPermission();
+}
+function playBell(){
+  try{
+    const ctx=new (window.AudioContext||window.webkitAudioContext)();
+    const o=ctx.createOscillator(), g=ctx.createGain();
+    o.connect(g); g.connect(ctx.destination);
+    o.type="sine"; o.frequency.value=880; g.gain.value=0.001;
+    g.gain.exponentialRampToValueAtTime(0.2, ctx.currentTime+0.01);
+    g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime+0.35);
+    o.start(); o.stop(ctx.currentTime+0.4);
+  }catch(e){/* 音が出せない環境でも無視 */}
+}
+function notifyDone(body){
+  playBell();
+  if(window.Notification&&Notification.permission==="granted"){
+    try{new Notification("🛠 LocalCoder — 入力待ちです",{body:(body||"").slice(0,200)})}
+    catch(e){}
+  }
+}
+let stoppedByUser=false;
+
 // ---------- 送信 ----------
 async function send(){
   const text=input.value.trim();
@@ -1248,6 +1285,7 @@ async function send(){
   el("div","msg user",text);
   history.push({role:"user",content:text});
   setRunning(true);
+  stoppedByUser=false;
 
   let curAssistant=null, curThink=null, curText="";
   try{
@@ -1268,6 +1306,7 @@ async function send(){
   }catch(e){el("div","err","通信エラー: "+e)}
   setRunning(false);
   loadSessions();
+  if(!stoppedByUser)notifyDone(curText||"作業が完了し、入力待ちに戻りました。");
 
   function handle(ev){
     if(ev.type==="think"){
@@ -1303,7 +1342,7 @@ $("sendBtn").onclick=send;
 input.addEventListener("keydown",e=>{
   if(e.key==="Enter"&&!e.shiftKey&&!e.isComposing){e.preventDefault();send()}
 });
-$("stopBtn").onclick=()=>post("/api/stop",{sid});
+$("stopBtn").onclick=()=>{stoppedByUser=true;post("/api/stop",{sid})};
 $("newBtn").onclick=newChat;
 if(window.LC_DEFAULT_WORKSPACE)$("workspace").value=window.LC_DEFAULT_WORKSPACE;
 loadModels();
@@ -1470,7 +1509,7 @@ cat ~/lc_test/hello.py   # → print("hello world") ができていれば合格
 ## 6. カスタマイズポイント
 
 - **ツール追加**: `TOOLS` にJSONスキーマを1個追加し、`exec_tool()` に分岐を1個追加するだけ
-- **ループ上限**: `MAX_ITER = 40`、コマンドタイムアウト: `CMD_TIMEOUT = 180`
+- **ループ上限**: `MAX_ITER = 80`、コマンドタイムアウト: `CMD_TIMEOUT = 180`
 - **コンテキスト長**: `NUM_CTX = 32768`（VRAMが少ないPCでは16384に下げる）
 - **システムプロンプト**: `SYSTEM_PROMPT` を編集（英語で書き「日本語で返答せよ」と指示するのが
   小型モデルには最も安定）
