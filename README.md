@@ -103,3 +103,10 @@ wsl -d ubuntu-24.04 -- bash -lc "python3 ~/localcoder/server.py"
 - `gpt-oss:20b` — 推奨。MoEで実質高速、ツール呼び出しが確実
 - `glm-4.7-flash` — 高性能だが19GBなのでCPU分担が大きく遅め
 - `qwen3:8b` — 軽量。簡単なタスク向け
+
+## 関連ドキュメント
+
+- [CHANGELOG.md](CHANGELOG.md) — 時系列の変更履歴
+- [MANUAL.html](MANUAL.html) — 人間向け操作マニュアル
+- [REBUILD.md](REBUILD.md) — 別PCへの完全再構築ガイド＋各機能の設計ノート
+- [SERVER.md](SERVER.md) — `server.py` のアーキテクチャ解説
