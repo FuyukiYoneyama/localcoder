@@ -54,6 +54,8 @@ details.tool{align-self:flex-start;max-width:860px;width:fit-content;background:
 details.tool summary{cursor:pointer;color:var(--green)}
 details.tool pre{background:#0d0f14;padding:8px;border-radius:6px;overflow-x:auto;
   max-height:260px;font-size:12px;white-space:pre-wrap}
+.imgmsg{display:flex;flex-wrap:wrap;gap:8px;background:transparent;border:none;padding:0}
+.imgmsg img{max-width:280px;max-height:280px;border-radius:8px;border:1px solid var(--border);object-fit:contain}
 .err{align-self:center;color:var(--red);font-size:13px}
 .notice{align-self:center;color:#e0b04a;background:#2a2418;border:1px solid #4a3f24;
   border-radius:8px;padding:6px 14px;font-size:13px}
@@ -88,6 +90,7 @@ footer{display:flex;gap:10px;padding:12px 16px;background:var(--panel);border-to
 <header>
   <h1>🛠 LocalCoder</h1>
   <label>モデル <select id="model"></select></label>
+  <span id="visionBadge" style="font-size:12px;color:var(--dim)"></span>
   <label>作業フォルダ <input type="text" id="workspace" placeholder="/home/youruser/project"></label>
   <button id="browseBtn" title="フォルダを選ぶ">📁 参照</button>
   <button id="newBtn">＋ 新規チャット</button>
@@ -164,16 +167,26 @@ function setRunning(v){
   status.innerHTML=v?'<span class="spin"></span> 実行中…':"";
 }
 
+let MODEL_VISION={};   // モデル名 -> vision対応かどうか
+function updateVisionBadge(){
+  const name=$("model").value;
+  const badge=$("visionBadge");
+  if(!name){badge.textContent="";return}
+  badge.textContent=MODEL_VISION[name]?"👁 画像対応":"🚫 画像非対応";
+}
 async function loadModels(){
   try{
     const r=await fetch("/api/models"); const d=await r.json();
     if(d.error){el("div","err",d.error);return}
-    const sel=$("model"); sel.innerHTML="";
-    for(const m of d.models){const o=document.createElement("option");o.value=o.textContent=m;sel.appendChild(o)}
+    const sel=$("model"); sel.innerHTML=""; MODEL_VISION={};
+    const names=d.models.map(m=>{MODEL_VISION[m.name]=!!m.vision;return m.name});
+    for(const m of names){const o=document.createElement("option");o.value=o.textContent=m;sel.appendChild(o)}
     const pref=["gpt-oss:20b","glm-4.7-flash:latest","qwen3:8b"];
-    for(const p of pref){if(d.models.includes(p)){sel.value=p;break}}
+    for(const p of pref){if(names.includes(p)){sel.value=p;break}}
+    updateVisionBadge();
   }catch(e){el("div","err","サーバに接続できません: "+e)}
 }
+$("model").addEventListener("change",updateVisionBadge);
 
 // ---------- 履歴サイドバー ----------
 async function loadSessions(){
@@ -210,16 +223,27 @@ async function openSession(id){
     if(d.workspace)$("workspace").value=d.workspace;
     const sel=$("model");
     if(d.model&&[...sel.options].some(o=>o.value===d.model))sel.value=d.model;
+    updateVisionBadge();
     renderHistory(history);
     loadSessions();
   }catch(e){el("div","err","履歴の読み込みに失敗: "+e)}
 }
 
+function imageBubble(images){
+  const d=document.createElement("div"); d.className="msg assistant imgmsg";
+  for(const b64 of images){
+    const img=document.createElement("img");
+    img.src="data:image/png;base64,"+b64;
+    d.appendChild(img);
+  }
+  chat.appendChild(d); scroll(); return d;
+}
 function renderHistory(msgs){
   chat.innerHTML="";
   const pending=[];
   for(const m of msgs){
-    if(m.role==="user"){el("div","msg user",m.content)}
+    if(m.role==="user"&&m.images&&m.images.length){imageBubble(m.images)}
+    else if(m.role==="user"){el("div","msg user",m.content)}
     else if(m.role==="assistant"){
       if(m.content){const e=el("div","msg assistant","");md(e,m.content)}
       for(const tc of (m.tool_calls||[])){
@@ -302,6 +326,8 @@ async function send(){
     }else if(ev.type==="turn_done"){
       if(curAssistant)md(curAssistant,curText);
       curAssistant=null; curThink=null; scroll();
+    }else if(ev.type==="image"){
+      imageBubble([ev.b64]);
     }else if(ev.type==="tool_start"){
       toolCard(ev.name,argSummary(ev.name,ev.args),true);
     }else if(ev.type==="tool_end"){

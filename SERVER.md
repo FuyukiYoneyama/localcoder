@@ -256,18 +256,23 @@ elif self.path.startswith("/vendor/"):
 パストラバーサル文字列は正規表現にマッチしないため`f.is_file()`まで到達せず
 404になる。
 
-`/api/models` はOllama未起動時にエラーを日本語化して返す:
+`/api/models` はOllama未起動時にエラーを日本語化して返す。モデル名だけでなく、
+`model_capabilities()`(`/api/show`の`capabilities`をモデル名でキャッシュする)で
+判定した vision 対応可否も付けて返す:
 
 ```python
 elif self.path == "/api/models":
     try:
         with urllib.request.urlopen(OLLAMA + "/api/tags", timeout=10) as r:
             data = json.loads(r.read())
-        self._json({"models": [m["name"] for m in data.get("models", [])]})
+        names = [m["name"] for m in data.get("models", [])]
+        models = [{"name": n, "vision": "vision" in model_capabilities(n)}
+                 for n in names]
+        self._json({"models": models})
     except Exception as e:
         self._json({"error": f"Ollamaに接続できません: {e}"}, 502)
 ```
-（`server.py:698-704`）
+（`server.py:775-784`）
 
 ### 3-2. 作業フォルダ選択ダイアログ — `/api/browse`
 
@@ -567,6 +572,7 @@ if not tool_calls:
                               "具体的な指示を送って続けさせてください。"})
     break
 
+pending_images = []
 for tc in tool_calls:
     if ev.is_set():
         turn_status = "stopped"
@@ -581,24 +587,38 @@ for tc in tool_calls:
         except json.JSONDecodeError:
             args = {"_raw": args}
     self._sse({"type": "tool_start", "name": name, "args": args})
-    result = exec_tool(name, args, ws, ev)
+    result = exec_tool(name, args, ws, ev, model=model, pending_images=pending_images)
     self._sse({"type": "tool_end", "name": name,
                "result": result if len(result) <= 4000
                else result[:4000] + "\n...[truncated]..."})
     messages.append({"role": "tool", "tool_name": name,
                      "name": name, "content": result})
+if pending_images:
+    # view_imageで読み込んだ画像は、tool結果(テキストのみ)とは別に合成のuser
+    # メッセージとして差し込み、次のOllama呼び出しでvisionモデルに実際に見せる。
+    messages.append({"role": "user", "content": "(view_imageで読み込んだ画像)",
+                     "images": pending_images})
+    for b64 in pending_images:
+        self._sse({"type": "image", "b64": b64})
 ```
-（`server.py:826-867`）
+（`server.py:906-958`）
 
 これが **エージェントループの心臓部**：
 1. モデルの応答（`assistant` メッセージ）を履歴に追加
 2. `tool_calls` が無ければ「タスク完了」とみなしループを抜ける——ただし本文も
    空なら「空応答」（下記）として扱う
-3. あれば `exec_tool(name, args, ws, ev)` で実際に実行し、結果を `role: "tool"`
-   メッセージとして履歴に追加。**キャンセル用の `ev` を渡す**ことで、
-   `run_command`（5-1節）が実行中でも停止ボタンに反応できるようにしている
-4. `messages` が増えた状態で `for it in range(MAX_ITER)` の次周回に入り、
-   再びOllamaに問い合わせる（モデルはツール結果を見て次の一手を判断する）
+3. あれば `exec_tool(name, args, ws, ev, model=model, pending_images=pending_images)`
+   で実際に実行し、結果を `role: "tool"` メッセージとして履歴に追加。**キャンセル用の
+   `ev` を渡す**ことで、`run_command`（5-1節）が実行中でも停止ボタンに反応できる
+   ようにしている
+4. `view_image`(5節) が画像を読み込んだ場合は `pending_images` に積まれるだけで、
+   個々の `tool` メッセージには画像データを載せない。全tool_calls処理後、
+   `pending_images` があれば合成の `user` メッセージ(`images`フィールド付き)を
+   1つ追加してからループを抜ける——tool役割ではなくuser役割で載せるのは、
+   Ollamaのvisionテンプレートがuser/assistantロールでの画像を前提にしている
+   実装が多いため
+5. `messages` が増えた状態で `for it in range(MAX_ITER)` の次周回に入り、
+   再びOllamaに問い合わせる（モデルはツール結果や画像を見て次の一手を判断する）
 
 `tool_name` と `name` を両方入れているのは、Ollamaのバージョン間でtoolメッセージの
 キー名が変わった経緯を吸収するため。
@@ -725,15 +745,18 @@ SUMMARIZE_INPUT_TOKENS = NUM_CTX // 2  # 要約1回の入力上限 (超えたら
 
 ## 5. ツール実行 — `exec_tool` / `run_command`
 
-`exec_tool` が7種のツール名を振り分ける:
+`exec_tool` が8種のツール名を振り分ける:
 
 ```python
-def exec_tool(name: str, args: dict, ws: Path, cancel=None) -> str:
+def exec_tool(name: str, args: dict, ws: Path, cancel=None, model: str | None = None,
+              pending_images: list | None = None) -> str:
     try:
         if name == "run_command":
             return run_command(args["command"], ws, cancel)
         if name == "read_file":
             f = resolve_path(ws, args["path"])
+            if f.suffix.lower() == ".pdf":
+                return pdf_to_text(f)   # pdftotext(poppler-utils)でテキスト抽出
             t = f.read_text(errors="replace")
             if len(t) > 60000:
                 t = t[:60000] + "\n...[truncated]..."
@@ -765,11 +788,24 @@ def exec_tool(name: str, args: dict, ws: Path, cancel=None) -> str:
             return web_search(args["query"], int(args.get("max_results") or 6))
         if name == "fetch_url":
             return fetch_url_text(args["url"])
+        if name == "view_image":
+            f = resolve_path(ws, args["path"])
+            ...  # 拡張子チェック・存在チェック
+            if "vision" not in model_capabilities(model or ""):
+                return f"ERROR: the current model ('{model}') does not support vision. ..."
+            data = f.read_bytes()
+            ...  # サイズ上限チェック
+            if pending_images is not None:
+                pending_images.append(base64.b64encode(data).decode())
+            return f"OK: loaded {args['path']}, it will be shown to you now"
         return f"ERROR: unknown tool {name}"
     except Exception as e:  # noqa: BLE001 - report all tool errors to the model
         return f"ERROR: {type(e).__name__}: {e}"
 ```
-（`server.py:320-368`、edit_fileのエラーメッセージ等は抜粋）
+（`server.py:374-441`、edit_fileのエラーメッセージ等は抜粋。呼び出し元の`handle_chat`が
+`model`と`pending_images`(可変リスト)を渡し、`view_image`が積んだ画像は1イテレーション
+分の全tool_calls処理後に合成のuserメッセージとして履歴へ追加される — 4節「エージェント
+ループの本体」参照）
 
 設計上の要点:
 

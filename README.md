@@ -51,12 +51,19 @@ wsl -d ubuntu-24.04 -- bash -lc "python3 ~/localcoder/server.py"
 
 - `server.py` — HTTPサーバー + エージェントループ (Ollama /api/chat + tools)
 - `index.html` — チャットGUI (SSEストリーミング表示)
-- ツール: run_command / read_file / write_file / edit_file / list_dir / web_search / fetch_url
+- ツール: run_command / read_file / write_file / edit_file / list_dir / web_search / fetch_url / view_image
   - ファイル操作は作業フォルダ内に制限
   - edit_file は完全一致のfind/replace。既存ファイルの部分修正は全文書き換えでなく
     こちらが優先される (トークン節約 + 書き換え漏れ事故の防止)
   - コマンドは作業フォルダをcwdとして実行 (タイムアウト180秒)
   - web_search は DuckDuckGo (無料・APIキー不要)、fetch_url はページ本文取得
+  - read_file は `.pdf` を自動判別し `pdftotext` でテキスト抽出する (poppler-utils必須。
+    スキャン画像PDFなどテキストが取れない場合はその旨を返す)
+  - view_image は画像ファイル(png/jpg/gif/webp/bmp)を読み込む。現在選択中のモデルが
+    vision対応 (`/api/show`の`capabilities`で判定) ならOllamaへの次の呼び出しで
+    実際に見せる。非対応モデルではエラーを返し、エージェントがユーザーにモデル
+    切り替えを促す。画面上部のモデル選択の横に「👁 画像対応 / 🚫 画像非対応」
+    バッジで対応状況を確認できる
 - Windows 側の操作にも対応: 作業フォルダ・ファイル操作ツールは WSLホーム(`$HOME`)
   に加え Windowsドライブ(`/mnt/c` 等)の配下も許可され、`C:\...` のファイルを
   read_file/write_file/edit_file で直接編集できる。Windowsコマンドは run_command
@@ -97,6 +104,9 @@ wsl -d ubuntu-24.04 -- bash -lc "python3 ~/localcoder/server.py"
 
 - Windows側 Ollama (localhost:11434)。WSLは mirrored ネットワークなので直結。
 - コンテキスト長はWindows環境変数 OLLAMA_CONTEXT_LENGTH=32768 で拡大済み。
+- PDFのテキスト抽出には poppler-utils (`pdftotext`) が必要。
+  `sudo apt install poppler-utils` (Ubuntu WSLには標準で入っていることが多い)。
+  未導入でもサーバーは動くが、read_fileでPDFを開くとその旨のエラーを返す。
 
 ## モデルの目安 (RTX 3070 8GB VRAM)
 
