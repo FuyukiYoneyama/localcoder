@@ -41,8 +41,8 @@ wsl -d ubuntu-24.04 -- bash -lc "python3 ~/localcoder/server.py"
 
 1. 画面上部でモデルを選択 (推奨: gpt-oss:20b。ツール呼び出しが最も安定)
 2. 作業フォルダを指定。手入力のほか「📁 参照」ボタンでフォルダ選択ダイアログが
-   開く (`$HOME`配下のみ移動可能)。未入力時は環境変数
-   `LOCALCODER_DEFAULT_WORKSPACE`の値、無ければ`$HOME`が自動で入る
+   開く (`$HOME` および Windowsドライブ `/mnt/c` 等の配下を移動可能)。未入力時は
+   環境変数 `LOCALCODER_DEFAULT_WORKSPACE`の値、無ければ`$HOME`が自動で入る
 3. やりたいことを日本語で入力して送信
 4. エージェントが自動でファイル作成・編集・コマンド実行・検証まで行う
    (承認プロンプトは一切なし。ツール実行内容は 🔧 カードで確認できる)
@@ -57,6 +57,12 @@ wsl -d ubuntu-24.04 -- bash -lc "python3 ~/localcoder/server.py"
     こちらが優先される (トークン節約 + 書き換え漏れ事故の防止)
   - コマンドは作業フォルダをcwdとして実行 (タイムアウト180秒)
   - web_search は DuckDuckGo (無料・APIキー不要)、fetch_url はページ本文取得
+- Windows 側の操作にも対応: 作業フォルダ・ファイル操作ツールは WSLホーム(`$HOME`)
+  に加え Windowsドライブ(`/mnt/c` 等)の配下も許可され、`C:\...` のファイルを
+  read_file/write_file/edit_file で直接編集できる。Windowsコマンドは run_command
+  から `powershell.exe -NoProfile -Command "..."` で実行できる(WSL相互運用)。
+  許可範囲は環境変数 `LOCALCODER_ALLOWED_ROOTS`(コロン区切り)で変更でき、`$HOME`
+  だけに戻すことも可能
 - 履歴の自動圧縮: 会話がコンテキスト長(32K)に近づくと、古いツール結果の切り詰め →
   古い会話のLLM要約への置換、を自動で行う (画面に 🗜 表示)。長い会話でも
   システムプロンプトや直近の文脈が押し出されて壊れることがない

@@ -60,7 +60,15 @@ HISTORY_DIR.mkdir(exist_ok=True)
 # 全POST APIで X-LocalCoder-Token ヘッダとして要求する。
 # 外部サイトからの no-cors POST はこの値を知り得ないため全て拒否される。
 TOKEN = secrets.token_hex(16)
-HOME = Path.home().resolve()     # ワークスペースはこの配下のみ許可
+HOME = Path.home().resolve()
+# 作業フォルダ・ファイル操作を許可するルート。既定は WSL ホーム + Windows ドライブ(/mnt)。
+# これにより /mnt/c/Users/... のような Windows 側ファイルも read_file/write_file/
+# edit_file/list_dir で直接編集できる。run_command は元々サンドボックス無しなので
+# powershell.exe 等で Windows コマンドも実行可能(WSL相互運用)。
+# 環境変数 LOCALCODER_ALLOWED_ROOTS(コロン区切り)で上書きでき、HOMEだけに戻すこともできる。
+ALLOWED_ROOTS = [Path(p).expanduser().resolve() for p in
+                 os.environ.get("LOCALCODER_ALLOWED_ROOTS",
+                                f"{HOME}:/mnt").split(":") if p]
 # 画面初期表示時の作業フォルダ。個人の作業パスをリポジトリに埋め込まないよう
 # 環境変数で指定する(未設定ならHOME)。index.html配信時にwindow変数として埋め込む。
 DEFAULT_WORKSPACE = os.environ.get("LOCALCODER_DEFAULT_WORKSPACE", str(HOME))
@@ -70,6 +78,7 @@ Workspace directory: {ws}
 
 Rules:
 - You have tools: run_command, read_file, write_file, edit_file, list_dir, web_search, fetch_url. Use them freely without asking permission.
+- You run inside WSL (Linux) but can also operate on the user's Windows system. Windows files live under /mnt/c, /mnt/d, etc. (e.g. C:\\Users\\name\\file becomes /mnt/c/Users/name/file), and read_file/write_file/edit_file/list_dir work on those paths too. To run a Windows program or command, use run_command and invoke it via powershell.exe, e.g. run_command with `powershell.exe -NoProfile -Command "Get-ChildItem"`, or call an .exe directly. Prefer powershell.exe over cmd.exe (cmd.exe prints a warning when the working directory is a WSL path). The workspace itself may be a Windows path such as /mnt/c/Users/name/project.
 - To change part of an existing file, prefer edit_file (exact find & replace) instead of rewriting the whole file with write_file. Use write_file only for new files or complete rewrites.
 - When you need up-to-date information (library usage, API docs, error messages, versions), use web_search first, then fetch_url on the most promising result. Prefer official documentation.
 - Inspect existing files before editing them. Never overwrite a file you have not read.
@@ -250,24 +259,29 @@ def resolve_path(ws: Path, p: str) -> Path:
     return full
 
 
-def under_home(p: Path) -> bool:
+def under_allowed(p: Path) -> bool:
+    """p が ALLOWED_ROOTS のいずれか(既定=HOME + /mnt)の配下か。"""
     p = p.resolve()
-    return p == HOME or str(p).startswith(str(HOME) + os.sep)
+    return any(p == root or str(p).startswith(str(root) + os.sep)
+               for root in ALLOWED_ROOTS)
 
 
 def list_subdirs(path: str) -> dict:
-    """作業フォルダ選択ダイアログ用。$HOME配下のサブディレクトリのみ一覧する。"""
+    """作業フォルダ選択ダイアログ用。ALLOWED_ROOTS(HOME + Windowsドライブ)配下のみ一覧する。"""
     p = Path(path or DEFAULT_WORKSPACE).expanduser()
     try:
         p = p.resolve()
     except OSError:
         p = HOME
-    if not p.is_dir() or not under_home(p):
+    if not p.is_dir() or not under_allowed(p):
         p = HOME
     dirs = sorted((e.name for e in p.iterdir()
                   if e.is_dir() and not e.name.startswith(".")),
                   key=str.lower)
-    parent = str(p.parent) if p != HOME and under_home(p.parent) else None
+    # 許可ルート自身では「上へ」を出さない(それ以上遡れない)。それ以外は
+    # 親も許可ルート配下である限り遡れる。
+    parent = (str(p.parent) if p not in ALLOWED_ROOTS and under_allowed(p.parent)
+              else None)
     return {"path": str(p), "parent": parent, "dirs": dirs}
 
 
@@ -756,9 +770,10 @@ class Handler(BaseHTTPRequestHandler):
             self._sse({"type": "error", "message": f"ワークスペースが存在しません: {ws}"})
             return
         wsr = ws.resolve()
-        if not (wsr == HOME or str(wsr).startswith(str(HOME) + os.sep)):
+        if not under_allowed(wsr):
+            roots = ", ".join(str(r) for r in ALLOWED_ROOTS)
             self._sse({"type": "error",
-                       "message": f"ワークスペースはホーム({HOME})配下のみ指定できます: {ws}"})
+                       "message": f"ワークスペースは {roots} 配下のみ指定できます: {ws}"})
             return
 
         messages = [{"role": "system", "content": SYSTEM_PROMPT.format(ws=ws)}]
