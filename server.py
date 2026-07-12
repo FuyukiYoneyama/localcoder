@@ -28,6 +28,30 @@ from pathlib import Path
 OLLAMA = os.environ.get("LOCALCODER_OLLAMA", "http://localhost:11434")
 PORT = int(os.environ.get("LOCALCODER_PORT", "8765"))
 ROOT = Path(__file__).resolve().parent
+
+
+def _detect_version() -> str:
+    """起動中のserver.pyが指すgitコミット(先頭7桁)を求める。
+
+    「再起動したのに直したはずのバグが直っていない」は、直した後に再起動を
+    忘れて古いプロセスのまま動かし続けていたことが実際に原因だった。画面上に
+    今動いているコミットを出しておけば、`git log`の最新コミットと見比べるだけで
+    最新版が動いているか一目で分かる。取得できない場合は"unknown"。
+    """
+    try:
+        out = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--short=7", "HEAD"],
+                             capture_output=True, text=True, timeout=5)
+        h = out.stdout.strip()
+        if out.returncode != 0 or not h:
+            return "unknown"
+        dirty = subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain"],
+                               capture_output=True, text=True, timeout=5).stdout.strip()
+        return h + ("+dirty" if dirty else "")
+    except Exception:
+        return "unknown"
+
+
+SERVER_VERSION = _detect_version()
 MAX_ITER = 80          # 1リクエストあたりの最大ツールループ回数
 TOOL_STUCK_LIMIT = 3   # 同じツール呼び出し(名前+引数)が同じエラーで連続失敗した回数の上限。
                        # 超えたら進展が見込めないと判断しMAX_ITERを待たずループを打ち切る
@@ -284,22 +308,44 @@ def _safe_sid(sid: str) -> str:
     return re.sub(r"[^A-Za-z0-9_-]", "", sid)[:40] or "default"
 
 
+def derive_title(messages: list) -> str:
+    """履歴一覧用のタイトルを最初のuserメッセージから作る。
+
+    それが圧縮マーカー(【自動要約】/【自動省略】)だった場合は、生のマーカー文
+    ではなく要約本文の冒頭を使う。マーカー文自体はどのセッションでも同じ
+    書き出しなので、そのままだと履歴一覧で全部同じタイトルに見えて区別が
+    つかなくなる(実際にユーザーから報告された)。
+    """
+    for m in messages:
+        if m.get("role") == "user" and m.get("content"):
+            c = m["content"]
+            summary, _ = _parse_marker(c)
+            return summary if summary is not None else c
+    return "(無題)"
+
+
 def save_session(sid: str, model: str, workspace: str, messages: list,
                   turn: dict | None = None):
     sid = _safe_sid(sid)
-    title = next((m["content"] for m in messages
-                  if m.get("role") == "user" and m.get("content")), "(無題)")
     path = HISTORY_DIR / f"{sid}.json"
     # turns: プロンプト受信〜完了/中断までの時刻ログ。既存ファイルがあれば読み継ぐ
     # (save_sessionは毎回ファイル全体を上書きするため、ここで読まないと消えてしまう)。
     turns = []
+    existing_title = None
     if path.exists():
         try:
-            turns = json.loads(path.read_text(encoding="utf-8")).get("turns", [])
+            prev = json.loads(path.read_text(encoding="utf-8"))
+            turns = prev.get("turns", [])
+            existing_title = prev.get("title")
         except Exception:
             turns = []
     if turn is not None:
         turns.append(turn)
+    # タイトルは初回保存時に一度だけ決め、以後は固定する。毎回作り直すと、
+    # 圧縮が起きて先頭のuserメッセージが要約マーカーに置き換わった瞬間に
+    # タイトルまで変わってしまう(本来のタイトルは既に生ログから失われている
+    # ため復元できない)。既存タイトルがあればそれを常に優先する。
+    title = existing_title or derive_title(messages)
     data = {"sid": sid, "title": title[:60], "updated_at": time.time(),
             "model": model, "workspace": workspace, "messages": messages,
             "turns": turns}
@@ -941,6 +987,7 @@ class Handler(BaseHTTPRequestHandler):
             body = (ROOT / "index.html").read_bytes()
             inject = (f'<script>window.LC_TOKEN={json.dumps(TOKEN)};'
                      f'window.LC_DEFAULT_WORKSPACE={json.dumps(DEFAULT_WORKSPACE)};'
+                     f'window.LC_VERSION={json.dumps(SERVER_VERSION)};'
                      f'</script></head>').encode()
             body = body.replace(b"</head>", inject, 1)
             self.send_response(200)

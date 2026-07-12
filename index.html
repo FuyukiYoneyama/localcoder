@@ -89,6 +89,7 @@ footer{display:flex;gap:10px;padding:12px 16px;background:var(--panel);border-to
 <body>
 <header>
   <h1>🛠 LocalCoder</h1>
+  <span id="version" title="実行中のserver.pyのgitコミット(先頭7桁)。git logの最新コミットと一致していれば最新版が動いている" style="font-size:11px;color:var(--dim)"></span>
   <label>モデル <select id="model"></select></label>
   <span id="visionBadge" style="font-size:12px;color:var(--dim)"></span>
   <label>作業フォルダ <input type="text" id="workspace" placeholder="/home/youruser/project"></label>
@@ -354,6 +355,7 @@ input.addEventListener("keydown",e=>{
 $("stopBtn").onclick=()=>{stoppedByUser=true;post("/api/stop",{sid})};
 $("newBtn").onclick=newChat;
 if(window.LC_DEFAULT_WORKSPACE)$("workspace").value=window.LC_DEFAULT_WORKSPACE;
+if(window.LC_VERSION)$("version").textContent=window.LC_VERSION;
 loadModels();
 loadSessions();
 
