@@ -29,6 +29,9 @@ OLLAMA = os.environ.get("LOCALCODER_OLLAMA", "http://localhost:11434")
 PORT = int(os.environ.get("LOCALCODER_PORT", "8765"))
 ROOT = Path(__file__).resolve().parent
 MAX_ITER = 80          # 1リクエストあたりの最大ツールループ回数
+TOOL_STUCK_LIMIT = 3   # 同じツール呼び出し(名前+引数)が同じエラーで連続失敗した回数の上限。
+                       # 超えたら進展が見込めないと判断しMAX_ITERを待たずループを打ち切る
+TOOL_NAME_TOKEN_RE = re.compile(r"<\|[^|]*\|>")  # モデルが漏らす特殊トークンの除去用
 EMPTY_RETRY_LIMIT = 1  # モデルが本文なし・ツール呼び出しなしで終える"空応答"時、
                        # 自動で続行を促す回数の上限 (それでも空ならユーザーに通知して停止)
 EMPTY_RESPONSE_NUDGE = ("(システム自動継続) 直前の応答が空でした。作業が完了して"
@@ -441,6 +444,11 @@ def exec_tool(name: str, args: dict, ws: Path, cancel=None, model: str | None = 
                 pending_images.append(base64.b64encode(data).decode())
             return f"OK: loaded {args['path']}, it will be shown to you now"
         return f"ERROR: unknown tool {name}"
+    except KeyError as e:
+        # 弱いローカルモデルほど引数を一部欠落させたツール呼び出しを返しがちなので、
+        # 生のKeyErrorよりモデルが自己修正しやすい具体的な指示にする。
+        return (f"ERROR: missing required argument {e} for tool '{name}'. "
+                f"Call {name} again with all required arguments included.")
     except Exception as e:  # noqa: BLE001 - report all tool errors to the model
         return f"ERROR: {type(e).__name__}: {e}"
 
@@ -637,10 +645,15 @@ def _iter_tool_calls_with_results(messages: list):
 def extract_changed_files(messages: list) -> list[str]:
     """write_file/edit_fileツール呼び出しから変更ファイルパスを機械的に抽出する
     (発生順・重複除去、LLM不使用)。圧縮時にLLM要約とは別ルートで確実に引き継ぐために使う。
+
+    結果が"ERROR"で始まる(=実際には書き込みに失敗した)呼び出しは含めない。呼び出しが
+    あっただけで成功とみなすと、モデルに「ファイルは変更済み」という誤った情報を
+    与えてしまい、実際には一度も書き込みに成功していないのに完了したと誤認する
+    (ダッシュボード経由でのハルシネーションを誘発する)ことが実際に確認された。
     """
     files = []
-    for name, args, _result in _iter_tool_calls_with_results(messages):
-        if name in ("write_file", "edit_file"):
+    for name, args, result in _iter_tool_calls_with_results(messages):
+        if name in ("write_file", "edit_file") and result is not None and not result.startswith("ERROR"):
             path = args.get("path")
             if path and path not in files:
                 files.append(path)
@@ -957,6 +970,9 @@ class Handler(BaseHTTPRequestHandler):
         messages += body.get("messages", [])
         empty_retries = 0
         http_retries = 0
+        last_failed_sig = None  # 直前の失敗ツール呼び出し(名前+引数)の署名。連続失敗検出用
+        tool_repeat = 0
+        stuck = False
 
         try:
             for it in range(MAX_ITER):
@@ -1029,7 +1045,16 @@ class Handler(BaseHTTPRequestHandler):
                         self._sse({"type": "error", "message": "停止しました"})
                         return
                     fn = tc.get("function", {})
-                    name = fn.get("name", "?")
+                    raw_name = fn.get("name", "?")
+                    # 一部のモデル(実例: laguna-xs-2.1)はツール呼び出しのname欄に
+                    # <|tool_call_argument_begin|>のような内部特殊トークンを漏らして
+                    # 返すことがあり、完全一致ディスパッチが永遠に失敗し続ける
+                    # (=ループを自己修正できないまま浪費する)原因になっていた。
+                    # 生ログにも正規化後の名前を残しておく(fnは元のtool_calls/messages
+                    # と同一オブジェクトを参照しているため、ここでの変更が保存履歴にも反映される)。
+                    name = TOOL_NAME_TOKEN_RE.sub("", raw_name).strip()
+                    if name != raw_name:
+                        fn["name"] = name
                     args = fn.get("arguments") or {}
                     if isinstance(args, str):
                         try:
@@ -1044,6 +1069,18 @@ class Handler(BaseHTTPRequestHandler):
                                else result[:4000] + "\n...[truncated]..."})
                     messages.append({"role": "tool", "tool_name": name,
                                      "name": name, "content": result})
+                    # 同じツール呼び出し(名前+引数)が同じ結果でTOOL_STUCK_LIMIT回連続
+                    # 失敗したら、進展が見込めないと判断してMAX_ITERを待たず打ち切る
+                    # (ツール名破損やモデルの引数生成不良で80回丸ごと浪費するのを防ぐ)。
+                    sig = (name, json.dumps(args, sort_keys=True, ensure_ascii=False))
+                    if result.startswith("ERROR") and sig == last_failed_sig:
+                        tool_repeat += 1
+                    else:
+                        tool_repeat = 0
+                    last_failed_sig = sig if result.startswith("ERROR") else None
+                    if tool_repeat >= TOOL_STUCK_LIMIT:
+                        stuck = True
+                        break
                 if pending_images:
                     # view_imageで読み込んだ画像は、tool結果(テキストのみ)とは別に
                     # 合成のuserメッセージとして差し込み、次のOllama呼び出しで
@@ -1053,6 +1090,14 @@ class Handler(BaseHTTPRequestHandler):
                                      "images": pending_images})
                     for b64 in pending_images:
                         self._sse({"type": "image", "b64": b64})
+                if stuck:
+                    turn_status = "stuck"
+                    self._sse({"type": "error",
+                               "message": f"同じツール呼び出し「{name}」が同じ引数・同じ"
+                                          f"エラーで{TOOL_STUCK_LIMIT}回連続失敗したため、"
+                                          "これ以上繰り返さず停止しました。モデルの出力形式"
+                                          "(ツール名や引数)に問題がある可能性があります。"})
+                    break
             else:
                 turn_status = "max_iter"
                 self._sse({"type": "error",
