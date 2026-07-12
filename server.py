@@ -58,6 +58,11 @@ COMPACT_TARGET_RATIO = 0.6  # 圧縮後に目指すサイズ(予算比)。予算
                             # ギリギリまでしか下げないと、数イテレーションごとに圧縮が
                             # 再発し、履歴前方の書き換えでollamaのプロンプトキャッシュも
                             # 毎回無効化されて激遅になる。一度超過したら大きく下げる
+PROACTIVE_COMPACT_RATIO = 0.9  # 予算に対してこの割合を超えたら、まだ超過していなくても
+                               # 先回りで圧縮する。天井ギリギリ(実測で予算の99%)まで
+                               # 会話を伸ばした状態でモデルに応答を続けさせると、生成用に
+                               # 確保したRESERVE_TOKENSの余白がほぼ無くなり、本文もツール
+                               # 呼び出しも無い"空応答"を返して進まなくなる実例があった
 DEDUPE_MIN_CHARS = 200  # この文字数を超える同一内容のツール結果だけ重複除去の対象にする
 KEEP_RECENT_MSGS = 6    # 要約時に原文のまま残す直近メッセージ数
 KEEP_RECENT_TOOLS = 4   # 切り詰めずに残す直近のツール結果数
@@ -790,8 +795,8 @@ def build_work_state(messages: list) -> str:
     return "\n".join(lines)
 
 
-def compact_history(messages: list, model: str, sse) -> list:
-    """messages(先頭はsystem)が予算を超えていたら圧縮して返す。超えていなければそのまま。
+def compact_history(messages: list, model: str, sse, force: bool = False) -> list:
+    """messages(先頭はsystem)が予算に近づいていたら圧縮して返す。近づいていなければそのまま。
 
     第0段階: 同一内容のツール結果の重複除去 (安価・LLM不使用)
     第1段階: 古いツール結果の切り詰め (安価・LLM不使用)
@@ -803,17 +808,26 @@ def compact_history(messages: list, model: str, sse) -> list:
     要約失敗時: 既存の要約とファイル一覧があればそれだけは保持し、新規分のみ
                省略する (全損させない)。
 
-    ヒステリシス: 発動は予算(budget)超過時だが、いったん発動したら目標(target=
-    予算×COMPACT_TARGET_RATIO)まで下げる。天井ギリギリで止めると数イテレーション
-    ごとに圧縮が再発し、しかも安価な切り詰めでも履歴前方を書き換えるため
-    ollamaのプロンプトキャッシュが毎回無効化され、全プロンプトの再処理
-    (CPUオフロード時は数分)が発生して実質作業が止まる。実測でこの状態に
-    陥ったセッションがあったため、超過したら一気に下げて再発間隔を空ける。
+    ヒステリシス: 発動判定は予算(budget)そのものではなく、より手前の
+    trigger(=budget×PROACTIVE_COMPACT_RATIO)。実測で、会話が予算の99%まで
+    伸びた状態(=正式な超過はしていない)でモデルが本文もツール呼び出しも無い
+    "空応答"を繰り返し、生成用に確保したRESERVE_TOKENSの余白をほぼ使い切って
+    何も produce できなくなるセッションがあった。予算に達してから動くのでは
+    手遅れなので、天井の手前で先回りして縮める。発動したら目標(target=
+    予算×COMPACT_TARGET_RATIO)まで一気に下げる。天井ギリギリで止めると数
+    イテレーションごとに圧縮が再発し、しかも安価な切り詰めでも履歴前方の
+    書き換えでollamaのプロンプトキャッシュが毎回無効化され、全プロンプトの
+    再処理(CPUオフロード時は数分)が発生して実質作業が止まる実例もあったため。
+
+    force=Trueの場合はtriggerを無視して必ず第0段階から実行する。空応答で
+    自動リトライする直前に呼び、リトライ前に強制的に文脈を減らすために使う
+    (リトライしても文脈がほぼ変わらなければ同じ壁にまた当たるだけなので)。
     """
     budget = NUM_CTX - RESERVE_TOKENS
+    trigger = int(budget * PROACTIVE_COMPACT_RATIO)
     target = int(budget * COMPACT_TARGET_RATIO)
     est = estimate_tokens(messages)
-    if est <= budget:
+    if not force and est <= trigger:
         return messages
 
     dedupe_tool_results(messages)
@@ -1092,9 +1106,15 @@ class Handler(BaseHTTPRequestHandler):
                         # 本文なし・ツール呼び出しなしで終える"空応答"は、ユーザーには
                         # 何も起きていないように見えて実質的に停止してしまう。
                         # 1回だけ自動で続行を促し、それでも空なら諦めて通知する。
+                        #
+                        # 「続けてください」を足すだけでは文脈量がほぼ変わらず、予算の
+                        # 天井付近で空応答になった場合は同じ壁に再度当たるだけなので、
+                        # リトライ前に強制的に圧縮して実際に余白を作る(force=True)。
                         empty_retries += 1
+                        messages = compact_history(messages, model, self._sse, force=True)
                         self._sse({"type": "notice",
-                                   "message": "モデルが空の応答を返したため、続行を促しています…"})
+                                   "message": "モデルが空の応答を返したため、文脈を圧縮してから"
+                                              "続行を促しています…"})
                         messages.append({"role": "user", "content": EMPTY_RESPONSE_NUDGE})
                         continue
                     if not content.strip():
