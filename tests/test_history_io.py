@@ -61,6 +61,24 @@ class TestSaveSessionTitlePersistence(unittest.TestCase):
         data = json.loads((s.HISTORY_DIR / "sid3.json").read_text(encoding="utf-8"))
         self.assertEqual([t["status"] for t in data["turns"]], ["completed", "max_iter"])
 
+    def test_schema_version_is_written(self):
+        s.save_session("sid4", "m", "/ws", [{"role": "user", "content": "x"}])
+        data = json.loads((s.HISTORY_DIR / "sid4.json").read_text(encoding="utf-8"))
+        self.assertEqual(data["schema_version"], s.SCHEMA_VERSION)
+
+    def test_diagnostic_turn_fields_round_trip(self):
+        """IMPROVEMENTS.md §2.3の診断情報(est_tokens/compact_count/tool_call_count等)を
+        含むturn辞書がそのまま保存・復元できることを確認する。実際の収集ロジックは
+        handle_chat(HTTPハンドラ)内にあり、ここではsave_session側の受け皿を検証する。
+        """
+        turn = {"started_at": 1.0, "ended_at": 2.0, "status": "stuck",
+                "est_tokens_start": 100, "est_tokens_end": 150,
+                "compact_count": 1, "http_retries": 0, "empty_retries": 1,
+                "tool_call_count": 5, "tool_exec_seconds": 3.2, "iterations_used": 7}
+        s.save_session("sid5", "m", "/ws", [{"role": "user", "content": "x"}], turn=turn)
+        data = json.loads((s.HISTORY_DIR / "sid5.json").read_text(encoding="utf-8"))
+        self.assertEqual(data["turns"][0], turn)
+
 
 if __name__ == "__main__":
     unittest.main()

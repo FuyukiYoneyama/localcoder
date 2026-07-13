@@ -33,6 +33,14 @@ LocalCoder の主な変更を時系列で記録する。形式は
     切り出した(挙動は変えず、テスト可能にするための移動)。
   - 実行方法: `python3 -m unittest discover -s tests -t .`（詳細は`REBUILD.md`
     §4-1）。(`3b66a17`)
+- **ターン診断情報の保存とセッションJSONの`schema_version`を追加
+  (`IMPROVEMENTS.md` §2.3/§8.3の実装)。** 障害調査のたびに履歴JSONから手計算
+  していたトークン見積もり・圧縮回数・ツール呼び出し数などを、`handle_chat`が
+  各ターンで機械的に記録するようにした。`turn`辞書に
+  `est_tokens_start`/`est_tokens_end`・`compact_count`・`http_retries`・
+  `empty_retries`・`tool_call_count`・`tool_exec_seconds`・`iterations_used`
+  を追加。あわせて履歴JSONに`schema_version`(現在2)を導入し、今後形式を
+  変える際に安全に移行できるようにした。実チャットで動作確認済み。
 
 ## 2026-07-12
 
