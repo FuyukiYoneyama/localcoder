@@ -2021,6 +2021,42 @@ cat ~/lc_test/hello.py   # → print("hello world") ができていれば合格
 最後に LocalCoder.bat をダブルクリックし、GUIウィンドウが開いてモデル一覧が
 表示されることを確認する。
 
+### 4-1. 自動テスト（Ollama不要・純粋関数のみ）
+
+`tests/` に、履歴圧縮・作業状態ダッシュボード・ツール呼び出しの正規化・履歴
+保存を対象にした回帰テストがある（`IMPROVEMENTS.md` §2.1〜2.2の実装）。
+標準ライブラリの`unittest`のみで完結し、Ollamaへの接続もモデルのダウンロードも
+不要（`ollama_ask`は`tests/_helpers.py`の`FakeOllama`で差し替える）。コードを
+変更したら、サーバーを起動する前にまずこれを走らせる。
+
+```bash
+cd ~/localcoder
+python3 -m unittest discover -s tests -t . -v
+```
+
+`tests/fixtures/` には実際に問題が起きたセッションのJSON（パスのみ匿名化した
+実データ）を置く運用にしている。**`tests/fixtures/`自体は`.gitignore`対象**
+（このマシンにのみ存在し、GitHubへは一切コミットされない）。実際の会話内容
+（プロジェクトのコード片・やり取り本文）を含むため、パス匿名化程度では
+リポジトリに含めるべきではないと判断した。fixtureが無い環境（`git clone`
+直後など）では該当テストだけが`unittest.SkipTest`で自動スキップされ、
+スイート全体は失敗しない（`tests/_helpers.py`の`load_fixture`参照）。
+
+このマシンで運用している fixture と対応する不具合（参考。ファイル自体は
+このリポジトリには含まれない）:
+
+| fixture | 対応する不具合 |
+|---|---|
+| `leaked_special_token.json` | ツール名に特殊トークンが混入し呼び出しが永久に失敗 |
+| `repeated_compaction.json` | 同一ツール結果の重複で圧縮が頻発しストール |
+| `empty_response_near_budget.json` | 予算の99%まで伸びて空応答を繰り返す |
+| `stuck_write_file.json` | `write_file`の`content`欠落を繰り返し連続失敗検出が発動 |
+
+新しい実障害セッションが見つかったら、同じ要領で（このマシンの）
+`tests/fixtures/`に追加し、その不具合を検知する回帰テストを`tests/test_*.py`
+に足す。別のマシンで再構築する場合は、そのマシン上の実障害セッションから
+同様に作成する。
+
 ---
 
 ## 5. 環境差分の調整（移植先で変わる箇所）

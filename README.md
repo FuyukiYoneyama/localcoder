@@ -122,3 +122,12 @@ wsl -d ubuntu-24.04 -- bash -lc "python3 ~/localcoder/server.py"
 - [SERVER.md](SERVER.md) — `server.py` のアーキテクチャ解説
 - [REVERSIBLE_OPERATIONS.md](REVERSIBLE_OPERATIONS.md) — 不可逆性を基準にした可逆操作・ロールバック安全設計
 - [IMPROVEMENTS.md](IMPROVEMENTS.md) — 信頼性・観測性・テスト・性能・保守・配布を含む改善ロードマップ
+
+## テスト
+
+```bash
+python3 -m unittest discover -s tests -t .
+```
+
+Ollama不要、標準ライブラリのみで完結する回帰テスト。詳細は
+[REBUILD.md](REBUILD.md) §4-1参照。

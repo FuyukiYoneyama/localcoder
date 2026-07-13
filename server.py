@@ -434,6 +434,34 @@ def run_command(cmd: str, ws: Path, cancel) -> str:
     return f"exit_code={p.returncode}\n{out}"
 
 
+def sanitize_tool_name(raw_name: str) -> str:
+    """ツール呼び出しのnameから、モデルが漏らす特殊トークンを除去する。
+
+    一部のモデル(実例: laguna-xs-2.1)は<|tool_call_argument_begin|>のような
+    内部特殊トークンをname欄に混入させて返すことがあり、完全一致ディスパッチが
+    永遠に失敗し続ける(=ループを自己修正できないまま浪費する)原因になっていた。
+    """
+    return TOOL_NAME_TOKEN_RE.sub("", raw_name).strip()
+
+
+def track_tool_repeat(name: str, args: dict, result: str,
+                       last_failed_sig, repeat_count: int):
+    """同じツール呼び出し(名前+引数)が同じ結果で連続失敗した回数を追跡する。
+
+    戻り値: (新しいlast_failed_sig, 新しいrepeat_count, TOOL_STUCK_LIMITに達したか)
+    達した場合、進展が見込めないと判断してMAX_ITERを待たず打ち切るために使う
+    (ツール名破損やモデルの引数生成不良で80回丸ごと浪費するのを防ぐ)。
+    """
+    sig = (name, json.dumps(args, sort_keys=True, ensure_ascii=False))
+    is_error = result.startswith("ERROR")
+    if is_error and sig == last_failed_sig:
+        repeat_count += 1
+    else:
+        repeat_count = 1 if is_error else 0
+    new_sig = sig if is_error else None
+    return new_sig, repeat_count, repeat_count >= TOOL_STUCK_LIMIT
+
+
 def exec_tool(name: str, args: dict, ws: Path, cancel=None, model: str | None = None,
               pending_images: list | None = None) -> str:
     try:
@@ -1178,13 +1206,9 @@ class Handler(BaseHTTPRequestHandler):
                         return
                     fn = tc.get("function", {})
                     raw_name = fn.get("name", "?")
-                    # 一部のモデル(実例: laguna-xs-2.1)はツール呼び出しのname欄に
-                    # <|tool_call_argument_begin|>のような内部特殊トークンを漏らして
-                    # 返すことがあり、完全一致ディスパッチが永遠に失敗し続ける
-                    # (=ループを自己修正できないまま浪費する)原因になっていた。
+                    name = sanitize_tool_name(raw_name)
                     # 生ログにも正規化後の名前を残しておく(fnは元のtool_calls/messages
                     # と同一オブジェクトを参照しているため、ここでの変更が保存履歴にも反映される)。
-                    name = TOOL_NAME_TOKEN_RE.sub("", raw_name).strip()
                     if name != raw_name:
                         fn["name"] = name
                     args = fn.get("arguments") or {}
@@ -1201,16 +1225,9 @@ class Handler(BaseHTTPRequestHandler):
                                else result[:4000] + "\n...[truncated]..."})
                     messages.append({"role": "tool", "tool_name": name,
                                      "name": name, "content": result})
-                    # 同じツール呼び出し(名前+引数)が同じ結果でTOOL_STUCK_LIMIT回連続
-                    # 失敗したら、進展が見込めないと判断してMAX_ITERを待たず打ち切る
-                    # (ツール名破損やモデルの引数生成不良で80回丸ごと浪費するのを防ぐ)。
-                    sig = (name, json.dumps(args, sort_keys=True, ensure_ascii=False))
-                    if result.startswith("ERROR") and sig == last_failed_sig:
-                        tool_repeat += 1
-                    else:
-                        tool_repeat = 0
-                    last_failed_sig = sig if result.startswith("ERROR") else None
-                    if tool_repeat >= TOOL_STUCK_LIMIT:
+                    last_failed_sig, tool_repeat, is_stuck = track_tool_repeat(
+                        name, args, result, last_failed_sig, tool_repeat)
+                    if is_stuck:
                         stuck = True
                         break
                 if pending_images:
