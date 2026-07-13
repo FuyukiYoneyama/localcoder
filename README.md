@@ -120,3 +120,4 @@ wsl -d ubuntu-24.04 -- bash -lc "python3 ~/localcoder/server.py"
 - [MANUAL.html](MANUAL.html) — 人間向け操作マニュアル
 - [REBUILD.md](REBUILD.md) — 別PCへの完全再構築ガイド＋各機能の設計ノート
 - [SERVER.md](SERVER.md) — `server.py` のアーキテクチャ解説
+- [REVERSIBLE_OPERATIONS.md](REVERSIBLE_OPERATIONS.md) — 不可逆性を基準にした可逆操作・ロールバック安全設計
