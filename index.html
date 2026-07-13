@@ -24,6 +24,9 @@ button{background:var(--panel2);color:var(--text);border:1px solid var(--border)
 button:hover{border-color:var(--accent)}
 #stopBtn{display:none;border-color:var(--red);color:var(--red)}
 #status{font-size:12px;color:var(--dim);margin-left:auto}
+#selfCheckBanner{background:#2a2418;color:#e0b04a;border-bottom:1px solid #4a3f24;
+  padding:8px 16px;font-size:12px;cursor:pointer}
+#selfCheckBanner:hover{background:#332b1c}
 #layout{flex:1;display:flex;min-height:0}
 #side{width:230px;flex-shrink:0;background:var(--panel);border-right:1px solid var(--border);
   overflow-y:auto;display:flex;flex-direction:column}
@@ -103,6 +106,7 @@ footer{display:flex;gap:10px;padding:12px 16px;background:var(--panel);border-to
   <button id="stopBtn">■ 停止</button>
   <span id="status"></span>
 </header>
+<div id="selfCheckBanner" style="display:none"></div>
 <div id="browseModal" class="modal-overlay" style="display:none">
   <div class="modal">
     <h3>📁 作業フォルダを選ぶ</h3>
@@ -191,6 +195,25 @@ async function loadModels(){
     for(const p of pref){if(names.includes(p)){sel.value=p;break}}
     updateVisionBadge();
   }catch(e){el("div","err","サーバに接続できません: "+e)}
+}
+async function loadSelfCheck(){
+  // 起動時セルフチェック(IMPROVEMENTS.md §9.2)。問題がある項目だけ簡潔に
+  // バナー表示し、クリックで詳細を展開する。全て問題なければ何も出さない。
+  try{
+    const d=await(await fetch("/api/selfcheck")).json();
+    const failed=(d.checks||[]).filter(c=>!c.ok);
+    const banner=$("selfCheckBanner");
+    if(!failed.length){banner.style.display="none";return}
+    let expanded=false;
+    const summary=()=>"⚠ 起動時チェックで"+failed.length+"件の問題（クリックで詳細）: "
+      +failed.map(c=>c.name).join(" / ");
+    const detail=()=>"⚠ 起動時チェックで見つかった問題（クリックで閉じる）:\n"
+      +failed.map(c=>"・"+c.name+": "+c.detail).join("\n");
+    banner.textContent=summary();
+    banner.style.display="block";
+    banner.style.whiteSpace="pre-wrap";
+    banner.onclick=()=>{expanded=!expanded; banner.textContent=expanded?detail():summary()};
+  }catch(e){/* セルフチェック自体の失敗はUIをブロックしない */}
 }
 $("model").addEventListener("change",updateVisionBadge);
 
@@ -392,6 +415,7 @@ if(window.LC_DEFAULT_WORKSPACE)$("workspace").value=window.LC_DEFAULT_WORKSPACE;
 if(window.LC_VERSION)$("version").textContent=window.LC_VERSION;
 loadModels();
 loadSessions();
+loadSelfCheck();
 
 // ---------- フォルダ選択ダイアログ ----------
 let browsePath="";
