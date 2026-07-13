@@ -32,7 +32,7 @@ LocalCoder の主な変更を時系列で記録する。形式は
     (`track_tool_repeat`)を、`do_POST`内のインライン処理から純粋関数として
     切り出した(挙動は変えず、テスト可能にするための移動)。
   - 実行方法: `python3 -m unittest discover -s tests -t .`（詳細は`REBUILD.md`
-    §4-1）。
+    §4-1）。(`3b66a17`)
 
 ## 2026-07-12
 
