@@ -41,6 +41,16 @@ LocalCoder の主な変更を時系列で記録する。形式は
   `empty_retries`・`tool_call_count`・`tool_exec_seconds`・`iterations_used`
   を追加。あわせて履歴JSONに`schema_version`(現在2)を導入し、今後形式を
   変える際に安全に移行できるようにした。実チャットで動作確認済み。(`11f322e`)
+- **`run_command`の出力が切り詰められても、完全な内容を診断用に保存する
+  ようにした(`IMPROVEMENTS.md` §4.2の一部実装)。** 12KBを超える出力は
+  モデル向けに先頭6KB+末尾6KBへ切り詰めていたが、その切り詰め後の文字列が
+  そのまま会話履歴にも保存されるため、中間にあるビルドエラー等が永久に
+  失われていた。切り詰めが発生した場合のみ、完全な出力を
+  `history/tool_output/<sid>/<call_id>.txt`へ保存するようにした
+  (`history/`配下なので`.gitignore`で自動的に除外され、GitHubには上がらない)。
+  構造化ツール結果(§4.1、`{ok, exit_code, stdout, stderr, ...}`形式)への
+  全面移行は、既存の`ERROR:`/`OK:`/`exit_code=0`という文字列規約が広範囲に
+  定着・テスト済みのため今回は見送った。実チャットで動作確認済み。
 
 ## 2026-07-12
 

@@ -405,7 +405,27 @@ def list_subdirs(path: str) -> dict:
     return {"path": str(p), "parent": parent, "dirs": dirs}
 
 
-def run_command(cmd: str, ws: Path, cancel) -> str:
+def save_full_tool_output(sid: str | None, call_id: str | None, content: str) -> None:
+    """出力がモデル向けに切り詰められた場合、完全な内容を診断用に別途保存する
+    (IMPROVEMENTS.md §4.2)。12KBを超える出力の中間にビルドエラー等の重要な
+    情報があっても、切り詰め後は永久に失われていた(モデルへ渡す文字列が
+    そのまま会話履歴にも保存されるため)。sid/call_idが無ければ何もしない
+    (診断用の副次的保存であり、本処理を失敗させたくないので例外も握りつぶす)。
+    保存先はHISTORY_DIR配下なので、.gitignoreの`history/`で自動的に除外される。
+    """
+    if not sid or not call_id:
+        return
+    try:
+        safe_call_id = re.sub(r"[^A-Za-z0-9_-]", "", call_id)[:40] or "call"
+        d = HISTORY_DIR / "tool_output" / _safe_sid(sid)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{safe_call_id}.txt").write_text(content, encoding="utf-8")
+    except Exception:
+        pass
+
+
+def run_command(cmd: str, ws: Path, cancel, sid: str | None = None,
+                 call_id: str | None = None) -> str:
     # start_new_session=True でプロセスグループを分離し、キャンセル/タイムアウト時に
     # killpg でパイプの先やバックグラウンド子プロセスまで確実に止める
     p = subprocess.Popen(["bash", "-lc", cmd], cwd=ws,
@@ -431,6 +451,7 @@ def run_command(cmd: str, ws: Path, cancel) -> str:
                 break
     out = (stdout or "") + (("\n[stderr]\n" + stderr) if stderr else "")
     if len(out) > 12000:
+        save_full_tool_output(sid, call_id, out)
         out = out[:6000] + "\n...[truncated]...\n" + out[-6000:]
     if killed:
         return f"ERROR: command {killed}\n{out}"
@@ -466,10 +487,11 @@ def track_tool_repeat(name: str, args: dict, result: str,
 
 
 def exec_tool(name: str, args: dict, ws: Path, cancel=None, model: str | None = None,
-              pending_images: list | None = None) -> str:
+              pending_images: list | None = None, sid: str | None = None,
+              call_id: str | None = None) -> str:
     try:
         if name == "run_command":
-            return run_command(args["command"], ws, cancel)
+            return run_command(args["command"], ws, cancel, sid=sid, call_id=call_id)
         if name == "read_file":
             f = resolve_path(ws, args["path"])
             if f.suffix.lower() == ".pdf":
@@ -1237,7 +1259,8 @@ class Handler(BaseHTTPRequestHandler):
                     self._sse({"type": "tool_start", "name": name, "args": args})
                     _tool_started = time.time()
                     result = exec_tool(name, args, ws, ev, model=model,
-                                       pending_images=pending_images)
+                                       pending_images=pending_images,
+                                       sid=sid, call_id=tc.get("id"))
                     diag_tool_call_count += 1
                     diag_tool_exec_seconds += time.time() - _tool_started
                     self._sse({"type": "tool_end", "name": name,

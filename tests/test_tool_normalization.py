@@ -103,6 +103,51 @@ class TestTrackToolRepeat(unittest.TestCase):
         self.assertIsNotNone(stuck_at, "実際のセッションでは'stuck'判定が発生している")
 
 
+class TestSaveFullToolOutput(unittest.TestCase):
+    """IMPROVEMENTS.md §4.2: 切り詰められたコマンド出力の全文を診断用に保存する。"""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.orig_history_dir = s.HISTORY_DIR
+        s.HISTORY_DIR = Path(self._tmpdir.name)
+
+    def tearDown(self):
+        s.HISTORY_DIR = self.orig_history_dir
+        self._tmpdir.cleanup()
+
+    def test_writes_full_content_to_sid_scoped_file(self):
+        s.save_full_tool_output("mysid", "call_abc123", "full content" * 1000)
+        f = s.HISTORY_DIR / "tool_output" / "mysid" / "call_abc123.txt"
+        self.assertTrue(f.is_file())
+        self.assertEqual(f.read_text(encoding="utf-8"), "full content" * 1000)
+
+    def test_noop_without_sid_or_call_id(self):
+        s.save_full_tool_output(None, "call_abc123", "x")
+        s.save_full_tool_output("mysid", None, "x")
+        self.assertFalse((s.HISTORY_DIR / "tool_output").exists())
+
+    def test_sanitizes_call_id_for_filesystem_safety(self):
+        s.save_full_tool_output("mysid", "../../etc/passwd", "x")
+        d = s.HISTORY_DIR / "tool_output" / "mysid"
+        names = [p.name for p in d.iterdir()]
+        self.assertTrue(all(".." not in n and "/" not in n for n in names))
+
+    def test_run_command_saves_full_output_when_truncated(self):
+        with tempfile.TemporaryDirectory() as ws:
+            result = s.run_command(
+                "python3 -c \"print('x' * 20000)\"", Path(ws), None,
+                sid="mysid", call_id="call_big")
+        self.assertIn("...[truncated]...", result)
+        f = s.HISTORY_DIR / "tool_output" / "mysid" / "call_big.txt"
+        self.assertTrue(f.is_file())
+        self.assertGreater(len(f.read_text(encoding="utf-8")), 12000)
+
+    def test_run_command_does_not_save_when_output_is_small(self):
+        with tempfile.TemporaryDirectory() as ws:
+            s.run_command("echo hi", Path(ws), None, sid="mysid", call_id="call_small")
+        self.assertFalse((s.HISTORY_DIR / "tool_output" / "mysid" / "call_small.txt").exists())
+
+
 class TestExecToolMissingArgument(unittest.TestCase):
     def test_missing_content_gives_actionable_message(self):
         with tempfile.TemporaryDirectory() as d:
