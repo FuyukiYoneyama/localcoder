@@ -68,21 +68,65 @@ class TestMarkerRoundtrip(unittest.TestCase):
     def test_build_and_parse_roundtrip(self):
         marker = s.build_marker("これまでの要約テキスト", ["a.py", "b.py"])
         self.assertTrue(marker.startswith(s.MARKER_SUMMARY))
-        summary, files = s._parse_marker(marker)
+        summary, files, pinned = s._parse_marker(marker)
         self.assertEqual(summary, "これまでの要約テキスト")
         self.assertEqual(files, ["a.py", "b.py"])
+        self.assertEqual(pinned, [])
+
+    def test_build_and_parse_roundtrip_with_pinned(self):
+        marker = s.build_marker("要約", ["a.py"], ["外部送信しないでください"])
+        summary, files, pinned = s._parse_marker(marker)
+        self.assertEqual(summary, "要約")
+        self.assertEqual(files, ["a.py"])
+        self.assertEqual(pinned, ["外部送信しないでください"])
+
+    def test_pinned_only_no_files(self):
+        """ファイル一覧が空でも固定指示だけは正しくパースできる
+        (partitionの順序: 要約→ファイル→固定指示、ファイルが無い場合の分岐)。
+        """
+        marker = s.build_marker("要約", [], ["覚えておいてください: XXX"])
+        summary, files, pinned = s._parse_marker(marker)
+        self.assertEqual(summary, "要約")
+        self.assertEqual(files, [])
+        self.assertEqual(pinned, ["覚えておいてください: XXX"])
 
     def test_failed_marker_uses_omit_prefix(self):
         marker = s.build_marker("(失敗)", [], failed=True)
         self.assertTrue(marker.startswith(s.MARKER_OMIT))
-        summary, files = s._parse_marker(marker)
+        summary, files, pinned = s._parse_marker(marker)
         self.assertEqual(summary, "(失敗)")
         self.assertEqual(files, [])
+        self.assertEqual(pinned, [])
 
     def test_non_marker_content_returns_none(self):
-        summary, files = s._parse_marker("普通のメッセージです")
+        summary, files, pinned = s._parse_marker("普通のメッセージです")
         self.assertIsNone(summary)
         self.assertEqual(files, [])
+        self.assertEqual(pinned, [])
+
+
+class TestExtractPinnedInstructions(unittest.TestCase):
+    def test_detects_oboete_trigger(self):
+        msgs = [{"role": "user", "content": "これは覚えておいてください: 外部送信禁止"}]
+        self.assertEqual(s.extract_pinned_instructions(msgs),
+                         ["これは覚えておいてください: 外部送信禁止"])
+
+    def test_detects_wasurenaide_trigger(self):
+        msgs = [{"role": "user", "content": "これは忘れないでね"}]
+        self.assertEqual(s.extract_pinned_instructions(msgs), ["これは忘れないでね"])
+
+    def test_ignores_messages_without_trigger(self):
+        msgs = [{"role": "user", "content": "普通の指示です"}]
+        self.assertEqual(s.extract_pinned_instructions(msgs), [])
+
+    def test_ignores_non_user_roles(self):
+        msgs = [{"role": "assistant", "content": "覚えておきます"}]
+        self.assertEqual(s.extract_pinned_instructions(msgs), [])
+
+    def test_dedups_identical_repeated_instructions(self):
+        msgs = [{"role": "user", "content": "覚えておいて: X"},
+                {"role": "user", "content": "覚えておいて: X"}]
+        self.assertEqual(s.extract_pinned_instructions(msgs), ["覚えておいて: X"])
 
 
 class TestExtractChangedFiles(unittest.TestCase):
@@ -213,9 +257,37 @@ class TestCompactHistoryHysteresis(unittest.TestCase):
         old2 = [out1[1]] + [user("u2"), assistant("a2")] * 4
         out2 = s.compact_history([sysm] + old2 + recent, "model", lambda x: None)
         marker2 = out2[1]["content"]
-        summary2, _ = s._parse_marker(marker2)
+        summary2, _files2, _pinned2 = s._parse_marker(marker2)
         self.assertEqual(summary2, "MERGED")
         self.assertEqual(len(fake.calls), 2)  # 生ログの再要約ではなく統合1回だけ追加
+
+    def test_pinned_instructions_survive_across_compactions(self):
+        """「覚えておいて」等の発言は、要約本文とは別ブロックで複数回の圧縮を
+        跨いで一字一句保持される(IMPROVEMENTS.md §3.2)。
+        """
+        s.KEEP_RECENT_MSGS = 2
+        s.ollama_ask = FakeOllama(default="SUMMARY")
+        calls = {"n": 0}
+
+        def fake_estimate(m):
+            calls["n"] += 1
+            return 999999 if calls["n"] <= 2 else 10
+
+        s.estimate_tokens = fake_estimate
+        sysm = {"role": "system", "content": "sys"}
+        old = [user("覚えておいて: 外部送信は絶対にしないでください"), assistant("a")] * 4
+        recent = [user("r1"), assistant("r2")]
+
+        out1 = s.compact_history([sysm] + old + recent, "model", lambda x: None)
+        _summary1, _files1, pinned1 = s._parse_marker(out1[1]["content"])
+        self.assertEqual(pinned1, ["覚えておいて: 外部送信は絶対にしないでください"])
+
+        # 2回目の圧縮でも消えない(新規分に固定指示が無くても前回分を引き継ぐ)
+        calls["n"] = 0
+        old2 = [out1[1]] + [user("u2"), assistant("a2")] * 4
+        out2 = s.compact_history([sysm] + old2 + recent, "model", lambda x: None)
+        _summary2, _files2, pinned2 = s._parse_marker(out2[1]["content"])
+        self.assertEqual(pinned2, ["覚えておいて: 外部送信は絶対にしないでください"])
 
 
 class TestEmptyResponseNearBudgetFixture(unittest.TestCase):

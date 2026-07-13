@@ -16,6 +16,22 @@ def tool_result(content):
     return {"role": "tool", "content": content}
 
 
+class TestPinnedInstructionsLine(unittest.TestCase):
+    def test_shows_pinned_instruction(self):
+        msgs = [{"role": "user", "content": "覚えておいて: 外部送信禁止"}]
+        out = s.build_work_state(msgs)
+        self.assertIn("ユーザーの固定指示(厳守):", out)
+        self.assertIn("外部送信禁止", out)
+
+    def test_no_line_without_pinned_instruction(self):
+        msgs = [{"role": "user", "content": "普通の依頼です"},
+                tool_call("write_file", {"path": "a.py"}),
+                tool_result("OK: wrote 1 chars to a.py")]
+        out = s.build_work_state(msgs)
+        self.assertIn("変更したファイル", out)  # 他の行は出ているのに
+        self.assertNotIn("固定指示", out)       # 固定指示だけ出ない、を確認する
+
+
 class TestChangedFilesLine(unittest.TestCase):
     def test_lists_successful_writes(self):
         msgs = [tool_call("write_file", {"path": "a.py"}),
