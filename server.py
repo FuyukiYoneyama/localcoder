@@ -1295,6 +1295,16 @@ class Handler(BaseHTTPRequestHandler):
                 self._sse({"type": "error",
                            "message": f"最大ループ回数({MAX_ITER})に達しました"})
 
+            # ターン単位の作業サマリー(IMPROVEMENTS.md §7.1)。診断情報(§2.3)を
+            # そのままUIに出す。stopped/エラー/切断時は(SSEが既に途切れている
+            # 可能性が高いため)送らない——completed/max_iter/stuckのみ対象。
+            self._sse({"type": "summary", "data": {
+                "status": turn_status,
+                "duration_seconds": round(time.time() - turn_started_at, 1),
+                "changed_files": extract_changed_files(messages[1:]),
+                "tool_call_count": diag_tool_call_count,
+                "compact_count": diag_compact_count,
+            }})
             # システムプロンプトを除いた全履歴を返す(次ターンで文脈維持)
             self._sse({"type": "history", "messages": messages[1:]})
             self._sse({"type": "all_done"})
@@ -1324,7 +1334,8 @@ class Handler(BaseHTTPRequestHandler):
                     "empty_retries": empty_retries,
                     "tool_call_count": diag_tool_call_count,
                     "tool_exec_seconds": round(diag_tool_exec_seconds, 1),
-                    "iterations_used": diag_iterations_used}
+                    "iterations_used": diag_iterations_used,
+                    "changed_files_count": len(extract_changed_files(messages[1:]))}
             if len(messages) > 1:
                 try:
                     save_session(sid, model, str(ws), messages[1:], turn=turn)

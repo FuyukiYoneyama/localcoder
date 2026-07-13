@@ -59,6 +59,11 @@ details.tool pre{background:#0d0f14;padding:8px;border-radius:6px;overflow-x:aut
 .err{align-self:center;color:var(--red);font-size:13px}
 .notice{align-self:center;color:#e0b04a;background:#2a2418;border:1px solid #4a3f24;
   border-radius:8px;padding:6px 14px;font-size:13px}
+.summary{align-self:flex-start;max-width:860px;width:fit-content;background:var(--panel2);
+  border:1px solid var(--border);border-radius:8px;padding:6px 12px;font-size:12px;
+  color:var(--dim);display:flex;flex-wrap:wrap;gap:4px 14px}
+.summary b{color:var(--text)}
+.summary.status-stuck,.summary.status-max_iter{border-color:#4a3f24;color:#e0b04a}
 footer{display:flex;gap:10px;padding:12px 16px;background:var(--panel);border-top:1px solid var(--border)}
 #input{flex:1;background:var(--panel2);color:var(--text);border:1px solid var(--border);
   border-radius:8px;padding:10px;font-size:14px;resize:none;font-family:inherit;min-height:44px;max-height:200px}
@@ -225,11 +230,31 @@ async function openSession(id){
     const sel=$("model");
     if(d.model&&[...sel.options].some(o=>o.value===d.model))sel.value=d.model;
     updateVisionBadge();
-    renderHistory(history);
+    renderHistory(history,d.turns);
     loadSessions();
   }catch(e){el("div","err","履歴の読み込みに失敗: "+e)}
 }
 
+const STATUS_LABEL={completed:"完了",max_iter:"最大ループ到達",stuck:"同一失敗で停止",
+  stopped:"ユーザー停止",error:"エラー",disconnected:"切断"};
+function summaryCard(data){
+  // changed_files: ライブ実行中はファイルパスの配列(ツールチップに使う)。
+  // 履歴再表示時は保存された件数(changed_files_count)しか無いため数値も許容する。
+  const files=data.changed_files;
+  const fileCount=Array.isArray(files)?files.length:(files||0);
+  const d=document.createElement("div");
+  d.className="summary status-"+data.status;
+  const parts=[
+    "<span>終了理由: <b>"+(STATUS_LABEL[data.status]||data.status)+"</b></span>",
+    "<span>所要時間: <b>"+data.duration_seconds+"秒</b></span>",
+    "<span>ツール呼び出し: <b>"+data.tool_call_count+"回</b></span>",
+  ];
+  if(fileCount)parts.push("<span>変更: <b>"+fileCount+"ファイル</b></span>");
+  if(data.compact_count)parts.push("<span>🗜 圧縮: <b>"+data.compact_count+"回</b></span>");
+  d.innerHTML=parts.join("");
+  if(Array.isArray(files)&&files.length)d.title=files.join("\n");
+  chat.appendChild(d); scroll(); return d;
+}
 function imageBubble(images){
   const d=document.createElement("div"); d.className="msg assistant imgmsg";
   for(const b64 of images){
@@ -239,7 +264,7 @@ function imageBubble(images){
   }
   chat.appendChild(d); scroll(); return d;
 }
-function renderHistory(msgs){
+function renderHistory(msgs,turns){
   chat.innerHTML="";
   const pending=[];
   for(const m of msgs){
@@ -255,6 +280,13 @@ function renderHistory(msgs){
       const d=pending.shift();
       if(d)d.querySelector("pre").textContent=m.content;
     }
+  }
+  // 直近ターンの診断情報(保存済み)があれば末尾にサマリーを表示する。
+  if(turns&&turns.length){
+    const t=turns[turns.length-1];
+    summaryCard({status:t.status, duration_seconds:Math.round((t.ended_at-t.started_at)*10)/10,
+      tool_call_count:t.tool_call_count||0, compact_count:t.compact_count||0,
+      changed_files:t.changed_files_count||0});
   }
   scroll();
 }
@@ -338,6 +370,8 @@ async function send(){
       scroll();
     }else if(ev.type==="compact"){
       el("div","think","🗜 "+ev.message);
+    }else if(ev.type==="summary"){
+      summaryCard(ev.data);
     }else if(ev.type==="notice"){
       el("div","notice","🔔 "+ev.message);
     }else if(ev.type==="history"){
