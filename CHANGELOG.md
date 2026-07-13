@@ -40,7 +40,7 @@ LocalCoder の主な変更を時系列で記録する。形式は
   `est_tokens_start`/`est_tokens_end`・`compact_count`・`http_retries`・
   `empty_retries`・`tool_call_count`・`tool_exec_seconds`・`iterations_used`
   を追加。あわせて履歴JSONに`schema_version`(現在2)を導入し、今後形式を
-  変える際に安全に移行できるようにした。実チャットで動作確認済み。
+  変える際に安全に移行できるようにした。実チャットで動作確認済み。(`11f322e`)
 
 ## 2026-07-12
 
