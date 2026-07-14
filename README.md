@@ -99,6 +99,14 @@ wsl -d ubuntu-24.04 -- bash -lc "python3 ~/localcoder/server.py"
   履歴から機械的に(LLM不使用で)毎回組み立て、その回のOllama呼び出しにだけ
   差し込む(保存される会話履歴自体は汚さない使い捨てのダッシュボード)。
   小型モデルが「さっき変更したファイルを忘れる」「同じ失敗を繰り返す」ことへの対策
+- MCPサーバー接続 (任意): `mcp_servers.json` に定義した外部MCPサーバー
+  (stdio / JSON-RPC 2.0) のツールを、組み込みツールと同列にモデルへ提供する。
+  形式は [mcp_servers.json.example](mcp_servers.json.example) を参照
+  (コピーしてパスを自分の環境に合わせる。ファイルが無ければこの機能は無効)。
+  対応トランスポートはstdioのみ＝サーバーは子プロセスとしてローカル起動され、
+  通信はマシン内で完結する。サーバーの起動失敗・応答失敗があってもLocalCoder
+  本体は通常通り動く。最初の実利用サーバーは PicoCalc Expert MCP
+  (PicoCalc開発資料の検索・参照、別リポジトリ)
 
 ## 前提
 

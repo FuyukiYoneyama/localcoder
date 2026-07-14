@@ -482,12 +482,17 @@ localcoder/
 3. ⬜ GitHub Release
 4. ⬜ 設定のエクスポート・インポート
 
-### 第6段階: MCP接続（着手可能）
+### 第6段階: MCP接続 — 完了
 
-1. ⬜ MCPクライアント機能をLocalCoderへ追加（`tools/list`・`tools/call`をToolProviderの
-   一種として`exec_tool`のディスパッチに統合）
-2. ⬜ PicoCalc Expert MCP（別リポジトリ）を最初の実利用MCPサーバーとして接続
-3. ⬜ 外部送信ポリシー（`REVERSIBLE_OPERATIONS.md` §8）をMCPツール呼び出しにも適用するか検討
+1. ✅ MCPクライアント機能をLocalCoderへ追加（`McpToolProvider`が`tools/list`・
+   `tools/call`をラップし、`TOOL_PROVIDERS`経由で組み込みツールと同列にディスパッチ。
+   設定は`mcp_servers.json`、無ければ従来通り）
+2. ✅ PicoCalc Expert MCP（別リポジトリ `~/pico_dvl/codex/mcp`）を最初の実利用
+   MCPサーバーとして接続（実チャットで`get_reference`の呼び出しを確認済み）
+3. ✅ 外部送信ポリシー（`REVERSIBLE_OPERATIONS.md` §8）との関係を整理: 対応
+   トランスポートをstdio(ローカル子プロセス)のみに限定したため、MCP呼び出しは
+   マシン内で完結し外部送信に該当しない。HTTP/SSEトランスポートを将来導入する
+   場合はその時点で外部送信ポリシーの対象に含めて再検討する
 
 ## 12. 到達点
 
@@ -561,11 +566,16 @@ class ToolProvider(Protocol):
 「基本機能はローカルで完結させる」と矛盾しない——PicoCalc Expert MCPも「LLMの記憶ではなく
 索引化された資料と機械的検索」を基盤にする設計になっている（外部文書§17設計原則）。
 
-### 13.4 未確定事項
+### 13.4 未確定事項（実装により解決済み）
 
-- MCPサーバーへの接続そのものを外部送信として扱うか（`REVERSIBLE_OPERATIONS.md` §8の
-  外部送信ポリシーの対象に含めるか）は未検討。PicoCalc Expert MCPはローカルまたは
-  開発者の管理下にあるサーバーを想定しているため、`allow_recorded`相当で運用する案が
-  自然だが、外部文書側にも接続ポリシーの記述はまだない。
-- 本書§13.2のToolProvider設計は素案であり、実装前にMCPプロトコル(`tools/list`/`tools/call`
-  のスキーマ、エラー処理、タイムアウト)を踏まえて見直す必要がある。
+いずれも第6段階の実装(2026-07-15)で決着した。
+
+- **外部送信ポリシーとの関係**: 対応トランスポートをstdio(サーバーを子プロセスと
+  して起動しパイプで通信)のみに限定した。通信はマシン内で完結するため
+  `REVERSIBLE_OPERATIONS.md` §8の外部送信には該当しない。HTTP/SSEトランスポート
+  は実装していない——将来必要になったら、その導入時に外部送信ポリシーの対象として
+  再検討する。
+- **ToolProvider設計の見直し**: §13.2の素案のまま実装できた。MCP固有の事情
+  (initializeハンドシェイク、`inputSchema`→Ollama`parameters`への変換、
+  `isError`の扱い、タイムアウト、起動失敗時の段階的劣化)はすべて
+  `McpToolProvider`の内部に閉じ、インターフェース自体の変更は不要だった。

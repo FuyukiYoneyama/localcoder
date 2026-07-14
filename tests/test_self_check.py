@@ -38,10 +38,15 @@ class TestRunSelfCheck(unittest.TestCase):
         self.orig_history_dir = s.HISTORY_DIR
         s.HISTORY_DIR = Path(self._tmpdir.name)
         self.orig_roots = s.ALLOWED_ROOTS
+        # 実行マシンに実際のmcp_servers.jsonがあるとMCP設定チェックが環境依存に
+        # なるため、既定では「設定ファイル無し」の状態に固定する
+        self.orig_mcp_config = s.MCP_CONFIG_PATH
+        s.MCP_CONFIG_PATH = Path(self._tmpdir.name) / "no_mcp_servers.json"
 
     def tearDown(self):
         s.HISTORY_DIR = self.orig_history_dir
         s.ALLOWED_ROOTS = self.orig_roots
+        s.MCP_CONFIG_PATH = self.orig_mcp_config
         self._tmpdir.cleanup()
 
     def test_ollama_reachable_with_recommended_model(self):
@@ -98,6 +103,33 @@ class TestRunSelfCheck(unittest.TestCase):
             checks = s.run_self_check()  # 例外を投げず、全項目ok=Falseで返る
         self.assertTrue(all(not c["ok"] for c in checks
                             if c["name"] != "pdftotext(poppler-utils)"))
+
+    def test_mcp_check_absent_when_no_config(self):
+        with patch("server.urllib.request.urlopen", side_effect=OSError("x")):
+            checks = _names(s.run_self_check())
+        self.assertNotIn("MCP設定", checks)
+
+    def test_mcp_check_ok_with_valid_config(self):
+        s.MCP_CONFIG_PATH.write_text(json.dumps({"mcpServers": {
+            "fake": {"command": "python3", "args": ["x.py"]}}}), encoding="utf-8")
+        with patch("server.urllib.request.urlopen", side_effect=OSError("x")):
+            checks = _names(s.run_self_check())
+        self.assertTrue(checks["MCP設定"]["ok"])
+        self.assertIn("1サーバー定義", checks["MCP設定"]["detail"])
+
+    def test_mcp_check_reports_missing_command(self):
+        s.MCP_CONFIG_PATH.write_text(json.dumps({"mcpServers": {
+            "fake": {"command": "no_such_command_xyz", "args": []}}}), encoding="utf-8")
+        with patch("server.urllib.request.urlopen", side_effect=OSError("x")):
+            checks = _names(s.run_self_check())
+        self.assertFalse(checks["MCP設定"]["ok"])
+        self.assertIn("fake", checks["MCP設定"]["detail"])
+
+    def test_mcp_check_reports_broken_json(self):
+        s.MCP_CONFIG_PATH.write_text("{broken", encoding="utf-8")
+        with patch("server.urllib.request.urlopen", side_effect=OSError("x")):
+            checks = _names(s.run_self_check())
+        self.assertFalse(checks["MCP設定"]["ok"])
 
 
 def _multi_response(responses: dict):

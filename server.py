@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import platform
+import queue
 import re
 import secrets
 import shutil
@@ -75,6 +76,15 @@ PDF_TIMEOUT = 60       # pdftotext実行タイムアウト(秒)
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
 IMAGE_MAX_BYTES = 20_000_000   # view_imageで読み込む画像の最大サイズ
 TOKENS_PER_IMAGE = 768         # 画像1枚のトークン概算(モデル依存の目安値)
+
+# --- MCPクライアント (IMPROVEMENTS.md §13 / 第6段階) ---
+MCP_CONFIG_PATH = ROOT / "mcp_servers.json"  # サーバー定義(個人パスを含むためgitignore)
+MCP_PROTOCOL_VERSION = "2025-06-18"
+MCP_INIT_TIMEOUT = 30    # initialize/tools/listの応答待ち上限(秒)
+MCP_CALL_TIMEOUT = 120   # tools/callの応答待ち上限(秒)。索引の初回構築等を見込む
+MCP_RETRY_INTERVAL = 60  # 起動に失敗したサーバーへ再起動を試みる最短間隔(秒)。
+                         # これが無いと、壊れた設定のまま毎リクエストで起動失敗の
+                         # 待ち時間が発生してチャット全体が遅くなる
 
 # --- 作業状態ダッシュボード (会話ログではなく、機械的に導出した「今の盤面」) ---
 WORK_STATE_PREFIX = "(作業状態 - 自動生成、会話には保存されません) "
@@ -340,6 +350,20 @@ def run_self_check() -> list[dict]:
     except Exception as e:
         add("履歴ディレクトリへの書き込み", False, f"{HISTORY_DIR}: {type(e).__name__}: {e}")
 
+    # MCP設定は任意機能なので、設定ファイルが存在する時だけ検査する
+    if MCP_CONFIG_PATH.is_file():
+        try:
+            servers = json.loads(
+                MCP_CONFIG_PATH.read_text(encoding="utf-8")).get("mcpServers") or {}
+            missing = [n for n, spec in servers.items()
+                       if not isinstance(spec, dict)
+                       or not shutil.which(str(spec.get("command", "")))]
+            add("MCP設定", not missing,
+                f"{len(servers)}サーバー定義"
+                + (f"、コマンド不明: {', '.join(missing)}" if missing else ""))
+        except Exception as e:
+            add("MCP設定", False, f"{MCP_CONFIG_PATH.name}: {type(e).__name__}: {e}")
+
     return checks
 
 
@@ -371,6 +395,14 @@ def build_diagnostic_bundle(sid: str | None = None, error: str | None = None) ->
             "allowed_roots_count": len(ALLOWED_ROOTS),  # パス自体は個人情報なので件数のみ
         },
     }
+
+    # MCPサーバーの状態(名前・ツール数・生存のみ。command/argsは個人パスを
+    # 含みうるため入れない)。プロセスの起動は伴わない(現在の状態を写すだけ)。
+    bundle["mcp_servers"] = [
+        {"name": p.name,
+         "alive": p._proc is not None and p._proc.poll() is None,
+         "tools": len(p._tools)}
+        for p in TOOL_PROVIDERS if isinstance(p, McpToolProvider)]
 
     try:
         with urllib.request.urlopen(OLLAMA + "/api/version", timeout=5) as r:
@@ -770,7 +802,217 @@ class BuiltinToolProvider:
 
 # 現時点ではBuiltinToolProviderのみ。McpToolProviderを追加する際はここに足すだけで、
 # exec_tool側のディスパッチ処理は変更不要になる設計(IMPROVEMENTS.md §13.2/§13.3)。
+class McpToolProvider:
+    """外部MCPサーバーをToolProviderとして扱う(IMPROVEMENTS.md §13 / 第6段階)。
+
+    対応トランスポートはstdio(サーバーを子プロセスとして起動し、改行区切りの
+    JSON-RPC 2.0で通信)のみ。HTTP/SSEトランスポートは実装しない——stdioの
+    子プロセスはこのマシン内で完結するため、REVERSIBLE_OPERATIONS.md §8の
+    外部送信ポリシーの対象外として扱える(§13.4の未確定事項への回答)。
+
+    起動は遅延(初回のlist_tools/call_toolまでプロセスを作らない)。起動や通信に
+    失敗しても例外は外へ漏らさず、list_tools()は空リスト・call_tool()は
+    "ERROR: ..."文字列を返す——サーバー全体の動作は従来通り続く(依存機能の
+    段階的劣化、IMPROVEMENTS.md §9.4の方針)。
+    """
+
+    def __init__(self, name: str, command: str, args: list[str] | None = None,
+                 env: dict | None = None):
+        self.name = name
+        self.command = command
+        self.args = args or []
+        self.env = env
+        self._proc: subprocess.Popen | None = None
+        self._queue: queue.Queue | None = None
+        self._tools: list[dict] = []
+        self._lock = threading.Lock()  # ThreadingHTTPServerの複数スレッドから直列化
+        self._id = 0
+        self._failed_at = 0.0
+
+    # --- プロセス管理・JSON-RPC(すべて_lock保持中に呼ぶこと) ---
+    @staticmethod
+    def _reader(proc: subprocess.Popen, q: queue.Queue) -> None:
+        """stdoutを読み続けてキューへ流す常駐スレッド。パイプの読み取りには
+        タイムアウトを付けられないため、待ち時間の制御はキュー側で行う。"""
+        try:
+            for line in proc.stdout:
+                q.put(line)
+        except Exception:
+            pass
+        q.put(None)  # EOFマーカー
+
+    def _rpc_locked(self, method: str, params: dict, timeout: float) -> dict:
+        self._id += 1
+        rid = self._id
+        req = {"jsonrpc": "2.0", "id": rid, "method": method, "params": params}
+        self._proc.stdin.write(json.dumps(req, ensure_ascii=False) + "\n")
+        self._proc.stdin.flush()
+        deadline = time.time() + timeout
+        while True:
+            remain = deadline - time.time()
+            if remain <= 0:
+                raise TimeoutError(f"{method}が{timeout}秒以内に応答しませんでした")
+            try:
+                line = self._queue.get(timeout=remain)
+            except queue.Empty:
+                raise TimeoutError(f"{method}が{timeout}秒以内に応答しませんでした")
+            if line is None:
+                raise RuntimeError("MCPサーバーが終了しました(stdoutがEOF)")
+            try:
+                resp = json.loads(line)
+            except json.JSONDecodeError:
+                continue  # JSON以外の行(行儀の悪いサーバーのログ等)は読み飛ばす
+            if resp.get("id") == rid:
+                return resp
+            # 他idの遅延応答・サーバー発の通知は読み飛ばす
+
+    def _notify_locked(self, method: str) -> None:
+        note = {"jsonrpc": "2.0", "method": method}
+        self._proc.stdin.write(json.dumps(note) + "\n")
+        self._proc.stdin.flush()
+
+    @staticmethod
+    def _to_ollama_tool(t: dict) -> dict:
+        """MCPのツール定義(name/description/inputSchema)をOllamaのtools形式へ。"""
+        return {"type": "function", "function": {
+            "name": t.get("name", ""),
+            "description": t.get("description", ""),
+            "parameters": t.get("inputSchema") or {"type": "object", "properties": {}},
+        }}
+
+    def _shutdown_locked(self) -> None:
+        if self._proc is not None:
+            try:
+                self._proc.kill()
+            except Exception:
+                pass
+            for f in (self._proc.stdin, self._proc.stdout):
+                try:
+                    if f:
+                        f.close()
+                except Exception:
+                    pass
+            try:
+                self._proc.wait(timeout=5)  # ゾンビプロセス化を防ぐ
+            except Exception:
+                pass
+        self._proc = None
+        self._tools = []
+
+    def _start_locked(self) -> bool:
+        try:
+            env = None
+            if self.env:
+                env = dict(os.environ)
+                env.update(self.env)
+            self._proc = subprocess.Popen(
+                [self.command] + self.args,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, text=True, env=env)
+            self._queue = queue.Queue()
+            threading.Thread(target=self._reader, args=(self._proc, self._queue),
+                             daemon=True).start()
+            init = self._rpc_locked("initialize", {
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "LocalCoder", "version": SERVER_VERSION}},
+                timeout=MCP_INIT_TIMEOUT)
+            if "error" in init:
+                raise RuntimeError(str(init["error"].get("message", init["error"])))
+            self._notify_locked("notifications/initialized")
+            listed = self._rpc_locked("tools/list", {}, timeout=MCP_INIT_TIMEOUT)
+            raw = (listed.get("result") or {}).get("tools") or []
+            self._tools = [self._to_ollama_tool(t) for t in raw]
+            self._failed_at = 0.0
+            return True
+        except Exception as e:
+            print(f"[MCP] {self.name}: 起動失敗: {type(e).__name__}: {e}")
+            self._shutdown_locked()
+            self._failed_at = time.time()
+            return False
+
+    def _ensure_started_locked(self) -> bool:
+        if self._proc is not None and self._proc.poll() is None:
+            return True
+        if self._failed_at and time.time() - self._failed_at < MCP_RETRY_INTERVAL:
+            return False
+        return self._start_locked()
+
+    # --- ToolProviderインターフェース ---
+    def list_tools(self) -> list[dict]:
+        with self._lock:
+            if not self._ensure_started_locked():
+                return []
+            return self._tools
+
+    def call_tool(self, name: str, args: dict, ctx: ToolContext) -> str:
+        with self._lock:
+            if not self._ensure_started_locked():
+                return f"ERROR: MCPサーバー '{self.name}' に接続できません(起動失敗)"
+            try:
+                resp = self._rpc_locked("tools/call",
+                                        {"name": name, "arguments": args},
+                                        timeout=MCP_CALL_TIMEOUT)
+            except Exception as e:
+                # ハング・切断したサーバーは殺して、次の呼び出しで再起動を試みる
+                self._shutdown_locked()
+                return (f"ERROR: MCPサーバー '{self.name}' の呼び出しに失敗: "
+                        f"{type(e).__name__}: {e}")
+            if "error" in resp:
+                err = resp["error"]
+                return f"ERROR: MCPサーバー '{self.name}': {err.get('message', err)}"
+            result = resp.get("result") or {}
+            parts = [c.get("text", "") for c in result.get("content") or []
+                     if c.get("type") == "text"]
+            text = "\n".join(p for p in parts if p) or "(空の応答)"
+            if result.get("isError") and not text.startswith("ERROR"):
+                text = "ERROR: " + text
+            return text
+
+
+def load_mcp_providers(config_path: Path | None = None) -> list[McpToolProvider]:
+    """mcp_servers.jsonからMCPサーバー定義を読む。ファイルが無ければ空リスト
+    (MCP機能は完全に無効で、従来と同じ動作)。形式は一般的なmcpServers規約:
+
+        {"mcpServers": {"名前": {"command": "python3", "args": ["..."],
+                                 "env": {"KEY": "VALUE"}}}}
+    """
+    path = config_path or MCP_CONFIG_PATH
+    if not path.is_file():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"[MCP] {path.name} の読み込みに失敗: {type(e).__name__}: {e}")
+        return []
+    providers = []
+    for name, spec in (data.get("mcpServers") or {}).items():
+        if not isinstance(spec, dict) or not spec.get("command"):
+            print(f"[MCP] {name}: command がありません — スキップ")
+            continue
+        providers.append(McpToolProvider(name, spec["command"],
+                                         spec.get("args") or [], spec.get("env")))
+    return providers
+
+
 TOOL_PROVIDERS: list[ToolProvider] = [BuiltinToolProvider()]
+
+
+def all_tools() -> list[dict]:
+    """全ToolProviderのツール定義を集める(Ollamaのtools引数用)。名前が重複した
+    場合は先に登録されたプロバイダ(組み込みが先頭)を優先して後発を除外する。
+    _provider_for_toolも同じ順で先勝ちするため、モデルへ見せる定義と実際の
+    ディスパッチ先が常に一致する。
+    """
+    tools, seen = [], set()
+    for provider in TOOL_PROVIDERS:
+        for t in provider.list_tools():
+            n = t.get("function", {}).get("name")
+            if n in seen:
+                continue
+            seen.add(n)
+            tools.append(t)
+    return tools
 
 
 def _provider_for_tool(name: str) -> ToolProvider | None:
@@ -1544,7 +1786,24 @@ class Handler(BaseHTTPRequestHandler):
                        "message": f"ワークスペースは {roots} 配下のみ指定できます: {ws}"})
             return
 
-        messages = [{"role": "system", "content": SYSTEM_PROMPT.format(ws=ws)}]
+        # ツール一覧は組み込み+接続済みMCPサーバーの合算(リクエスト開始時に1回
+        # だけ確定させ、ターン途中で増減しないようにする)。MCP未設定ならTOOLSと同じ。
+        tools = all_tools()
+        sys_prompt = SYSTEM_PROMPT.format(ws=ws)
+        mcp_lines = []
+        for provider in TOOL_PROVIDERS:
+            if isinstance(provider, McpToolProvider):
+                for t in provider.list_tools():
+                    fn = t.get("function", {})
+                    desc = (fn.get("description") or "").split("\n")[0][:120]
+                    mcp_lines.append(f"- {fn.get('name')}: {desc}")
+        if mcp_lines:
+            # ローカルの弱いモデルはtoolsスキーマだけだと追加ツールを使い忘れる
+            # ことがあるため、システムプロンプトでも存在を明示する
+            sys_prompt += ("\n\nAdditional tools provided by connected MCP servers "
+                           "(call them exactly like the built-in tools):\n"
+                           + "\n".join(mcp_lines))
+        messages = [{"role": "system", "content": sys_prompt}]
         messages += body.get("messages", [])
         empty_retries = 0
         http_retries = 0
@@ -1574,7 +1833,7 @@ class Handler(BaseHTTPRequestHandler):
                 if work_state:
                     call_messages = messages + [
                         {"role": "user", "content": WORK_STATE_PREFIX + work_state}]
-                payload = {"model": model, "messages": call_messages, "tools": TOOLS,
+                payload = {"model": model, "messages": call_messages, "tools": tools,
                            "stream": True, "options": {"num_ctx": NUM_CTX}}
                 content, thinking, tool_calls = "", "", []
                 try:
@@ -1761,6 +2020,14 @@ def main():
     SELF_CHECK_RESULTS = run_self_check()
     for c in SELF_CHECK_RESULTS:
         print(f"  [{'OK' if c['ok'] else 'NG'}] {c['name']}: {c['detail']}")
+    # MCPサーバーは遅延起動だが、ここで一度list_tools()を呼んで先に立ち上げて
+    # おく(初回チャットの待ち時間と、起動失敗の早期発見のため)。失敗しても
+    # サーバー全体は通常通り動く。
+    for p in load_mcp_providers():
+        TOOL_PROVIDERS.append(p)
+        n = len(p.list_tools())
+        print(f"  [{'OK' if n else 'NG'}] MCP {p.name}: "
+              f"{f'{n}ツール' if n else '接続失敗または0ツール'}")
     print(f"LocalCoder running: http://localhost:{PORT}  (ollama: {OLLAMA})")
     srv.serve_forever()
 

@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 history/
 tests/fixtures/
+mcp_servers.json

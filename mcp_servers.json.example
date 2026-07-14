@@ -1,0 +1,9 @@
+{
+  "_comment": "MCPサーバー定義のサンプル。実際に使うにはこのファイルを mcp_servers.json という名前でコピーし、パスを自分の環境に合わせて書き換える。mcp_servers.json は個人パスを含むため gitignore 済み。ファイルが無ければMCP機能は無効(従来通り)。対応トランスポートはstdioのみ。",
+  "mcpServers": {
+    "picocalc-expert": {
+      "command": "python3",
+      "args": ["/home/USERNAME/pico_dvl/codex/mcp/picocalc_expert.py"]
+    }
+  }
+}
