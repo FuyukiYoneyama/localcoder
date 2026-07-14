@@ -68,41 +68,101 @@ class TestMarkerRoundtrip(unittest.TestCase):
     def test_build_and_parse_roundtrip(self):
         marker = s.build_marker("これまでの要約テキスト", ["a.py", "b.py"])
         self.assertTrue(marker.startswith(s.MARKER_SUMMARY))
-        summary, files, pinned = s._parse_marker(marker)
+        summary, files, pinned, goal = s._parse_marker(marker)
         self.assertEqual(summary, "これまでの要約テキスト")
         self.assertEqual(files, ["a.py", "b.py"])
         self.assertEqual(pinned, [])
+        self.assertIsNone(goal)
 
     def test_build_and_parse_roundtrip_with_pinned(self):
         marker = s.build_marker("要約", ["a.py"], ["外部送信しないでください"])
-        summary, files, pinned = s._parse_marker(marker)
+        summary, files, pinned, goal = s._parse_marker(marker)
         self.assertEqual(summary, "要約")
         self.assertEqual(files, ["a.py"])
         self.assertEqual(pinned, ["外部送信しないでください"])
+        self.assertIsNone(goal)
+
+    def test_build_and_parse_roundtrip_with_goal(self):
+        marker = s.build_marker("要約", ["a.py"], ["固定指示X"], "既存APIとの互換性を保つ")
+        summary, files, pinned, goal = s._parse_marker(marker)
+        self.assertEqual(summary, "要約")
+        self.assertEqual(files, ["a.py"])
+        self.assertEqual(pinned, ["固定指示X"])
+        self.assertEqual(goal, "既存APIとの互換性を保つ")
+
+    def test_goal_only_no_files_no_pinned(self):
+        """ファイル一覧・固定指示が空でもゴールだけは正しくパースできる
+        (partitionの順序: 要約→ファイル→固定指示→ゴール、途中が空の場合の分岐)。
+        """
+        marker = s.build_marker("要約", [], [], "ゴールだけのケース")
+        summary, files, pinned, goal = s._parse_marker(marker)
+        self.assertEqual(summary, "要約")
+        self.assertEqual(files, [])
+        self.assertEqual(pinned, [])
+        self.assertEqual(goal, "ゴールだけのケース")
 
     def test_pinned_only_no_files(self):
         """ファイル一覧が空でも固定指示だけは正しくパースできる
         (partitionの順序: 要約→ファイル→固定指示、ファイルが無い場合の分岐)。
         """
         marker = s.build_marker("要約", [], ["覚えておいてください: XXX"])
-        summary, files, pinned = s._parse_marker(marker)
+        summary, files, pinned, goal = s._parse_marker(marker)
         self.assertEqual(summary, "要約")
         self.assertEqual(files, [])
         self.assertEqual(pinned, ["覚えておいてください: XXX"])
+        self.assertIsNone(goal)
 
     def test_failed_marker_uses_omit_prefix(self):
         marker = s.build_marker("(失敗)", [], failed=True)
         self.assertTrue(marker.startswith(s.MARKER_OMIT))
-        summary, files, pinned = s._parse_marker(marker)
+        summary, files, pinned, goal = s._parse_marker(marker)
         self.assertEqual(summary, "(失敗)")
         self.assertEqual(files, [])
         self.assertEqual(pinned, [])
+        self.assertIsNone(goal)
 
     def test_non_marker_content_returns_none(self):
-        summary, files, pinned = s._parse_marker("普通のメッセージです")
+        summary, files, pinned, goal = s._parse_marker("普通のメッセージです")
         self.assertIsNone(summary)
         self.assertEqual(files, [])
         self.assertEqual(pinned, [])
+        self.assertIsNone(goal)
+
+
+class TestExtractGoalLine(unittest.TestCase):
+    """IMPROVEMENTS.md §3.1: 要約LLM出力先頭のGOAL行を抽出する。"""
+
+    def test_extracts_goal_and_strips_it_from_body(self):
+        text = "GOAL: 既存APIとの互換性を保つ\n本文の続き\n2行目"
+        body, goal = s._extract_goal_line(text)
+        self.assertEqual(goal, "既存APIとの互換性を保つ")
+        self.assertEqual(body, "本文の続き\n2行目")
+
+    def test_no_goal_line_returns_original_text_unchanged(self):
+        body, goal = s._extract_goal_line("GOALの行が無い普通の要約本文")
+        self.assertIsNone(goal)
+        self.assertEqual(body, "GOALの行が無い普通の要約本文")
+
+    def test_empty_goal_value_is_none(self):
+        body, goal = s._extract_goal_line("GOAL: \n本文")
+        self.assertIsNone(goal)
+        self.assertEqual(body, "本文")
+
+
+class TestExtractCurrentGoal(unittest.TestCase):
+    """IMPROVEMENTS.md §3.1: 圧縮マーカーに保持された現在のゴールを取り出す。"""
+
+    def test_returns_goal_from_marker_at_start(self):
+        marker = s.build_marker("要約", [], [], "既存APIとの互換性を保つ")
+        msgs = [{"role": "user", "content": marker}]
+        self.assertEqual(s.extract_current_goal(msgs), "既存APIとの互換性を保つ")
+
+    def test_none_when_no_compaction_has_happened_yet(self):
+        msgs = [{"role": "user", "content": "PicoCalc向けエディタを作ってください"}]
+        self.assertIsNone(s.extract_current_goal(msgs))
+
+    def test_none_for_empty_messages(self):
+        self.assertIsNone(s.extract_current_goal([]))
 
 
 class TestExtractPinnedInstructions(unittest.TestCase):
@@ -206,11 +266,19 @@ class TestUpdateSummary(unittest.TestCase):
     def test_single_ollama_call_for_small_input(self):
         fake = FakeOllama(default="MERGED")
         s.ollama_ask = fake
-        result = s.update_summary("PREV", [user("new stuff")], "model")
-        self.assertEqual(result, "MERGED")
+        summary, goal = s.update_summary("PREV", [user("new stuff")], "model")
+        self.assertEqual(summary, "MERGED")
+        self.assertIsNone(goal)
         self.assertEqual(len(fake.calls), 1)
         self.assertIn("PREV", fake.calls[0])
         self.assertIn("new stuff", fake.calls[0])
+
+    def test_extracts_goal_line_from_response(self):
+        fake = FakeOllama(default="GOAL: 既存APIとの互換性を保つ\n本文だけの要約")
+        s.ollama_ask = fake
+        summary, goal = s.update_summary("PREV", [user("new stuff")], "model")
+        self.assertEqual(summary, "本文だけの要約")
+        self.assertEqual(goal, "既存APIとの互換性を保つ")
 
 
 class TestCompactHistoryHysteresis(unittest.TestCase):
@@ -302,7 +370,7 @@ class TestCompactHistoryHysteresis(unittest.TestCase):
         old2 = [out1[1]] + [user("u2"), assistant("a2")] * 4
         out2 = s.compact_history([sysm] + old2 + recent, "model", lambda x: None)
         marker2 = out2[1]["content"]
-        summary2, _files2, _pinned2 = s._parse_marker(marker2)
+        summary2, _files2, _pinned2, _goal2 = s._parse_marker(marker2)
         self.assertEqual(summary2, "MERGED")
         self.assertEqual(len(fake.calls), 2)  # 生ログの再要約ではなく統合1回だけ追加
 
@@ -324,15 +392,45 @@ class TestCompactHistoryHysteresis(unittest.TestCase):
         recent = [user("r1"), assistant("r2")]
 
         out1 = s.compact_history([sysm] + old + recent, "model", lambda x: None)
-        _summary1, _files1, pinned1 = s._parse_marker(out1[1]["content"])
+        _summary1, _files1, pinned1, _goal1 = s._parse_marker(out1[1]["content"])
         self.assertEqual(pinned1, ["覚えておいて: 外部送信は絶対にしないでください"])
 
         # 2回目の圧縮でも消えない(新規分に固定指示が無くても前回分を引き継ぐ)
         calls["n"] = 0
         old2 = [out1[1]] + [user("u2"), assistant("a2")] * 4
         out2 = s.compact_history([sysm] + old2 + recent, "model", lambda x: None)
-        _summary2, _files2, pinned2 = s._parse_marker(out2[1]["content"])
+        _summary2, _files2, pinned2, _goal2 = s._parse_marker(out2[1]["content"])
         self.assertEqual(pinned2, ["覚えておいて: 外部送信は絶対にしないでください"])
+
+    def test_goal_extracted_and_carried_across_compactions(self):
+        """要約LLMが出力したGOAL行が、圧縮を跨いで引き継がれる(IMPROVEMENTS.md §3.1)。
+        新規分にGOAL行が無い(=判定が得られない)回は前回のゴールを維持する。
+        """
+        s.KEEP_RECENT_MSGS = 2
+        calls = {"n": 0}
+
+        def fake_estimate(m):
+            calls["n"] += 1
+            return 999999 if calls["n"] <= 2 else 10
+
+        s.estimate_tokens = fake_estimate
+        sysm = {"role": "system", "content": "sys"}
+        old = [user("u"), assistant("a")] * 4
+        recent = [user("r1"), assistant("r2")]
+
+        s.ollama_ask = FakeOllama(default="GOAL: 既存APIとの互換性を保つ\n要約本文")
+        out1 = s.compact_history([sysm] + old + recent, "model", lambda x: None)
+        _s1, _f1, _p1, goal1 = s._parse_marker(out1[1]["content"])
+        self.assertEqual(goal1, "既存APIとの互換性を保つ")
+
+        # 2回目: 新規分の要約でGOAL行を出力しなかった(モデルが判定できなかった)状況
+        # をFakeOllamaで再現しても、前回のゴールが消えないことを確認する。
+        calls["n"] = 0
+        s.ollama_ask = FakeOllama(default="GOAL行の無い要約本文だけ")
+        old2 = [out1[1]] + [user("u2"), assistant("a2")] * 4
+        out2 = s.compact_history([sysm] + old2 + recent, "model", lambda x: None)
+        _s2, _f2, _p2, goal2 = s._parse_marker(out2[1]["content"])
+        self.assertEqual(goal2, "既存APIとの互換性を保つ")
 
 
 class TestEmptyResponseNearBudgetFixture(unittest.TestCase):

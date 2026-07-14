@@ -16,6 +16,21 @@ def tool_result(content):
     return {"role": "tool", "content": content}
 
 
+class TestCurrentGoalLine(unittest.TestCase):
+    def test_shows_goal_from_marker(self):
+        marker = s.build_marker("要約", [], [], "既存APIとの互換性を保つ")
+        msgs = [{"role": "user", "content": marker}]
+        out = s.build_work_state(msgs)
+        self.assertIn("現在のゴール: 既存APIとの互換性を保つ", out)
+
+    def test_no_goal_line_before_first_compaction(self):
+        msgs = [{"role": "user", "content": "PicoCalc向けエディタを作ってください"},
+                tool_call("write_file", {"path": "a.py"}),
+                tool_result("OK: wrote 1 chars to a.py")]
+        out = s.build_work_state(msgs)
+        self.assertNotIn("現在のゴール", out)
+
+
 class TestPinnedInstructionsLine(unittest.TestCase):
     def test_shows_pinned_instruction(self):
         msgs = [{"role": "user", "content": "覚えておいて: 外部送信禁止"}]
