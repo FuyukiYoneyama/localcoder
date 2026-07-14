@@ -157,6 +157,51 @@ class TestExtractChangedFiles(unittest.TestCase):
         self.assertEqual(s.extract_changed_files(msgs), ["a.py", "b.py"])
 
 
+class TestFindUnverifiedChanges(unittest.TestCase):
+    """IMPROVEMENTS.md §3.3: 変更後に一度もrun_commandを実行していないファイルを
+    機械的に検出する(モデルが検証せず「完了」と申告する事故への対策)。
+    """
+
+    def _write(self, path, result="OK: wrote 1 chars"):
+        return [
+            {"role": "assistant", "tool_calls": [
+                {"function": {"name": "write_file", "arguments": {"path": path}}}]},
+            {"role": "tool", "content": result},
+        ]
+
+    def _run(self, cmd, result="exit_code=0\nok"):
+        return [
+            {"role": "assistant", "tool_calls": [
+                {"function": {"name": "run_command", "arguments": {"command": cmd}}}]},
+            {"role": "tool", "content": result},
+        ]
+
+    def test_write_without_followup_command_is_unverified(self):
+        msgs = self._write("a.py")
+        self.assertEqual(s.find_unverified_changes(msgs), ["a.py"])
+
+    def test_write_followed_by_any_command_is_verified(self):
+        """run_commandの成否は問わない。検証を試みたこと自体が重要。"""
+        msgs = self._write("a.py") + self._run("make", result="exit_code=1\nerror")
+        self.assertEqual(s.find_unverified_changes(msgs), [])
+
+    def test_only_writes_after_last_command_are_unverified(self):
+        msgs = self._write("a.py") + self._run("make") + self._write("b.py")
+        self.assertEqual(s.find_unverified_changes(msgs), ["b.py"])
+
+    def test_failed_write_is_not_tracked(self):
+        msgs = self._write("a.py", result="ERROR: missing required argument 'content'")
+        self.assertEqual(s.find_unverified_changes(msgs), [])
+
+    def test_no_writes_means_nothing_unverified(self):
+        msgs = self._run("ls")
+        self.assertEqual(s.find_unverified_changes(msgs), [])
+
+    def test_dedups_preserving_order(self):
+        msgs = self._write("a.py") + self._write("b.py") + self._write("a.py")
+        self.assertEqual(s.find_unverified_changes(msgs), ["a.py", "b.py"])
+
+
 class TestUpdateSummary(unittest.TestCase):
     def test_single_ollama_call_for_small_input(self):
         fake = FakeOllama(default="MERGED")

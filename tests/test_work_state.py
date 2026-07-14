@@ -32,6 +32,23 @@ class TestPinnedInstructionsLine(unittest.TestCase):
         self.assertNotIn("固定指示", out)       # 固定指示だけ出ない、を確認する
 
 
+class TestUnverifiedChangesLine(unittest.TestCase):
+    def test_warns_when_change_not_verified(self):
+        msgs = [tool_call("write_file", {"path": "a.py"}),
+                tool_result("OK: wrote 1 chars to a.py")]
+        out = s.build_work_state(msgs)
+        self.assertIn("未検証", out)
+        self.assertIn("a.py", out)
+
+    def test_no_warning_after_verification_command(self):
+        msgs = [tool_call("write_file", {"path": "a.py"}),
+                tool_result("OK: wrote 1 chars to a.py"),
+                tool_call("run_command", {"command": "make"}),
+                tool_result("exit_code=0\nok")]
+        out = s.build_work_state(msgs)
+        self.assertNotIn("未検証", out)
+
+
 class TestChangedFilesLine(unittest.TestCase):
     def test_lists_successful_writes(self):
         msgs = [tool_call("write_file", {"path": "a.py"}),

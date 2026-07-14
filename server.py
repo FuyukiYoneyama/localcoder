@@ -871,6 +871,31 @@ def extract_pinned_instructions(messages: list) -> list[str]:
     return pinned
 
 
+def find_unverified_changes(messages: list) -> list[str]:
+    """write_file/edit_fileで変更したファイルのうち、その後に一度も
+    run_commandが実行されていないものを機械的に検出する(発生順・重複除去、
+    LLM不使用)。モデルが「完了した」と申告しただけで実際にはビルド/テストで
+    検証していない状態を検知するために使う(IMPROVEMENTS.md §3.3)。
+
+    run_commandの成否は問わない——ここで確認したいのは「検証を試みたか」
+    であり、「検証に成功したか」は直近コマンドの結果(build_work_state側)で
+    別途分かる。run_commandが1回でも実行されればそれ以前の変更は「検証試行
+    済み」とみなし、以後の新しい変更だけを追跡し直す。
+
+    圧縮済みの古い部分はtool_calls構造が失われているため対象外——他の
+    ダッシュボード項目と同じく直近の非圧縮ウィンドウのみを反映する。
+    """
+    unverified = []
+    for name, args, result in _iter_tool_calls_with_results(messages):
+        if name in ("write_file", "edit_file") and result is not None and not result.startswith("ERROR"):
+            path = args.get("path")
+            if path and path not in unverified:
+                unverified.append(path)
+        elif name == "run_command":
+            unverified = []
+    return unverified
+
+
 def _parse_marker(content: str) -> tuple[str | None, list[str], list[str]]:
     """圧縮マーカーのcontentから (これまでの要約本文, 変更ファイル一覧, 固定指示一覧) を取り出す。
 
@@ -940,6 +965,13 @@ def build_work_state(messages: list) -> str:
             lines.append(f"  - {p}")
     if changed_files:
         lines.append("変更したファイル: " + ", ".join(changed_files))
+
+    unverified = find_unverified_changes(messages)
+    if unverified:
+        lines.append(
+            "⚠ 未検証の変更(ビルド/テストを一度も実行していない): "
+            + ", ".join(unverified)
+            + " — これらを検証するまで作業を完了したと報告しないこと。")
 
     recent = commands[-RECENT_COMMANDS_SHOWN:]
     if recent:
@@ -1389,6 +1421,7 @@ class Handler(BaseHTTPRequestHandler):
                 "status": turn_status,
                 "duration_seconds": round(time.time() - turn_started_at, 1),
                 "changed_files": extract_changed_files(messages[1:]),
+                "unverified_changes": find_unverified_changes(messages[1:]),
                 "tool_call_count": diag_tool_call_count,
                 "compact_count": diag_compact_count,
             }})
@@ -1422,7 +1455,8 @@ class Handler(BaseHTTPRequestHandler):
                     "tool_call_count": diag_tool_call_count,
                     "tool_exec_seconds": round(diag_tool_exec_seconds, 1),
                     "iterations_used": diag_iterations_used,
-                    "changed_files_count": len(extract_changed_files(messages[1:]))}
+                    "changed_files_count": len(extract_changed_files(messages[1:])),
+                    "unverified_changes_count": len(find_unverified_changes(messages[1:]))}
             if len(messages) > 1:
                 try:
                     save_session(sid, model, str(ws), messages[1:], turn=turn)

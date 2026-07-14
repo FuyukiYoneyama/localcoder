@@ -261,21 +261,27 @@ async function openSession(id){
 const STATUS_LABEL={completed:"完了",max_iter:"最大ループ到達",stuck:"同一失敗で停止",
   stopped:"ユーザー停止",error:"エラー",disconnected:"切断"};
 function summaryCard(data){
-  // changed_files: ライブ実行中はファイルパスの配列(ツールチップに使う)。
-  // 履歴再表示時は保存された件数(changed_files_count)しか無いため数値も許容する。
+  // changed_files/unverified_changes: ライブ実行中はファイルパスの配列
+  // (ツールチップに使う)。履歴再表示時は保存された件数しか無いため数値も許容する。
   const files=data.changed_files;
   const fileCount=Array.isArray(files)?files.length:(files||0);
+  const unverified=data.unverified_changes;
+  const unverifiedCount=Array.isArray(unverified)?unverified.length:(unverified||0);
   const d=document.createElement("div");
-  d.className="summary status-"+data.status;
+  d.className="summary status-"+data.status+(unverifiedCount?" status-stuck":"");
   const parts=[
     "<span>終了理由: <b>"+(STATUS_LABEL[data.status]||data.status)+"</b></span>",
     "<span>所要時間: <b>"+data.duration_seconds+"秒</b></span>",
     "<span>ツール呼び出し: <b>"+data.tool_call_count+"回</b></span>",
   ];
   if(fileCount)parts.push("<span>変更: <b>"+fileCount+"ファイル</b></span>");
+  if(unverifiedCount)parts.push("<span>⚠ 未検証: <b>"+unverifiedCount+"ファイル</b></span>");
   if(data.compact_count)parts.push("<span>🗜 圧縮: <b>"+data.compact_count+"回</b></span>");
   d.innerHTML=parts.join("");
-  if(Array.isArray(files)&&files.length)d.title=files.join("\n");
+  const titleParts=[];
+  if(Array.isArray(files)&&files.length)titleParts.push("変更:\n"+files.join("\n"));
+  if(Array.isArray(unverified)&&unverified.length)titleParts.push("未検証:\n"+unverified.join("\n"));
+  if(titleParts.length)d.title=titleParts.join("\n\n");
   chat.appendChild(d); scroll(); return d;
 }
 function imageBubble(images){
@@ -309,7 +315,7 @@ function renderHistory(msgs,turns){
     const t=turns[turns.length-1];
     summaryCard({status:t.status, duration_seconds:Math.round((t.ended_at-t.started_at)*10)/10,
       tool_call_count:t.tool_call_count||0, compact_count:t.compact_count||0,
-      changed_files:t.changed_files_count||0});
+      changed_files:t.changed_files_count||0, unverified_changes:t.unverified_changes_count||0});
   }
   scroll();
 }
