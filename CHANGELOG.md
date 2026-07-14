@@ -48,6 +48,21 @@ LocalCoder の主な変更を時系列で記録する。形式は
   テストで固定した。`gpt-oss:20b`・`qwen2.5-coder:7b`の両方で実際に
   `GOAL: ...`形式が正しく出力・抽出されることを確認済み。(`729e708`)
 
+### 変更
+- **ツール実行部分を`BuiltinToolProvider`クラスへ分離し、`ToolProvider`共通
+  インターフェースを導入した(`IMPROVEMENTS.md` §8.1の一部＋§13.2の実装、
+  MCP対応前提の第3弾)。** 組み込みツールの分岐ロジックを`exec_tool`から
+  `BuiltinToolProvider.call_tool()`へ移し、`list_tools()`/`call_tool()`という
+  共通形式(`ToolProvider` Protocol)に揃えた。ツール実行に必要な状態は
+  `ToolContext`に1つにまとめ、ツール名からプロバイダを探す`_provider_for_tool`
+  はデータ駆動(if/elifではなく`list_tools()`との突き合わせ)にした。将来
+  `McpToolProvider`を`TOOL_PROVIDERS`へ追加するだけで組み込みツールと同列に
+  扱えるようにする受け皿。`exec_tool`自体は公開シグネチャ・挙動を変えない薄い
+  ラッパーとして残し、既存93テストは無修正で全パス。実チャットで
+  `write_file`→`read_file`→`run_command`の3種を連続実行させ新しいディスパッチ
+  経路の動作を確認済み。物理的な`server.py`の複数ファイル分割は今回のスコープ外
+  (第5段階で別途行う)。
+
 ## 2026-07-13
 
 ### 追加

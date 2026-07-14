@@ -24,6 +24,7 @@ import urllib.request
 from html import unescape
 from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Protocol
 from pathlib import Path
 
 OLLAMA = os.environ.get("LOCALCODER_OLLAMA", "http://localhost:11434")
@@ -540,80 +541,151 @@ def track_tool_repeat(name: str, args: dict, result: str,
     return new_sig, repeat_count, repeat_count >= TOOL_STUCK_LIMIT
 
 
+class ToolContext:
+    """ツール実行に必要な状態をまとめて渡すためのコンテナ(IMPROVEMENTS.md §13.2)。
+
+    個々のツール実装は元exec_toolの引数を直接見るのではなく、これ経由でアクセス
+    する。将来MCPツールプロバイダを追加する際も同じ形で渡せる。
+    """
+    __slots__ = ("ws", "cancel", "model", "pending_images", "sid", "call_id")
+
+    def __init__(self, ws: Path, cancel=None, model: str | None = None,
+                 pending_images: list | None = None, sid: str | None = None,
+                 call_id: str | None = None):
+        self.ws = ws
+        self.cancel = cancel
+        self.model = model
+        self.pending_images = pending_images
+        self.sid = sid
+        self.call_id = call_id
+
+
+class ToolProvider(Protocol):
+    """組み込みツールと将来のMCPツールを同じ形で扱うための共通インターフェース
+    (IMPROVEMENTS.md §13.2)。ディスパッチ側(exec_tool)はこのプロトコルだけを見て
+    呼び出す先を決めるため、新しいプロバイダ(例: McpToolProvider)を
+    TOOL_PROVIDERSへ追加するだけで組み込みツールと同列に扱えるようになる。
+    """
+
+    def list_tools(self) -> list[dict]: ...  # Ollamaのtools引数に渡す定義そのもの
+
+    def call_tool(self, name: str, args: dict, ctx: ToolContext) -> str: ...
+
+
+class BuiltinToolProvider:
+    """組み込みツール(run_command/read_file/write_file/...)のToolProvider実装。
+
+    ロジック自体は元のexec_tool関数の中身をそのまま移しただけで、挙動は
+    変えていない(IMPROVEMENTS.md §8.1のツール実行部分の分離)。
+    """
+
+    def list_tools(self) -> list[dict]:
+        return TOOLS
+
+    def call_tool(self, name: str, args: dict, ctx: ToolContext) -> str:
+        ws, cancel, model = ctx.ws, ctx.cancel, ctx.model
+        pending_images = ctx.pending_images
+        try:
+            if name == "run_command":
+                return run_command(args["command"], ws, cancel,
+                                   sid=ctx.sid, call_id=ctx.call_id)
+            if name == "read_file":
+                f = resolve_path(ws, args["path"])
+                if f.suffix.lower() == ".pdf":
+                    return pdf_to_text(f)
+                t = f.read_text(errors="replace")
+                if len(t) > 60000:
+                    t = t[:60000] + "\n...[truncated]..."
+                return t
+            if name == "write_file":
+                f = resolve_path(ws, args["path"])
+                f.parent.mkdir(parents=True, exist_ok=True)
+                f.write_text(args["content"])
+                return f"OK: wrote {len(args['content'])} chars to {args['path']}"
+            if name == "edit_file":
+                f = resolve_path(ws, args["path"])
+                old, new = args["old_string"], args["new_string"]
+                if not old:
+                    return "ERROR: old_string must not be empty"
+                if old == new:
+                    return "ERROR: old_string and new_string are identical"
+                if not f.is_file():
+                    return f"ERROR: file not found: {args['path']}"
+                t = f.read_text(errors="replace")
+                n = t.count(old)
+                if n == 0:
+                    return ("ERROR: old_string not found in file. Use read_file to see "
+                            "the current content and copy the exact text including "
+                            "whitespace and indentation. If matching is too hard, "
+                            "rewrite the file with write_file instead.")
+                if n > 1 and not args.get("replace_all"):
+                    return (f"ERROR: old_string occurs {n} times. Include more "
+                            "surrounding lines to make it unique, or set "
+                            "replace_all=true to replace every occurrence.")
+                f.write_text(t.replace(old, new))
+                return (f"OK: replaced {n if args.get('replace_all') else 1} "
+                        f"occurrence(s) in {args['path']}")
+            if name == "list_dir":
+                f = resolve_path(ws, args.get("path") or ".")
+                items = sorted(e.name + ("/" if e.is_dir() else "") for e in f.iterdir())
+                return "\n".join(items)[:8000] or "(empty)"
+            if name == "web_search":
+                return web_search(args["query"], int(args.get("max_results") or 6))
+            if name == "fetch_url":
+                return fetch_url_text(args["url"])
+            if name == "view_image":
+                f = resolve_path(ws, args["path"])
+                if f.suffix.lower() not in IMAGE_EXTS:
+                    return f"ERROR: not a supported image type: {f.suffix or '(none)'}"
+                if not f.is_file():
+                    return f"ERROR: file not found: {args['path']}"
+                if "vision" not in model_capabilities(model or ""):
+                    return (f"ERROR: the current model ('{model}') does not support vision. "
+                            "Tell the user to switch to a vision-capable model "
+                            "(e.g. qwen3-vl, llava, gemma3) in the model dropdown, then retry.")
+                data = f.read_bytes()
+                if len(data) > IMAGE_MAX_BYTES:
+                    return f"ERROR: image too large (>{IMAGE_MAX_BYTES // 1_000_000}MB)"
+                if pending_images is not None:
+                    pending_images.append(base64.b64encode(data).decode())
+                return f"OK: loaded {args['path']}, it will be shown to you now"
+            return f"ERROR: unknown tool {name}"
+        except KeyError as e:
+            # 弱いローカルモデルほど引数を一部欠落させたツール呼び出しを返しがちなので、
+            # 生のKeyErrorよりモデルが自己修正しやすい具体的な指示にする。
+            return (f"ERROR: missing required argument {e} for tool '{name}'. "
+                    f"Call {name} again with all required arguments included.")
+        except Exception as e:  # noqa: BLE001 - report all tool errors to the model
+            return f"ERROR: {type(e).__name__}: {e}"
+
+
+# 現時点ではBuiltinToolProviderのみ。McpToolProviderを追加する際はここに足すだけで、
+# exec_tool側のディスパッチ処理は変更不要になる設計(IMPROVEMENTS.md §13.2/§13.3)。
+TOOL_PROVIDERS: list[ToolProvider] = [BuiltinToolProvider()]
+
+
+def _provider_for_tool(name: str) -> ToolProvider | None:
+    """nameを提供しているToolProviderをTOOL_PROVIDERSから探す(list_tools()の
+    定義済みツール名と突き合わせるデータ駆動な方式。if/elifの連鎖ではない)。
+    """
+    for provider in TOOL_PROVIDERS:
+        if any(t.get("function", {}).get("name") == name for t in provider.list_tools()):
+            return provider
+    return None
+
+
 def exec_tool(name: str, args: dict, ws: Path, cancel=None, model: str | None = None,
               pending_images: list | None = None, sid: str | None = None,
               call_id: str | None = None) -> str:
-    try:
-        if name == "run_command":
-            return run_command(args["command"], ws, cancel, sid=sid, call_id=call_id)
-        if name == "read_file":
-            f = resolve_path(ws, args["path"])
-            if f.suffix.lower() == ".pdf":
-                return pdf_to_text(f)
-            t = f.read_text(errors="replace")
-            if len(t) > 60000:
-                t = t[:60000] + "\n...[truncated]..."
-            return t
-        if name == "write_file":
-            f = resolve_path(ws, args["path"])
-            f.parent.mkdir(parents=True, exist_ok=True)
-            f.write_text(args["content"])
-            return f"OK: wrote {len(args['content'])} chars to {args['path']}"
-        if name == "edit_file":
-            f = resolve_path(ws, args["path"])
-            old, new = args["old_string"], args["new_string"]
-            if not old:
-                return "ERROR: old_string must not be empty"
-            if old == new:
-                return "ERROR: old_string and new_string are identical"
-            if not f.is_file():
-                return f"ERROR: file not found: {args['path']}"
-            t = f.read_text(errors="replace")
-            n = t.count(old)
-            if n == 0:
-                return ("ERROR: old_string not found in file. Use read_file to see "
-                        "the current content and copy the exact text including "
-                        "whitespace and indentation. If matching is too hard, "
-                        "rewrite the file with write_file instead.")
-            if n > 1 and not args.get("replace_all"):
-                return (f"ERROR: old_string occurs {n} times. Include more "
-                        "surrounding lines to make it unique, or set "
-                        "replace_all=true to replace every occurrence.")
-            f.write_text(t.replace(old, new))
-            return (f"OK: replaced {n if args.get('replace_all') else 1} "
-                    f"occurrence(s) in {args['path']}")
-        if name == "list_dir":
-            f = resolve_path(ws, args.get("path") or ".")
-            items = sorted(e.name + ("/" if e.is_dir() else "") for e in f.iterdir())
-            return "\n".join(items)[:8000] or "(empty)"
-        if name == "web_search":
-            return web_search(args["query"], int(args.get("max_results") or 6))
-        if name == "fetch_url":
-            return fetch_url_text(args["url"])
-        if name == "view_image":
-            f = resolve_path(ws, args["path"])
-            if f.suffix.lower() not in IMAGE_EXTS:
-                return f"ERROR: not a supported image type: {f.suffix or '(none)'}"
-            if not f.is_file():
-                return f"ERROR: file not found: {args['path']}"
-            if "vision" not in model_capabilities(model or ""):
-                return (f"ERROR: the current model ('{model}') does not support vision. "
-                        "Tell the user to switch to a vision-capable model "
-                        "(e.g. qwen3-vl, llava, gemma3) in the model dropdown, then retry.")
-            data = f.read_bytes()
-            if len(data) > IMAGE_MAX_BYTES:
-                return f"ERROR: image too large (>{IMAGE_MAX_BYTES // 1_000_000}MB)"
-            if pending_images is not None:
-                pending_images.append(base64.b64encode(data).decode())
-            return f"OK: loaded {args['path']}, it will be shown to you now"
+    """後方互換の薄いエントリポイント。実際のディスパッチはToolProvider経由で行う
+    (IMPROVEMENTS.md §13.2)。呼び出し側(handle_chat)・既存テストの引数はそのまま。
+    """
+    ctx = ToolContext(ws=ws, cancel=cancel, model=model, pending_images=pending_images,
+                      sid=sid, call_id=call_id)
+    provider = _provider_for_tool(name)
+    if provider is None:
         return f"ERROR: unknown tool {name}"
-    except KeyError as e:
-        # 弱いローカルモデルほど引数を一部欠落させたツール呼び出しを返しがちなので、
-        # 生のKeyErrorよりモデルが自己修正しやすい具体的な指示にする。
-        return (f"ERROR: missing required argument {e} for tool '{name}'. "
-                f"Call {name} again with all required arguments included.")
-    except Exception as e:  # noqa: BLE001 - report all tool errors to the model
-        return f"ERROR: {type(e).__name__}: {e}"
+    return provider.call_tool(name, args, ctx)
 
 
 def ollama_stream(payload: dict):
