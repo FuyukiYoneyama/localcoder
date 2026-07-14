@@ -513,6 +513,41 @@ def run_command(cmd: str, ws: Path, cancel, sid: str | None = None,
     return f"exit_code={p.returncode}\n{out}"
 
 
+def parse_command_result(result: str) -> dict:
+    """run_commandの文字列結果を構造化データに変換する(IMPROVEMENTS.md §4.1)。
+
+    「モデルには読みやすい文字列を渡し、サーバー側では機械判定に構造化データを
+    使う」という方針を、run_command/ToolProvider/exec_toolの契約(いずれも文字列
+    を返す)を一切変えずに実現する——文字列表現から逆算するアダプタとして追加
+    した。既存の`r.startswith("exit_code=0")`のような場当たり的な文字列チェックを
+    ここに集約し、`build_work_state`側の判定をこちらへ置き換える。
+
+    構造化ツール結果の完全な形(§4.1のJSON例、stdout/stderr分離やduration_ms)は
+    見送った——現在のrun_commandはstdoutとstderrを1本の文字列へ結合済みで
+    (`out = stdout + "\n[stderr]\n" + stderr`)、分離しようとすると出力自体に
+    その区切り文字列が偶然含まれるケースで誤動作しうる。実際に必要としている
+    消費先(build_work_state)はok/exit_codeだけなので、確実に導出できる範囲に
+    留めた。
+    """
+    if result.startswith("ERROR: command "):
+        first_line = result.splitlines()[0]
+        return {"ok": False, "exit_code": None,
+                "timed_out": "timed out" in first_line,
+                "cancelled": "cancelled" in first_line}
+    if result.startswith("exit_code="):
+        first_line = result.splitlines()[0]
+        try:
+            code = int(first_line.split("=", 1)[1].strip())
+        except ValueError:
+            code = None
+        return {"ok": code == 0, "exit_code": code,
+                "timed_out": False, "cancelled": False}
+    # run_command以外のツール結果、または未知の形式。okをNoneにして
+    # 「成功とも失敗とも判定できない」ことを明示する(Falseにすると誤って
+    # 失敗扱いされてしまう)。
+    return {"ok": None, "exit_code": None, "timed_out": False, "cancelled": False}
+
+
 def sanitize_tool_name(raw_name: str) -> str:
     """ツール呼び出しのnameから、モデルが漏らす特殊トークンを除去する。
 
@@ -1117,7 +1152,7 @@ def build_work_state(messages: list) -> str:
         lines.append("直近の実行コマンド:")
         for cmd, result in recent:
             r = result or ""
-            ok = r.startswith("exit_code=0")
+            ok = parse_command_result(r).get("ok")
             status = "OK" if ok else "失敗/要確認"
             first_line = r.splitlines()[0] if r else "(結果なし)"
             lines.append(f"  - `{cmd}` → {status} ({first_line[:80]})")
@@ -1125,7 +1160,7 @@ def build_work_state(messages: list) -> str:
     if len(commands) >= FAIL_REPEAT_THRESHOLD:
         tail = commands[-FAIL_REPEAT_THRESHOLD:]
         same_cmd = len({c for c, _ in tail}) == 1
-        all_failed = all(not (r or "").startswith("exit_code=0") for _, r in tail)
+        all_failed = all(not parse_command_result(r or "").get("ok") for _, r in tail)
         if same_cmd and all_failed:
             lines.append(
                 f"⚠ 同じコマンド「{tail[-1][0]}」が直近{FAIL_REPEAT_THRESHOLD}回連続で"
@@ -1527,8 +1562,14 @@ class Handler(BaseHTTPRequestHandler):
                     self._sse({"type": "tool_end", "name": name,
                                "result": result if len(result) <= 4000
                                else result[:4000] + "\n...[truncated]..."})
-                    messages.append({"role": "tool", "tool_name": name,
-                                     "name": name, "content": result})
+                    tool_msg = {"role": "tool", "tool_name": name,
+                               "name": name, "content": result}
+                    if name == "run_command":
+                        # 構造化データはcontent(モデル向け文字列)とは別のmetaフィールドに
+                        # 付記するだけで、既存のcontent読み取り側には一切影響しない
+                        # (IMPROVEMENTS.md §4.1)。
+                        tool_msg["meta"] = parse_command_result(result)
+                    messages.append(tool_msg)
                     last_failed_sig, tool_repeat, is_stuck = track_tool_repeat(
                         name, args, result, last_failed_sig, tool_repeat)
                     if is_stuck:
