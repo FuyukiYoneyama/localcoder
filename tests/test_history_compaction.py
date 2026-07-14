@@ -217,6 +217,39 @@ class TestExtractChangedFiles(unittest.TestCase):
         self.assertEqual(s.extract_changed_files(msgs), ["a.py", "b.py"])
 
 
+class TestFindPreviousRead(unittest.TestCase):
+    """差分中心の再読(IMPROVEMENTS.md §6.3)のキャッシュヒット判定に使う
+    find_previous_readの単体テスト。"""
+
+    def _msgs(self, name, path, result):
+        return [
+            {"role": "assistant", "tool_calls": [
+                {"function": {"name": name, "arguments": {"path": path}}}]},
+            {"role": "tool", "content": result},
+        ]
+
+    def test_no_prior_read_returns_none(self):
+        self.assertIsNone(s.find_previous_read([], "a.py"))
+
+    def test_returns_successful_read_result(self):
+        msgs = self._msgs("read_file", "a.py", "hello world")
+        self.assertEqual(s.find_previous_read(msgs, "a.py"), "hello world")
+
+    def test_ignores_other_tools_and_other_paths(self):
+        msgs = (self._msgs("write_file", "a.py", "OK: wrote 3 chars to a.py")
+               + self._msgs("read_file", "b.py", "content of b"))
+        self.assertIsNone(s.find_previous_read(msgs, "a.py"))
+
+    def test_ignores_failed_read(self):
+        msgs = self._msgs("read_file", "a.py", "ERROR: file not found: a.py")
+        self.assertIsNone(s.find_previous_read(msgs, "a.py"))
+
+    def test_returns_most_recent_read(self):
+        msgs = (self._msgs("read_file", "a.py", "old content")
+               + self._msgs("read_file", "a.py", "new content"))
+        self.assertEqual(s.find_previous_read(msgs, "a.py"), "new content")
+
+
 class TestFindUnverifiedChanges(unittest.TestCase):
     """IMPROVEMENTS.md §3.3: 変更後に一度もrun_commandを実行していないファイルを
     機械的に検出する(モデルが検証せず「完了」と申告する事故への対策)。

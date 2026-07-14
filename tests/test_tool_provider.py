@@ -57,6 +57,54 @@ class TestBuiltinToolProviderCallTool(unittest.TestCase):
         self.assertIn("'content'", result)
 
 
+class TestReadFileCacheHit(unittest.TestCase):
+    """差分中心の再読(IMPROVEMENTS.md §6.3)のキャッシュヒット短絡の挙動確認。
+    messages未指定時は従来通り、指定時は前回同一内容なら短いメッセージを返す。
+    """
+
+    def _read_msgs(self, path, result):
+        return [
+            {"role": "assistant", "tool_calls": [
+                {"function": {"name": "read_file", "arguments": {"path": path}}}]},
+            {"role": "tool", "content": result},
+        ]
+
+    def test_messages_none_returns_full_content_as_before(self):
+        provider = s.BuiltinToolProvider()
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "a.txt").write_text("hi")
+            ctx = s.ToolContext(ws=Path(d), messages=None)
+            result = provider.call_tool("read_file", {"path": "a.txt"}, ctx)
+        self.assertEqual(result, "hi")
+
+    def test_unchanged_content_returns_short_notice(self):
+        provider = s.BuiltinToolProvider()
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "a.txt").write_text("hi")
+            msgs = self._read_msgs("a.txt", "hi")
+            ctx = s.ToolContext(ws=Path(d), messages=msgs)
+            result = provider.call_tool("read_file", {"path": "a.txt"}, ctx)
+        self.assertIn("変わっていません", result)
+        self.assertIn("SHA256=", result)
+
+    def test_changed_content_returns_full_content(self):
+        provider = s.BuiltinToolProvider()
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "a.txt").write_text("new content")
+            msgs = self._read_msgs("a.txt", "old content")
+            ctx = s.ToolContext(ws=Path(d), messages=msgs)
+            result = provider.call_tool("read_file", {"path": "a.txt"}, ctx)
+        self.assertEqual(result, "new content")
+
+    def test_first_read_with_messages_returns_full_content(self):
+        provider = s.BuiltinToolProvider()
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "a.txt").write_text("hi")
+            ctx = s.ToolContext(ws=Path(d), messages=[])
+            result = provider.call_tool("read_file", {"path": "a.txt"}, ctx)
+        self.assertEqual(result, "hi")
+
+
 class TestExecToolStillWorksAsThinWrapper(unittest.TestCase):
     """exec_toolの公開シグネチャ・挙動は変えていない(後方互換)ことの確認。
     実際の分岐ロジックはBuiltinToolProvider側でカバーする。
@@ -73,6 +121,17 @@ class TestExecToolStillWorksAsThinWrapper(unittest.TestCase):
                                  cancel=None, model="gpt-oss:20b",
                                  pending_images=None, sid="s1", call_id="c1")
         self.assertTrue(result.startswith("ERROR:"))
+
+    def test_exec_tool_accepts_optional_messages_kwarg(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "a.txt").write_text("hi")
+            msgs = [
+                {"role": "assistant", "tool_calls": [
+                    {"function": {"name": "read_file", "arguments": {"path": "a.txt"}}}]},
+                {"role": "tool", "content": "hi"},
+            ]
+            result = s.exec_tool("read_file", {"path": "a.txt"}, Path(d), messages=msgs)
+        self.assertIn("変わっていません", result)
 
 
 if __name__ == "__main__":
