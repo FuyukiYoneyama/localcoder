@@ -104,6 +104,7 @@ footer{display:flex;gap:10px;padding:12px 16px;background:var(--panel);border-to
   <button id="browseBtn" title="フォルダを選ぶ">📁 参照</button>
   <button id="newBtn">＋ 新規チャット</button>
   <button id="stopBtn">■ 停止</button>
+  <button id="diagBtn" title="問題報告用の診断情報(バージョン・設定・モデル一覧・現在のセッションの診断ログ)をJSONでダウンロード。会話本文や個人パスは含まない">🩺 診断</button>
   <span id="status"></span>
 </header>
 <div id="selfCheckBanner" style="display:none"></div>
@@ -214,6 +215,21 @@ async function loadSelfCheck(){
     banner.style.whiteSpace="pre-wrap";
     banner.onclick=()=>{expanded=!expanded; banner.textContent=expanded?detail():summary()};
   }catch(e){/* セルフチェック自体の失敗はUIをブロックしない */}
+}
+async function downloadDiagnosticBundle(){
+  // 問題報告用の診断パッケージをJSONでダウンロードする(IMPROVEMENTS.md §9.3)。
+  // 会話本文や個人パスは含まれない(サーバー側で除外済み)。
+  try{
+    const q=sid?("?sid="+encodeURIComponent(sid)):"";
+    const bundle=await(await getAuth("/api/diagnostic_bundle"+q)).json();
+    const blob=new Blob([JSON.stringify(bundle,null,2)],{type:"application/json"});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement("a");
+    a.href=url;
+    a.download="localcoder-diagnostic-"+new Date().toISOString().replace(/[:.]/g,"-")+".json";
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+  }catch(e){el("div","err","診断パッケージの生成に失敗: "+e)}
 }
 $("model").addEventListener("change",updateVisionBadge);
 
@@ -417,6 +433,7 @@ input.addEventListener("keydown",e=>{
 });
 $("stopBtn").onclick=()=>{stoppedByUser=true;post("/api/stop",{sid})};
 $("newBtn").onclick=newChat;
+$("diagBtn").onclick=downloadDiagnosticBundle;
 if(window.LC_DEFAULT_WORKSPACE)$("workspace").value=window.LC_DEFAULT_WORKSPACE;
 if(window.LC_VERSION)$("version").textContent=window.LC_VERSION;
 loadModels();
