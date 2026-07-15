@@ -31,6 +31,7 @@ LocalCoder の主な変更を時系列で記録する。形式は
   CONTINUEを含む全判定を🧭カードで表示(履歴再表示にも対応)。
   `LOCALCODER_STRATEGY_REVIEW=off`で無効化可。単体テスト39件追加(計234件)。
   実Ollama(gpt-oss:20b)で発火→有効なCONTINUE→履歴保存→再提示の全経路を確認済み。
+  (`b7550b2`)
 - **可逆操作レイヤー第3段階(一部): 外部送信の分類とポリシーを追加した
   (`REVERSIBLE_OPERATIONS.md` §7-8/第3段階の§3・§5)。** 「危険なのは取り消せない
   ネットへの書き込み」という設計原則の中核。`classify_external_send(cmd)`が
