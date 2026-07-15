@@ -20,7 +20,8 @@ class TestBuiltinToolProviderListTools(unittest.TestCase):
     def test_every_builtin_tool_name_is_listed(self):
         names = {t["function"]["name"] for t in s.BuiltinToolProvider().list_tools()}
         expected = {"run_command", "read_file", "write_file", "edit_file",
-                    "list_dir", "web_search", "fetch_url", "view_image"}
+                    "list_dir", "delete_file", "delete_directory", "move_file",
+                    "copy_file", "web_search", "fetch_url", "view_image"}
         self.assertEqual(names, expected)
 
 

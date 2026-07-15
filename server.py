@@ -153,7 +153,8 @@ SYSTEM_PROMPT = """You are LocalCoder, an autonomous coding agent running on the
 Workspace directory: {ws}
 
 Rules:
-- You have tools: run_command, read_file, write_file, edit_file, list_dir, web_search, fetch_url, view_image. Use them freely without asking permission.
+- You have tools: run_command, read_file, write_file, edit_file, list_dir, delete_file, delete_directory, move_file, copy_file, web_search, fetch_url, view_image. Use them freely without asking permission.
+- To delete or move files, prefer the dedicated tools (delete_file, delete_directory, move_file) over `rm`/`mv` in run_command. The dedicated tools record the operation so the user can undo the whole turn; a raw `rm` cannot be undone. If you use run_command for a destructive file operation anyway, it will still run (no sandbox), but it won't be reversible.
 - read_file automatically extracts text from PDF files (.pdf) via pdftotext — just call it with the PDF path like any other file. If a PDF is a scanned image with no extractable text, you'll get a message saying so.
 - To actually see an image (screenshot, photo, diagram), call view_image with its path. This only works if the currently selected model supports vision — if it doesn't, view_image returns an error; tell the user in your reply to switch to a vision-capable model (e.g. qwen3-vl, llava, gemma3) in the model dropdown, then retry. Do not guess what an image contains without calling view_image first.
 - You run inside WSL (Linux) but can also operate on the user's Windows system. Windows files live under /mnt/c, /mnt/d, etc. (e.g. C:\\Users\\name\\file becomes /mnt/c/Users/name/file), and read_file/write_file/edit_file/list_dir work on those paths too. To run a Windows program or command, use run_command and invoke it via powershell.exe, e.g. run_command with `powershell.exe -NoProfile -Command "Get-ChildItem"`, or call an .exe directly. Prefer powershell.exe over cmd.exe (cmd.exe prints a warning when the working directory is a WSL path). The workspace itself may be a Windows path such as /mnt/c/Users/name/project.
@@ -204,6 +205,32 @@ TOOLS = [
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string", "description": "Directory path, default is workspace root"}},
             "required": []}}},
+    {"type": "function", "function": {
+        "name": "delete_file",
+        "description": "Delete a single file. Reversible: the file is moved to the turn's transaction trash so the user can undo it. Prefer this over `rm` in run_command.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "File path (relative to workspace or absolute)"}},
+            "required": ["path"]}}},
+    {"type": "function", "function": {
+        "name": "delete_directory",
+        "description": "Delete a directory and everything inside it. Reversible: the whole subtree is saved to the turn's transaction trash so the user can undo it. Prefer this over `rm -r` in run_command.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "Directory path (relative to workspace or absolute)"}},
+            "required": ["path"]}}},
+    {"type": "function", "function": {
+        "name": "move_file",
+        "description": "Move or rename a file. Reversible: source, destination and any overwritten content are recorded so the user can undo it. Prefer this over `mv` in run_command.",
+        "parameters": {"type": "object", "properties": {
+            "src": {"type": "string", "description": "Existing file path to move"},
+            "dst": {"type": "string", "description": "Destination file path"}},
+            "required": ["src", "dst"]}}},
+    {"type": "function", "function": {
+        "name": "copy_file",
+        "description": "Copy a file to a new path. Reversible: the created/overwritten destination is recorded so the user can undo it.",
+        "parameters": {"type": "object", "properties": {
+            "src": {"type": "string", "description": "Existing file path to copy"},
+            "dst": {"type": "string", "description": "Destination file path"}},
+            "required": ["src", "dst"]}}},
     {"type": "function", "function": {
         "name": "web_search",
         "description": "Search the web (DuckDuckGo). Returns titles, URLs and snippets. Use for documentation, error messages, library usage, current versions.",
@@ -624,6 +651,32 @@ class Transaction:
     def _rel(self, f: Path) -> str:
         return str(f.resolve().relative_to(self.ws))
 
+    def _ensure_dir(self) -> None:
+        """台帳ディレクトリを作り、.localcoder自体を無視する.gitignoreを置く。
+        (最初の記録時に1回だけ実行される。読み取りだけのターンでは呼ばれない)"""
+        self.dir.mkdir(parents=True, exist_ok=True)
+        gi = self.ws / LEDGER_DIR_NAME / ".gitignore"
+        if not gi.exists():
+            gi.write_text("*\n")
+
+    def _backup_bytes(self, subdir: str, rel: str, data: bytes) -> str:
+        """dataを台帳の<subdir>/<rel>へ保存し、記録用の相対パス文字列を返す。"""
+        dest = self.dir / subdir / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)
+        return str(Path(subdir) / rel)
+
+    @staticmethod
+    def _created_dirs_for(ws: Path, target: Path) -> list:
+        """targetを作るために新規作成されることになる親ディレクトリを深い順に。
+        (ロールバックで空になったら取り除くため)"""
+        created = []
+        d = target.parent
+        while d != ws and not d.exists():
+            created.append(str(d.resolve().relative_to(ws)))
+            d = d.parent
+        return created
+
     def record_before_write(self, f: Path) -> None:
         """write_file/edit_fileの書き込み直前(親ディレクトリ作成よりも前)に呼ぶ。
         変更前状態を保存する(§4.1)。"""
@@ -631,33 +684,82 @@ class Transaction:
         if rel in self._seen:
             return
         self._seen.add(rel)
-        self.dir.mkdir(parents=True, exist_ok=True)
-        # ユーザーのgitリポジトリを台帳で汚さないよう、.localcoder自体を無視させる
-        gi = self.ws / LEDGER_DIR_NAME / ".gitignore"
-        if not gi.exists():
-            gi.write_text("*\n")
+        self._ensure_dir()
         if f.is_file():
             data = f.read_bytes()
             st = f.stat()
-            backup = self.dir / "before" / rel
-            backup.parent.mkdir(parents=True, exist_ok=True)
-            backup.write_bytes(data)
             op = {"type": "write", "path": rel, "existed_before": True,
                   "before_sha256": hashlib.sha256(data).hexdigest(),
                   "before_mode": st.st_mode, "before_mtime": st.st_mtime,
-                  "backup_path": str(Path("before") / rel)}
+                  "backup_path": self._backup_bytes("before", rel, data)}
         else:
-            # 新規作成。ロールバック時に(空になっていれば)取り除くべき
-            # 新規親ディレクトリも深い順に記録する(§4.1)。
-            created_dirs = []
-            d = f.parent
-            while d != self.ws and not d.exists():
-                created_dirs.append(self._rel(d))
-                d = d.parent
             op = {"type": "create", "path": rel, "existed_before": False,
+                  "created_dirs": self._created_dirs_for(self.ws, f)}
+        self.operations.append(op)
+        self._write_manifest()
+
+    def record_delete(self, f: Path) -> None:
+        """delete_file/delete_directoryの実行直前に呼ぶ。削除対象を台帳へ退避する。
+
+        ファイルはbefore/へ内容を保存し、ディレクトリは(空でなくても)配下の
+        全ファイルを相対パスごと保存する。ロールバックで丸ごと復元できる。
+        """
+        self._ensure_dir()
+        rel = self._rel(f)
+        if f.is_dir():
+            entries = []
+            for child in sorted(f.rglob("*")):
+                if child.is_file() or child.is_symlink():
+                    crel = self._rel(child)
+                    st = child.stat()
+                    self._backup_bytes("trash", crel, child.read_bytes())
+                    entries.append({"path": crel, "mode": st.st_mode})
+                elif child.is_dir():
+                    entries.append({"path": self._rel(child), "dir": True})
+            op = {"type": "delete_dir", "path": rel,
+                  "created_dirs": self._created_dirs_for(self.ws, f),
+                  "entries": entries}
+        else:
+            st = f.stat()
+            op = {"type": "delete", "path": rel, "before_mode": st.st_mode,
+                  "backup_path": self._backup_bytes("trash", rel, f.read_bytes())}
+        self.operations.append(op)
+        self._write_manifest()
+
+    def record_move(self, src: Path, dst: Path, dst_existed_data: bytes | None,
+                     created_dirs: list) -> None:
+        """move_file/copy_fileの完了直後に呼ぶ。移動元・移動先・上書きされた
+        既存内容を記録する(§6)。dst_existed_dataはdstに元々あった内容(無ければNone)、
+        created_dirsはdst親ディレクトリ作成のために新規作成された相対パス
+        (呼び出し側がmkdir前に算出して渡す——mkdir後だと既存扱いになり検出できない)。"""
+        self._ensure_dir()
+        src_rel, dst_rel = self._rel(src), self._rel(dst)
+        op = {"type": "move", "src": src_rel, "dst": dst_rel,
+              "created_dirs": created_dirs}
+        if dst_existed_data is not None:
+            op["dst_overwritten_backup"] = self._backup_bytes(
+                "before", dst_rel, dst_existed_data)
+        self.operations.append(op)
+        self._write_manifest()
+
+    def record_copy(self, dst: Path, dst_existed_data: bytes | None,
+                     created_dirs: list) -> None:
+        """copy_fileの完了直後に呼ぶ。作られた/上書きされたdstだけを記録する
+        (srcは変化しないので記録不要)。ロールバックはwrite/createと同じ扱い。"""
+        self._ensure_dir()
+        dst_rel = self._rel(dst)
+        if dst_existed_data is not None:
+            op = {"type": "write", "path": dst_rel, "existed_before": True,
+                  "backup_path": self._backup_bytes("before", dst_rel, dst_existed_data)}
+        else:
+            op = {"type": "create", "path": dst_rel, "existed_before": False,
                   "created_dirs": created_dirs}
         self.operations.append(op)
         self._write_manifest()
+
+    def created_dirs_for(self, target: Path) -> list:
+        """公開版: mkdir前にtargetの親で新規作成される相対パス一覧を得る。"""
+        return self._created_dirs_for(self.ws, target)
 
     def _manifest(self) -> dict:
         return {"transaction_id": self.id,
@@ -685,13 +787,32 @@ def _txn_manifest_path(ws: Path, txn_id: str) -> Path:
     return ws / TXN_SUBDIR / txn_id / "manifest.json"
 
 
+def _remove_empty_created_dirs(ws: Path, created_dirs: list) -> None:
+    """作成された親ディレクトリのうち、空になったものだけ深い順に取り除く。"""
+    for rel in created_dirs:
+        try:
+            resolve_path(ws, rel).rmdir()  # 空の場合だけ消える
+        except OSError:
+            pass
+
+
+def _snapshot_after(tdir: Path, ws: Path, rel: str) -> None:
+    """ロールバックで戻す直前の状態をafter/へ退避する(再適用=redo用)。"""
+    f = resolve_path(ws, rel)
+    if f.is_file():
+        dest = tdir / "after" / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_bytes(dest, f.read_bytes())
+
+
 def rollback_transaction(ws: Path, txn_id: str) -> dict:
     """トランザクションの操作を逆順に取り消し、開始前の状態へ復元する(§12)。
 
-    ロールバック自体も可逆にするため、戻す直前の各ファイルの内容を after/ へ
-    退避してから復元する(誤ロールバックはreapply_transactionで再適用できる)。
-    manifest内のパスはresolve_pathで検証するため、台帳が改竄されていても
-    ワークスペース外のファイルには触れない。
+    write/create/delete/delete_dir/move の各操作型を扱う。ロールバック自体も
+    可逆にするため、戻す直前の各ファイルの内容を after/ へ退避してから復元する
+    (誤ロールバックはreapply_transactionで再適用できる)。manifest内のパスは
+    resolve_pathで検証するため、台帳が改竄されていてもワークスペース外の
+    ファイルには触れない。
     """
     ws = ws.resolve()
     mpath = _txn_manifest_path(ws, txn_id)
@@ -701,42 +822,74 @@ def rollback_transaction(ws: Path, txn_id: str) -> dict:
     if manifest.get("status") == "rolled_back":
         raise ValueError("このトランザクションは既にロールバック済みです")
     tdir = mpath.parent
-    restored = removed = 0
+    counts = {"restored": 0, "removed": 0, "moved_back": 0, "undeleted": 0}
     for op in reversed(manifest.get("operations", [])):
-        f = resolve_path(ws, op["path"])
-        if f.is_file():   # 現在の内容をafter/へ退避(再適用=redo用)
-            after = tdir / "after" / op["path"]
-            after.parent.mkdir(parents=True, exist_ok=True)
-            atomic_write_bytes(after, f.read_bytes())
-        if op.get("existed_before"):
-            backup = tdir / "before" / op["path"]
+        typ = op.get("type", "write")
+        if typ in ("write", "create"):
+            f = resolve_path(ws, op["path"])
+            _snapshot_after(tdir, ws, op["path"])
+            if op.get("existed_before"):
+                f.parent.mkdir(parents=True, exist_ok=True)
+                atomic_write_bytes(f, (tdir / op["backup_path"]).read_bytes())
+                if op.get("before_mode") is not None:
+                    try:
+                        os.chmod(f, op["before_mode"])
+                    except OSError:
+                        pass
+                counts["restored"] += 1
+            else:
+                if f.is_file():
+                    f.unlink()
+                counts["removed"] += 1
+                _remove_empty_created_dirs(ws, op.get("created_dirs", []))
+        elif typ == "delete":
+            # 削除したファイルをtrash/から復元する
+            f = resolve_path(ws, op["path"])
             f.parent.mkdir(parents=True, exist_ok=True)
-            atomic_write_bytes(f, backup.read_bytes())
+            atomic_write_bytes(f, (tdir / op["backup_path"]).read_bytes())
             if op.get("before_mode") is not None:
                 try:
                     os.chmod(f, op["before_mode"])
                 except OSError:
                     pass
-            restored += 1
-        else:
-            if f.is_file():
-                f.unlink()
-            removed += 1
-            for rel in op.get("created_dirs", []):
-                d = resolve_path(ws, rel)
-                try:
-                    d.rmdir()   # 空の場合だけ消える(他の生成物があれば残す)
-                except OSError:
-                    pass
+            counts["undeleted"] += 1
+        elif typ == "delete_dir":
+            # 削除したディレクトリ配下を丸ごと復元する
+            for e in op.get("entries", []):
+                p = resolve_path(ws, e["path"])
+                if e.get("dir"):
+                    p.mkdir(parents=True, exist_ok=True)
+                else:
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    atomic_write_bytes(p, (tdir / "trash" / e["path"]).read_bytes())
+                    if e.get("mode") is not None:
+                        try:
+                            os.chmod(p, e["mode"])
+                        except OSError:
+                            pass
+            counts["undeleted"] += 1
+        elif typ == "move":
+            # dstを消してsrcへ戻す。dstに上書きされた既存があれば復元する
+            src, dst = resolve_path(ws, op["src"]), resolve_path(ws, op["dst"])
+            _snapshot_after(tdir, ws, op["dst"])
+            if dst.is_file():
+                src.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(dst, src)
+            if op.get("dst_overwritten_backup"):
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                atomic_write_bytes(dst, (tdir / op["dst_overwritten_backup"]).read_bytes())
+            _remove_empty_created_dirs(ws, op.get("created_dirs", []))
+            counts["moved_back"] += 1
     manifest["status"] = "rolled_back"
     atomic_write(mpath, json.dumps(manifest, ensure_ascii=False, indent=1))
-    return {"ok": True, "restored": restored, "removed": removed}
+    return {"ok": True, **counts}
 
 
 def reapply_transaction(ws: Path, txn_id: str) -> dict:
     """ロールバック済みトランザクションの変更を再適用する(§11のredo)。
 
-    ロールバック時にafter/へ退避した「戻す直前の状態」を各ファイルへ書き戻す。
+    write/create/copyはafter/へ退避した「戻す直前の状態」を書き戻す。
+    delete/delete_dirは再度削除し、moveは再度srcからdstへ動かす。
     再適用後にもう一度rollback_transactionを呼べば再び戻せる(undo/redoの往復)。
     """
     ws = ws.resolve()
@@ -749,12 +902,29 @@ def reapply_transaction(ws: Path, txn_id: str) -> dict:
     tdir = mpath.parent
     reapplied = 0
     for op in manifest.get("operations", []):
-        f = resolve_path(ws, op["path"])
-        after = tdir / "after" / op["path"]
-        if after.is_file():
-            f.parent.mkdir(parents=True, exist_ok=True)
-            atomic_write_bytes(f, after.read_bytes())
-            reapplied += 1
+        typ = op.get("type", "write")
+        if typ in ("write", "create"):
+            after = tdir / "after" / op["path"]
+            if after.is_file():
+                f = resolve_path(ws, op["path"])
+                f.parent.mkdir(parents=True, exist_ok=True)
+                atomic_write_bytes(f, after.read_bytes())
+                reapplied += 1
+        elif typ in ("delete", "delete_dir"):
+            # 再度削除する(ロールバックで復元されたものを消し戻す)
+            target = resolve_path(ws, op["path"])
+            if target.is_dir():
+                shutil.rmtree(target, ignore_errors=True)
+                reapplied += 1
+            elif target.is_file():
+                target.unlink()
+                reapplied += 1
+        elif typ == "move":
+            src, dst = resolve_path(ws, op["src"]), resolve_path(ws, op["dst"])
+            if src.is_file():
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(src, dst)
+                reapplied += 1
     manifest["status"] = "reapplied"
     atomic_write(mpath, json.dumps(manifest, ensure_ascii=False, indent=1))
     return {"ok": True, "reapplied": reapplied}
@@ -990,6 +1160,52 @@ class BuiltinToolProvider:
                 f = resolve_path(ws, args.get("path") or ".")
                 items = sorted(e.name + ("/" if e.is_dir() else "") for e in f.iterdir())
                 return "\n".join(items)[:8000] or "(empty)"
+            if name == "delete_file":
+                f = resolve_path(ws, args["path"])
+                if in_ledger_area(ws, f):
+                    return "ERROR: .localcoder/ is LocalCoder's ledger and cannot be deleted"
+                if f.is_dir():
+                    return "ERROR: this is a directory; use delete_directory instead"
+                if not f.is_file():
+                    return f"ERROR: file not found: {args['path']}"
+                if ctx.txn is not None:
+                    ctx.txn.record_delete(f)   # trashへ退避してから消す
+                f.unlink()
+                return f"OK: deleted {args['path']} (reversible for this turn)"
+            if name == "delete_directory":
+                f = resolve_path(ws, args["path"])
+                if in_ledger_area(ws, f):
+                    return "ERROR: .localcoder/ is LocalCoder's ledger and cannot be deleted"
+                if not f.is_dir():
+                    return f"ERROR: directory not found: {args['path']}"
+                if f.resolve() == ws.resolve():
+                    return "ERROR: refusing to delete the workspace root itself"
+                if ctx.txn is not None:
+                    ctx.txn.record_delete(f)
+                shutil.rmtree(f)
+                return f"OK: deleted directory {args['path']} and its contents (reversible for this turn)"
+            if name in ("move_file", "copy_file"):
+                src = resolve_path(ws, args["src"])
+                dst = resolve_path(ws, args["dst"])
+                if in_ledger_area(ws, src) or in_ledger_area(ws, dst):
+                    return "ERROR: .localcoder/ is LocalCoder's ledger and cannot be a move/copy target"
+                if not src.is_file():
+                    return f"ERROR: source file not found: {args['src']}"
+                if dst.is_dir():
+                    return f"ERROR: destination is a directory: {args['dst']}"
+                dst_existed = dst.read_bytes() if dst.is_file() else None
+                # mkdirより前に新規親dirを算出する(mkdir後だと既存扱いで検出漏れする)
+                created_dirs = (ctx.txn.created_dirs_for(dst) if ctx.txn is not None else [])
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                if name == "move_file":
+                    os.replace(src, dst)
+                    if ctx.txn is not None:
+                        ctx.txn.record_move(src, dst, dst_existed, created_dirs)
+                    return f"OK: moved {args['src']} -> {args['dst']} (reversible for this turn)"
+                shutil.copy2(src, dst)
+                if ctx.txn is not None:
+                    ctx.txn.record_copy(dst, dst_existed, created_dirs)
+                return f"OK: copied {args['src']} -> {args['dst']} (reversible for this turn)"
             if name == "web_search":
                 return web_search(args["query"], int(args.get("max_results") or 6))
             if name == "fetch_url":
@@ -1533,11 +1749,20 @@ def extract_changed_files(messages: list) -> list[str]:
     (ダッシュボード経由でのハルシネーションを誘発する)ことが実際に確認された。
     """
     files = []
+
+    def add(p):
+        if p and p not in files:
+            files.append(p)
+
     for name, args, result in _iter_tool_calls_with_results(messages):
-        if name in ("write_file", "edit_file") and result is not None and not result.startswith("ERROR"):
-            path = args.get("path")
-            if path and path not in files:
-                files.append(path)
+        if result is None or result.startswith("ERROR"):
+            continue
+        if name in ("write_file", "edit_file"):
+            add(args.get("path"))
+        elif name in ("delete_file", "delete_directory"):
+            add(args.get("path"))
+        elif name in ("move_file", "copy_file"):
+            add(args.get("dst"))
     return files
 
 

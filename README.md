@@ -51,10 +51,13 @@ wsl -d ubuntu-24.04 -- bash -lc "python3 ~/localcoder/server.py"
 
 - `server.py` — HTTPサーバー + エージェントループ (Ollama /api/chat + tools)
 - `index.html` — チャットGUI (SSEストリーミング表示)
-- ツール: run_command / read_file / write_file / edit_file / list_dir / web_search / fetch_url / view_image
+- ツール: run_command / read_file / write_file / edit_file / list_dir /
+  delete_file / delete_directory / move_file / copy_file / web_search / fetch_url / view_image
   - ファイル操作は作業フォルダ内に制限
   - edit_file は完全一致のfind/replace。既存ファイルの部分修正は全文書き換えでなく
     こちらが優先される (トークン節約 + 書き換え漏れ事故の防止)
+  - delete_file/delete_directory/move_file/copy_file は生の`rm`/`mv`より優先される
+    可逆な削除・移動ツール (ターン単位でundoできる)
   - コマンドは作業フォルダをcwdとして実行 (タイムアウト180秒)
   - web_search は DuckDuckGo (無料・APIキー不要)、fetch_url はページ本文取得
   - read_file は `.pdf` を自動判別し `pdftotext` でテキスト抽出する (poppler-utils必須。
@@ -70,12 +73,14 @@ wsl -d ubuntu-24.04 -- bash -lc "python3 ~/localcoder/server.py"
   から `powershell.exe -NoProfile -Command "..."` で実行できる(WSL相互運用)。
   許可範囲は環境変数 `LOCALCODER_ALLOWED_ROOTS`(コロン区切り)で変更でき、`$HOME`
   だけに戻すことも可能
-- 可逆操作レイヤー(第1段階): write_file/edit_file は書き込み前に変更前状態を
-  ワークスペース配下 `.localcoder/transactions/` へ自動保存し(1リクエスト=
-  1トランザクション)、ターン終了サマリーの「⎌ このターンの変更を元に戻す」
-  ボタンでいつでも復元できる(再適用=redoも可)。書き込み自体も原子的
-  (一時ファイル+os.replace)。読み取りだけのターンでは何も作られない。
-  設計の全体像は [REVERSIBLE_OPERATIONS.md](REVERSIBLE_OPERATIONS.md) 参照
+- 可逆操作レイヤー(第1〜2段階): ファイルの変更・削除・移動・コピーを書き込み
+  前に変更前状態としてワークスペース配下 `.localcoder/transactions/` へ自動保存し
+  (1リクエスト=1トランザクション)、ターン終了サマリーの「⎌ このターンの変更を
+  元に戻す」ボタンでいつでも復元できる(再適用=redoも可)。write_file/edit_fileは
+  原子的書き込み、削除は専用ゴミ箱へ退避。削除・移動には専用ツール
+  (delete_file/delete_directory/move_file/copy_file)があり、生の`rm`/`mv`より
+  優先される(前者は戻せるが後者は戻せない)。読み取りだけのターンでは何も
+  作られない。設計の全体像は [REVERSIBLE_OPERATIONS.md](REVERSIBLE_OPERATIONS.md) 参照
 - 履歴の自動圧縮: 会話がコンテキスト長(32K)に近づくと、古いツール結果の切り詰め →
   古い会話のLLM要約への置換、を自動で行う (画面に 🗜 表示)。長い会話でも
   システムプロンプトや直近の文脈が押し出されて壊れることがない
