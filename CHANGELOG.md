@@ -13,6 +13,21 @@ LocalCoder の主な変更を時系列で記録する。形式は
 ## 2026-07-15
 
 ### 追加
+- **可逆操作レイヤー第3段階(一部): 外部送信の分類とポリシーを追加した
+  (`REVERSIBLE_OPERATIONS.md` §7-8/第3段階の§3・§5)。** 「危険なのは取り消せない
+  ネットへの書き込み」という設計原則の中核。`classify_external_send(cmd)`が
+  run_commandのコマンド文字列から外部送信(git push / curl・wgetのPOST系・
+  アップロード / scp・sftp / rsync・sshのリモート / npm・twine・gh release・
+  docker push等の公開 / aws s3・gsutilアップロード / メール送信)を検出する
+  (取得=GETは安全側として対象外。難読化・変数展開は捕捉外の安全網)。環境変数
+  `LOCALCODER_EXTERNAL_SEND_POLICY`で挙動を選べる: `allow_recorded`(既定・
+  従来通り実行するが送信内容を台帳へ必ず記録)/ `deny`(実行前に拒否しモデルに
+  ユーザー依頼を促す)。外部送信は`manifest.json`の`external_sends`(コマンド全文・
+  検出理由・実行有無)に記録され、サマリーカードに「📤 外部送信: N件」を表示、
+  起動時セルフチェックにポリシー項目を追加。`ask`(実行前のUI同期確認)はSSE往復
+  承認が必要なため未実装、run_command前後のファイル差分検出(§7-B)は観測用で
+  可逆化に直結しないため後回し。単体テスト9件追加(計195件)。deny/allow_recorded
+  両方をサーバー起動込みで実チャット確認済み。
 - **可逆操作レイヤー第2段階: 削除・移動・コピーを可逆化した
   (`REVERSIBLE_OPERATIONS.md` §5-6/第2段階の実装)。** 専用ツール
   `delete_file`/`delete_directory`/`move_file`/`copy_file`を追加。削除は即時

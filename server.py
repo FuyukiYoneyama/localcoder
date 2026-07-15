@@ -124,6 +124,36 @@ LEDGER_DIR_NAME = ".localcoder"                    # ワークスペース配下
 TXN_SUBDIR = Path(LEDGER_DIR_NAME) / "transactions"
 TXN_ID_RE = re.compile(r"^[0-9]{8}-[0-9]{6}-[0-9a-f]{4}$")  # ロールバックAPIのid検証用
 
+# --- 外部送信ポリシー (REVERSIBLE_OPERATIONS.md 第3段階 §8) ---
+# 外部送信=管理範囲外への不可逆なコピー/状態変更。「危険なのは取り消せない
+# ネットへの書き込み」という設計原則の中核。既定は allow_recorded(従来通り無確認で
+# 実行するが、送信内容を台帳に必ず記録する)。deny にすると外部送信コマンドを実行
+# 前に拒否する。ask(実行前にUIで確認)はSSE往復の同期承認が必要なため現時点で未実装。
+EXTERNAL_SEND_POLICY = os.environ.get("LOCALCODER_EXTERNAL_SEND_POLICY", "allow_recorded")
+
+# run_command のコマンド文字列から「外部送信」を検出するヒューリスティック。
+# GET(取得)は安全側として対象外——POST/PUT/PATCH・アップロード・push・リモート
+# コピー/実行・パッケージ公開など、管理範囲外へ不可逆にデータを出す操作だけを拾う。
+# 誤検出より取りこぼしを避ける方針だが、シェルは自由度が高いため完全ではない
+# (難読化・変数展開・エイリアス等は捕捉しきれない。あくまで明白なケースの安全網)。
+_EXTERNAL_SEND_PATTERNS = [
+    (re.compile(r"\bgit\s+push\b"), "git push (リモートへのコミット反映)"),
+    (re.compile(r"\bcurl\b(?=.*(?:-X\s*(?:POST|PUT|PATCH|DELETE)\b|--request\s*(?:POST|PUT|PATCH|DELETE)\b|--data\b|--data-\w+\b|(?<!\w)-d\b|--form\b|(?<!\w)-F\b|--upload-file\b|(?<!\w)-T\b))", re.I | re.S),
+     "curl による送信/アップロード (POST/PUT/PATCH/DELETE/--data/--form/-T)"),
+    (re.compile(r"\bwget\b(?=.*(?:--post-data\b|--post-file\b|--method\s*=?\s*(?:POST|PUT)\b|--body-data\b|--body-file\b))", re.I | re.S),
+     "wget による送信 (--post-data/--post-file/--method=POST)"),
+    (re.compile(r"\b(?:scp|sftp)\b"), "scp/sftp (リモートへのファイル転送)"),
+    (re.compile(r"\brsync\b(?=.*\s[\w.-]+@?[\w.-]+:)", re.S), "rsync のリモート転送 (host:path 宛)"),
+    (re.compile(r"\bssh\b\s+(?!-)[\w.-]+@?[\w.-]+\s+\S"), "ssh によるリモートコマンド実行"),
+    (re.compile(r"\b(?:npm|yarn|pnpm)\s+publish\b"), "npm/yarn/pnpm publish (パッケージ公開)"),
+    (re.compile(r"\btwine\s+upload\b"), "twine upload (PyPI公開)"),
+    (re.compile(r"\bgh\s+release\s+(?:create|upload)\b"), "gh release (GitHubリリース公開/アップロード)"),
+    (re.compile(r"\baws\s+s3\s+(?:cp|sync|mv)\b(?=.*\bs3://)", re.S), "aws s3 へのアップロード"),
+    (re.compile(r"\bgsutil\s+(?:cp|rsync|mv)\b(?=.*\bgs://)", re.S), "gsutil (GCSへのアップロード)"),
+    (re.compile(r"\bgit\s+send-email\b|\b(?:sendmail|mail|mailx|mutt)\b"), "メール送信"),
+    (re.compile(r"\bdocker\s+push\b"), "docker push (レジストリへのイメージ公開)"),
+]
+
 CANCEL = {}            # sid -> threading.Event
 SELF_CHECK_RESULTS = []  # 起動時セルフチェックの結果。main()で1回だけ設定される
 HISTORY_DIR = ROOT / "history"   # チャット履歴の保存先 (1会話 = 1 JSONファイル)
@@ -373,6 +403,11 @@ def run_self_check() -> list[dict]:
     bad_roots = [str(p) for p in ALLOWED_ROOTS if not p.is_dir()]
     add("allowed roots", not bad_roots,
         "全て有効" if not bad_roots else f"存在しないパス: {', '.join(bad_roots)}")
+
+    # 外部送信ポリシー(§8)。既知の値でなければ警告(未知値はallow_recorded扱いで動く)
+    add("外部送信ポリシー", EXTERNAL_SEND_POLICY in ("allow_recorded", "deny"),
+        EXTERNAL_SEND_POLICY if EXTERNAL_SEND_POLICY in ("allow_recorded", "deny")
+        else f"未知の値 '{EXTERNAL_SEND_POLICY}' (allow_recorded扱い)")
 
     try:
         probe = HISTORY_DIR / ".selfcheck_probe"
@@ -642,11 +677,12 @@ class Transaction:
         self.started_at = time.time()
         self.status = "open"
         self.operations: list[dict] = []
+        self.external_sends: list[dict] = []   # 第3段階(§8): 外部送信の台帳
         self._seen: set[str] = set()   # 記録済みrelpath(1ファイル=1オペレーション)
 
     @property
     def has_ops(self) -> bool:
-        return bool(self.operations)
+        return bool(self.operations) or bool(self.external_sends)
 
     def _rel(self, f: Path) -> str:
         return str(f.resolve().relative_to(self.ws))
@@ -761,13 +797,23 @@ class Transaction:
         """公開版: mkdir前にtargetの親で新規作成される相対パス一覧を得る。"""
         return self._created_dirs_for(self.ws, target)
 
+    def record_external_send(self, cmd: str, reasons: list, executed: bool) -> None:
+        """run_commandで外部送信が検出された時に呼ぶ(§8)。送信内容(コマンド全文)・
+        検出理由・ポリシーで実際に実行したかを台帳へ記録する。ファイル操作が無くても
+        外部送信だけで台帳を残す(has_opsがexternal_sendsも見るのはこのため)。"""
+        self._ensure_dir()
+        self.external_sends.append({
+            "at": time.time(), "command": cmd, "reasons": reasons,
+            "policy": EXTERNAL_SEND_POLICY, "executed": executed})
+        self._write_manifest()
+
     def _manifest(self) -> dict:
         return {"transaction_id": self.id,
                 "started_at": self.started_at,
                 "workspace": str(self.ws),
                 "status": self.status,
                 "operations": self.operations,
-                "external_sends": []}  # 第3段階(外部送信の台帳、§8)用の置き場
+                "external_sends": self.external_sends}
 
     def _write_manifest(self) -> None:
         atomic_write(self.dir / "manifest.json",
@@ -928,6 +974,20 @@ def reapply_transaction(ws: Path, txn_id: str) -> dict:
     manifest["status"] = "reapplied"
     atomic_write(mpath, json.dumps(manifest, ensure_ascii=False, indent=1))
     return {"ok": True, "reapplied": reapplied}
+
+
+def classify_external_send(cmd: str) -> list:
+    """run_commandのコマンド文字列から外部送信の兆候を検出する(§7-C/§8)。
+
+    マッチした理由(人間可読)のリストを返す。空なら外部送信は検出されなかった
+    (=ローカル完結とみなす)。GET等の取得系は安全側として拾わない。ヒューリスティック
+    のため、難読化・変数展開・エイリアスは捕捉できない(明白なケースの安全網)。
+    """
+    reasons = []
+    for pat, label in _EXTERNAL_SEND_PATTERNS:
+        if pat.search(cmd):
+            reasons.append(label)
+    return reasons
 
 
 def save_full_tool_output(sid: str | None, call_id: str | None, content: str) -> None:
@@ -1101,7 +1161,22 @@ class BuiltinToolProvider:
         pending_images = ctx.pending_images
         try:
             if name == "run_command":
-                return run_command(args["command"], ws, cancel,
+                cmd = args["command"]
+                # 外部送信ポリシー(§8): 取り消せないネットへの書き込みだけを別扱いする
+                reasons = classify_external_send(cmd)
+                if reasons:
+                    if EXTERNAL_SEND_POLICY == "deny":
+                        if ctx.txn is not None:
+                            ctx.txn.record_external_send(cmd, reasons, executed=False)
+                        return ("ERROR: この操作は外部への送信(取り消せないネットワーク"
+                                "書き込み)を含むため、現在のポリシー(deny)では実行"
+                                f"できません。検出理由: {'; '.join(reasons)}。"
+                                "ユーザーに実行を依頼するか、内容を確認の上で手動実行"
+                                "してもらってください。")
+                    # allow_recorded(既定): 従来通り実行するが、送信内容を台帳に必ず残す
+                    if ctx.txn is not None:
+                        ctx.txn.record_external_send(cmd, reasons, executed=True)
+                return run_command(cmd, ws, cancel,
                                    sid=ctx.sid, call_id=ctx.call_id)
             if name == "read_file":
                 f = resolve_path(ws, args["path"])
@@ -2449,6 +2524,7 @@ class Handler(BaseHTTPRequestHandler):
                 # 可逆操作レイヤー: 台帳に操作があればUIに「元に戻す」を出せる
                 "txn_id": txn.id if txn.has_ops else None,
                 "txn_ops": len(txn.operations),
+                "external_sends": len(txn.external_sends),  # 外部送信の件数(§8)
                 "workspace": str(wsr),
             }})
             # システムプロンプトを除いた全履歴を返す(次ターンで文脈維持)
@@ -2491,7 +2567,8 @@ class Handler(BaseHTTPRequestHandler):
                     "changed_files_count": len(extract_changed_files(messages[1:])),
                     "unverified_changes_count": len(find_unverified_changes(messages[1:])),
                     "txn_id": txn.id if txn.has_ops else None,
-                    "txn_ops": len(txn.operations)}
+                    "txn_ops": len(txn.operations),
+                    "external_sends": len(txn.external_sends)}
             if len(messages) > 1:
                 try:
                     save_session(sid, model, str(ws), messages[1:], turn=turn)

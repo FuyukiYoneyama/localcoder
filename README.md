@@ -73,14 +73,18 @@ wsl -d ubuntu-24.04 -- bash -lc "python3 ~/localcoder/server.py"
   から `powershell.exe -NoProfile -Command "..."` で実行できる(WSL相互運用)。
   許可範囲は環境変数 `LOCALCODER_ALLOWED_ROOTS`(コロン区切り)で変更でき、`$HOME`
   だけに戻すことも可能
-- 可逆操作レイヤー(第1〜2段階): ファイルの変更・削除・移動・コピーを書き込み
+- 可逆操作レイヤー(第1〜3段階): ファイルの変更・削除・移動・コピーを書き込み
   前に変更前状態としてワークスペース配下 `.localcoder/transactions/` へ自動保存し
   (1リクエスト=1トランザクション)、ターン終了サマリーの「⎌ このターンの変更を
   元に戻す」ボタンでいつでも復元できる(再適用=redoも可)。write_file/edit_fileは
   原子的書き込み、削除は専用ゴミ箱へ退避。削除・移動には専用ツール
   (delete_file/delete_directory/move_file/copy_file)があり、生の`rm`/`mv`より
   優先される(前者は戻せるが後者は戻せない)。読み取りだけのターンでは何も
-  作られない。設計の全体像は [REVERSIBLE_OPERATIONS.md](REVERSIBLE_OPERATIONS.md) 参照
+  作られない。取り消せない「外部送信」(git push・アップロード・POST等)は
+  run_commandから検出して台帳に記録し、環境変数
+  `LOCALCODER_EXTERNAL_SEND_POLICY=deny` で実行前に拒否もできる(既定は
+  allow_recorded=実行するが記録する)。設計の全体像は
+  [REVERSIBLE_OPERATIONS.md](REVERSIBLE_OPERATIONS.md) 参照
 - 履歴の自動圧縮: 会話がコンテキスト長(32K)に近づくと、古いツール結果の切り詰め →
   古い会話のLLM要約への置換、を自動で行う (画面に 🗜 表示)。長い会話でも
   システムプロンプトや直近の文脈が押し出されて壊れることがない

@@ -101,8 +101,10 @@ class TestRunSelfCheck(unittest.TestCase):
         s.HISTORY_DIR = Path(self._tmpdir.name) / "also" / "gone"
         with patch("server.urllib.request.urlopen", side_effect=OSError("x")):
             checks = s.run_self_check()  # 例外を投げず、全項目ok=Falseで返る
-        self.assertTrue(all(not c["ok"] for c in checks
-                            if c["name"] != "pdftotext(poppler-utils)"))
+        # pdftotextと外部送信ポリシーは外部依存やパスに紐づかない静的チェックなので、
+        # 「全て失敗」シナリオでも正常(ok=True)になりうる——除外する。
+        exempt = {"pdftotext(poppler-utils)", "外部送信ポリシー"}
+        self.assertTrue(all(not c["ok"] for c in checks if c["name"] not in exempt))
 
     def test_mcp_check_absent_when_no_config(self):
         with patch("server.urllib.request.urlopen", side_effect=OSError("x")):

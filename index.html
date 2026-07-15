@@ -293,6 +293,7 @@ function summaryCard(data){
   ];
   if(fileCount)parts.push("<span>変更: <b>"+fileCount+"ファイル</b></span>");
   if(unverifiedCount)parts.push("<span>⚠ 未検証: <b>"+unverifiedCount+"ファイル</b></span>");
+  if(data.external_sends)parts.push("<span>📤 外部送信: <b>"+data.external_sends+"件</b></span>");
   if(data.compact_count)parts.push("<span>🗜 圧縮: <b>"+data.compact_count+"回</b></span>");
   d.innerHTML=parts.join("");
   const titleParts=[];
@@ -361,6 +362,7 @@ function renderHistory(msgs,turns){
     summaryCard({status:t.status, duration_seconds:Math.round((t.ended_at-t.started_at)*10)/10,
       tool_call_count:t.tool_call_count||0, compact_count:t.compact_count||0,
       changed_files:t.changed_files_count||0, unverified_changes:t.unverified_changes_count||0,
+      external_sends:t.external_sends||0,
       txn_id:t.txn_id||null, txn_ops:t.txn_ops||0, workspace:$("workspace").value});
   }
   scroll();

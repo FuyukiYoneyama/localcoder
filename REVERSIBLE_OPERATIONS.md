@@ -362,13 +362,29 @@ GET  /api/transactions/<id>/diff
 サマリーカードの変更ファイル数はdelete/move/copyのdstも数える。単体テスト
 14件を追加(第1段階と合わせて`tests/test_transactions.py`が40件)。
 
-### 第3段階: 任意コマンドと外部送信
+### 第3段階: 任意コマンドと外部送信 【一部実装済み 2026-07-15】
 
-1. `run_command`前後のファイル差分検出
-2. Git差分保存
-3. 外部送信コマンドの分類
-4. `git push`等の専用ツール化
-5. 外部送信ポリシーの追加
+1. `run_command`前後のファイル差分検出 ⏸ 未実装(観測用。可逆化には直結しない
+   ため後回し。run_commandの変更は元々自動ロールバック対象外)
+2. Git差分保存 ⏸ 未実装(同上)
+3. 外部送信コマンドの分類 ✅ `classify_external_send(cmd)`。git push /
+   curl・wgetの送信系(POST/PUT/PATCH/--data/--form/-T/アップロード) /
+   scp・sftp / rsync・sshのリモート / npm・yarn・twine・gh release・docker
+   push等の公開 / aws s3・gsutilアップロード / メール送信 を検出する
+   ヒューリスティック(取得=GETは対象外。難読化・変数展開は捕捉外の安全網)
+4. `git push`等の専用ツール化 ⏸ 未実装(run_commandでの検出+ポリシーで
+   当面の安全目標は満たせるため、専用ツール化は必要になった時点で追加)
+5. 外部送信ポリシーの追加 ✅ 環境変数`LOCALCODER_EXTERNAL_SEND_POLICY`。
+   `allow_recorded`(既定・従来通り実行するが送信内容を台帳へ必ず記録)と
+   `deny`(実行前に拒否)を実装。`ask`(実行前にUIで同期確認)はSSEの往復承認が
+   必要で複雑なため未実装——`deny`/`allow_recorded`で安全上意味のある選択は
+   カバーできる
+
+実装メモ: 「危険なのは取り消せないネットへの書き込み」という原則の中核。
+外部送信は`manifest.json`の`external_sends`配列(コマンド全文・検出理由・
+ポリシー・実際に実行したか)に記録され、サマリーカードに「📤 外部送信: N件」を表示。
+起動時セルフチェックに「外部送信ポリシー」項目を追加。単体テスト9件を追加
+(`tests/test_external_send.py`。可逆操作レイヤー全体で計49件)。
 
 ## 14. 設計上の到達点
 
