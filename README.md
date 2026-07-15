@@ -70,6 +70,12 @@ wsl -d ubuntu-24.04 -- bash -lc "python3 ~/localcoder/server.py"
   から `powershell.exe -NoProfile -Command "..."` で実行できる(WSL相互運用)。
   許可範囲は環境変数 `LOCALCODER_ALLOWED_ROOTS`(コロン区切り)で変更でき、`$HOME`
   だけに戻すことも可能
+- 可逆操作レイヤー(第1段階): write_file/edit_file は書き込み前に変更前状態を
+  ワークスペース配下 `.localcoder/transactions/` へ自動保存し(1リクエスト=
+  1トランザクション)、ターン終了サマリーの「⎌ このターンの変更を元に戻す」
+  ボタンでいつでも復元できる(再適用=redoも可)。書き込み自体も原子的
+  (一時ファイル+os.replace)。読み取りだけのターンでは何も作られない。
+  設計の全体像は [REVERSIBLE_OPERATIONS.md](REVERSIBLE_OPERATIONS.md) 参照
 - 履歴の自動圧縮: 会話がコンテキスト長(32K)に近づくと、古いツール結果の切り詰め →
   古い会話のLLM要約への置換、を自動で行う (画面に 🗜 表示)。長い会話でも
   システムプロンプトや直近の文脈が押し出されて壊れることがない

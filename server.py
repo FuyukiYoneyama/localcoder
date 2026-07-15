@@ -119,6 +119,11 @@ GOAL_LINE_RE = re.compile(r"^GOAL:[ \t]*(.*)$", re.MULTILINE)  # 要約LLM出力
 # ([ \t]*であって\s*ではない点に注意: \sは改行にもマッチするため、GOAL値が空の
 # 場合に次行の内容まで巻き込んで抽出してしまうバグが実際にあった)
 
+# --- 可逆操作レイヤー (REVERSIBLE_OPERATIONS.md 第1段階: ファイル編集の可逆化) ---
+LEDGER_DIR_NAME = ".localcoder"                    # ワークスペース配下の台帳置き場
+TXN_SUBDIR = Path(LEDGER_DIR_NAME) / "transactions"
+TXN_ID_RE = re.compile(r"^[0-9]{8}-[0-9]{6}-[0-9a-f]{4}$")  # ロールバックAPIのid検証用
+
 CANCEL = {}            # sid -> threading.Event
 SELF_CHECK_RESULTS = []  # 起動時セルフチェックの結果。main()で1回だけ設定される
 HISTORY_DIR = ROOT / "history"   # チャット履歴の保存先 (1会話 = 1 JSONファイル)
@@ -555,6 +560,206 @@ def list_subdirs(path: str) -> dict:
     return {"path": str(p), "parent": parent, "dirs": dirs}
 
 
+# ---------- 可逆操作レイヤー (REVERSIBLE_OPERATIONS.md 第1段階) ----------
+def atomic_write(path: Path, content: str) -> None:
+    """一時ファイルへ書いてから os.replace で置き換える原子的書き込み(§4.2)。
+
+    プロセス停止や書き込みエラーで対象ファイルが中途半端な内容になるのを防ぐ。
+    一時ファイルは同一ディレクトリに作る(os.replaceが同一ファイルシステム内で
+    のみ原子的なため)。
+    """
+    temp = path.with_name(f".{path.name}.localcoder-tmp")
+    with temp.open("w", encoding="utf-8") as f:
+        f.write(content)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temp, path)
+
+
+def atomic_write_bytes(path: Path, data: bytes) -> None:
+    temp = path.with_name(f".{path.name}.localcoder-tmp")
+    with temp.open("wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temp, path)
+
+
+def in_ledger_area(ws: Path, f: Path) -> bool:
+    """fがワークスペースの台帳領域(.localcoder)配下か。
+
+    write_file/edit_fileから保護する——モデルが台帳自体を書き換えられると
+    「操作前の状態へ確実に戻せる」という可逆性の保証が壊れるため。
+    """
+    ledger = ws.resolve() / LEDGER_DIR_NAME
+    fr = f.resolve()
+    return fr == ledger or str(fr).startswith(str(ledger) + os.sep)
+
+
+class Transaction:
+    """1回の/api/chatリクエスト内のファイル操作を記録し、ターン単位で元に戻せる
+    ようにする台帳 (REVERSIBLE_OPERATIONS.md §2〜§4)。
+
+    - 置き場所はワークスペース配下 `.localcoder/transactions/<id>/`。最初の
+      書き込みが起きるまで何も作らない(読み取りだけのターンでは痕跡ゼロ)。
+    - 同じファイルを1ターン中に何度変更しても、変更前状態の保存は最初の1回だけ
+      (§3)。これでトランザクション開始前の状態へ戻せる。
+    - manifest.jsonは操作のたびに書き直す(ターン途中でプロセスが落ちても、
+      そこまでの操作は台帳に残り、ロールバック可能なまま)。
+    """
+
+    def __init__(self, ws: Path):
+        self.ws = ws.resolve()
+        self.id = time.strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(2)
+        self.dir = self.ws / TXN_SUBDIR / self.id
+        self.started_at = time.time()
+        self.status = "open"
+        self.operations: list[dict] = []
+        self._seen: set[str] = set()   # 記録済みrelpath(1ファイル=1オペレーション)
+
+    @property
+    def has_ops(self) -> bool:
+        return bool(self.operations)
+
+    def _rel(self, f: Path) -> str:
+        return str(f.resolve().relative_to(self.ws))
+
+    def record_before_write(self, f: Path) -> None:
+        """write_file/edit_fileの書き込み直前(親ディレクトリ作成よりも前)に呼ぶ。
+        変更前状態を保存する(§4.1)。"""
+        rel = self._rel(f)
+        if rel in self._seen:
+            return
+        self._seen.add(rel)
+        self.dir.mkdir(parents=True, exist_ok=True)
+        # ユーザーのgitリポジトリを台帳で汚さないよう、.localcoder自体を無視させる
+        gi = self.ws / LEDGER_DIR_NAME / ".gitignore"
+        if not gi.exists():
+            gi.write_text("*\n")
+        if f.is_file():
+            data = f.read_bytes()
+            st = f.stat()
+            backup = self.dir / "before" / rel
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            backup.write_bytes(data)
+            op = {"type": "write", "path": rel, "existed_before": True,
+                  "before_sha256": hashlib.sha256(data).hexdigest(),
+                  "before_mode": st.st_mode, "before_mtime": st.st_mtime,
+                  "backup_path": str(Path("before") / rel)}
+        else:
+            # 新規作成。ロールバック時に(空になっていれば)取り除くべき
+            # 新規親ディレクトリも深い順に記録する(§4.1)。
+            created_dirs = []
+            d = f.parent
+            while d != self.ws and not d.exists():
+                created_dirs.append(self._rel(d))
+                d = d.parent
+            op = {"type": "create", "path": rel, "existed_before": False,
+                  "created_dirs": created_dirs}
+        self.operations.append(op)
+        self._write_manifest()
+
+    def _manifest(self) -> dict:
+        return {"transaction_id": self.id,
+                "started_at": self.started_at,
+                "workspace": str(self.ws),
+                "status": self.status,
+                "operations": self.operations,
+                "external_sends": []}  # 第3段階(外部送信の台帳、§8)用の置き場
+
+    def _write_manifest(self) -> None:
+        atomic_write(self.dir / "manifest.json",
+                     json.dumps(self._manifest(), ensure_ascii=False, indent=1))
+
+    def finalize(self, status: str) -> None:
+        """ターン終了時に呼ぶ。書き込みが1件も無ければ(dir未作成のまま)何もしない。"""
+        if not self.has_ops:
+            return
+        self.status = status
+        self._write_manifest()
+
+
+def _txn_manifest_path(ws: Path, txn_id: str) -> Path:
+    if not TXN_ID_RE.fullmatch(txn_id):
+        raise ValueError(f"不正なトランザクションID: {txn_id!r}")
+    return ws / TXN_SUBDIR / txn_id / "manifest.json"
+
+
+def rollback_transaction(ws: Path, txn_id: str) -> dict:
+    """トランザクションの操作を逆順に取り消し、開始前の状態へ復元する(§12)。
+
+    ロールバック自体も可逆にするため、戻す直前の各ファイルの内容を after/ へ
+    退避してから復元する(誤ロールバックはreapply_transactionで再適用できる)。
+    manifest内のパスはresolve_pathで検証するため、台帳が改竄されていても
+    ワークスペース外のファイルには触れない。
+    """
+    ws = ws.resolve()
+    mpath = _txn_manifest_path(ws, txn_id)
+    if not mpath.is_file():
+        raise FileNotFoundError(f"トランザクションが見つかりません: {txn_id}")
+    manifest = json.loads(mpath.read_text(encoding="utf-8"))
+    if manifest.get("status") == "rolled_back":
+        raise ValueError("このトランザクションは既にロールバック済みです")
+    tdir = mpath.parent
+    restored = removed = 0
+    for op in reversed(manifest.get("operations", [])):
+        f = resolve_path(ws, op["path"])
+        if f.is_file():   # 現在の内容をafter/へ退避(再適用=redo用)
+            after = tdir / "after" / op["path"]
+            after.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_bytes(after, f.read_bytes())
+        if op.get("existed_before"):
+            backup = tdir / "before" / op["path"]
+            f.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_bytes(f, backup.read_bytes())
+            if op.get("before_mode") is not None:
+                try:
+                    os.chmod(f, op["before_mode"])
+                except OSError:
+                    pass
+            restored += 1
+        else:
+            if f.is_file():
+                f.unlink()
+            removed += 1
+            for rel in op.get("created_dirs", []):
+                d = resolve_path(ws, rel)
+                try:
+                    d.rmdir()   # 空の場合だけ消える(他の生成物があれば残す)
+                except OSError:
+                    pass
+    manifest["status"] = "rolled_back"
+    atomic_write(mpath, json.dumps(manifest, ensure_ascii=False, indent=1))
+    return {"ok": True, "restored": restored, "removed": removed}
+
+
+def reapply_transaction(ws: Path, txn_id: str) -> dict:
+    """ロールバック済みトランザクションの変更を再適用する(§11のredo)。
+
+    ロールバック時にafter/へ退避した「戻す直前の状態」を各ファイルへ書き戻す。
+    再適用後にもう一度rollback_transactionを呼べば再び戻せる(undo/redoの往復)。
+    """
+    ws = ws.resolve()
+    mpath = _txn_manifest_path(ws, txn_id)
+    if not mpath.is_file():
+        raise FileNotFoundError(f"トランザクションが見つかりません: {txn_id}")
+    manifest = json.loads(mpath.read_text(encoding="utf-8"))
+    if manifest.get("status") != "rolled_back":
+        raise ValueError("ロールバック済みのトランザクションだけ再適用できます")
+    tdir = mpath.parent
+    reapplied = 0
+    for op in manifest.get("operations", []):
+        f = resolve_path(ws, op["path"])
+        after = tdir / "after" / op["path"]
+        if after.is_file():
+            f.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_bytes(f, after.read_bytes())
+            reapplied += 1
+    manifest["status"] = "reapplied"
+    atomic_write(mpath, json.dumps(manifest, ensure_ascii=False, indent=1))
+    return {"ok": True, "reapplied": reapplied}
+
+
 def save_full_tool_output(sid: str | None, call_id: str | None, content: str) -> None:
     """出力がモデル向けに切り詰められた場合、完全な内容を診断用に別途保存する
     (IMPROVEMENTS.md §4.2)。12KBを超える出力の中間にビルドエラー等の重要な
@@ -677,11 +882,13 @@ class ToolContext:
     個々のツール実装は元exec_toolの引数を直接見るのではなく、これ経由でアクセス
     する。将来MCPツールプロバイダを追加する際も同じ形で渡せる。
     """
-    __slots__ = ("ws", "cancel", "model", "pending_images", "sid", "call_id", "messages")
+    __slots__ = ("ws", "cancel", "model", "pending_images", "sid", "call_id",
+                 "messages", "txn")
 
     def __init__(self, ws: Path, cancel=None, model: str | None = None,
                  pending_images: list | None = None, sid: str | None = None,
-                 call_id: str | None = None, messages: list | None = None):
+                 call_id: str | None = None, messages: list | None = None,
+                 txn: Transaction | None = None):
         self.ws = ws
         self.cancel = cancel
         self.model = model
@@ -692,6 +899,9 @@ class ToolContext:
         # 読んだ時と内容が変わっていないか」を調べるために会話履歴を参照する。
         # Noneなら(exec_toolの既存呼び出し元・テスト等)チェックを単純に省略する。
         self.messages = messages
+        # 可逆操作レイヤー(REVERSIBLE_OPERATIONS.md)のターン台帳。Noneなら
+        # 記録なしで従来通り動く(テスト・レガシー呼び出し元の後方互換)。
+        self.txn = txn
 
 
 class ToolProvider(Protocol):
@@ -740,11 +950,19 @@ class BuiltinToolProvider:
                 return t
             if name == "write_file":
                 f = resolve_path(ws, args["path"])
+                if in_ledger_area(ws, f):
+                    return ("ERROR: .localcoder/ is LocalCoder's transaction ledger "
+                            "and must not be modified by tools")
+                if ctx.txn is not None:
+                    ctx.txn.record_before_write(f)  # mkdirより前(新規親dir検出のため)
                 f.parent.mkdir(parents=True, exist_ok=True)
-                f.write_text(args["content"])
+                atomic_write(f, args["content"])
                 return f"OK: wrote {len(args['content'])} chars to {args['path']}"
             if name == "edit_file":
                 f = resolve_path(ws, args["path"])
+                if in_ledger_area(ws, f):
+                    return ("ERROR: .localcoder/ is LocalCoder's transaction ledger "
+                            "and must not be modified by tools")
                 old, new = args["old_string"], args["new_string"]
                 if not old:
                     return "ERROR: old_string must not be empty"
@@ -763,7 +981,9 @@ class BuiltinToolProvider:
                     return (f"ERROR: old_string occurs {n} times. Include more "
                             "surrounding lines to make it unique, or set "
                             "replace_all=true to replace every occurrence.")
-                f.write_text(t.replace(old, new))
+                if ctx.txn is not None:
+                    ctx.txn.record_before_write(f)
+                atomic_write(f, t.replace(old, new))
                 return (f"OK: replaced {n if args.get('replace_all') else 1} "
                         f"occurrence(s) in {args['path']}")
             if name == "list_dir":
@@ -1027,13 +1247,15 @@ def _provider_for_tool(name: str) -> ToolProvider | None:
 
 def exec_tool(name: str, args: dict, ws: Path, cancel=None, model: str | None = None,
               pending_images: list | None = None, sid: str | None = None,
-              call_id: str | None = None, messages: list | None = None) -> str:
+              call_id: str | None = None, messages: list | None = None,
+              txn: Transaction | None = None) -> str:
     """後方互換の薄いエントリポイント。実際のディスパッチはToolProvider経由で行う
     (IMPROVEMENTS.md §13.2)。呼び出し側(handle_chat)・既存テストの引数はそのまま。
-    messagesは差分中心の再読(§6.3)用の追加引数で、省略時は従来通り動作する。
+    messagesは差分中心の再読(§6.3)用、txnは可逆操作レイヤー
+    (REVERSIBLE_OPERATIONS.md)用の追加引数で、省略時は従来通り動作する。
     """
     ctx = ToolContext(ws=ws, cancel=cancel, model=model, pending_images=pending_images,
-                      sid=sid, call_id=call_id, messages=messages)
+                      sid=sid, call_id=call_id, messages=messages, txn=txn)
     provider = _provider_for_tool(name)
     if provider is None:
         return f"ERROR: unknown tool {name}"
@@ -1760,10 +1982,36 @@ class Handler(BaseHTTPRequestHandler):
                 f.unlink()
             self._json({"ok": True})
             return
+        if self.path == "/api/transaction/rollback":
+            self._handle_txn_action(rollback_transaction)
+            return
+        if self.path == "/api/transaction/reapply":
+            self._handle_txn_action(reapply_transaction)
+            return
         if self.path == "/api/chat":
             self.handle_chat()
             return
         self._json({"error": "not found"}, 404)
+
+    def _handle_txn_action(self, fn):
+        """「今回の操作を元に戻す/再適用」(REVERSIBLE_OPERATIONS.md §12)。
+
+        workspaceはチャットと同じ許可検証(under_allowed)を通し、トランザクション
+        IDは形式検証(TXN_ID_RE)される。台帳内のパスもワークスペース外なら拒否
+        されるため、リクエストや台帳の改竄で任意ファイルには触れない。
+        """
+        body = self._read_body()
+        ws = Path(str(body.get("workspace") or "")).expanduser()
+        txn_id = str(body.get("txn_id") or "")
+        if not ws.is_dir() or not under_allowed(ws.resolve()):
+            self._json({"error": f"不正なワークスペース: {ws}"}, 400)
+            return
+        try:
+            self._json(fn(ws.resolve(), txn_id))
+        except (ValueError, FileNotFoundError) as e:
+            self._json({"error": str(e)}, 400)
+        except Exception as e:  # noqa: BLE001
+            self._json({"error": f"{type(e).__name__}: {e}"}, 500)
 
     def handle_chat(self):
         turn_started_at = time.time()  # プロンプト受信時刻 (中断/完了時刻とセットで記録する)
@@ -1805,6 +2053,9 @@ class Handler(BaseHTTPRequestHandler):
                            + "\n".join(mcp_lines))
         messages = [{"role": "system", "content": sys_prompt}]
         messages += body.get("messages", [])
+        # 可逆操作レイヤー(REVERSIBLE_OPERATIONS.md): 1リクエスト=1トランザクション。
+        # 書き込みが1件も無ければディスクには何も作られない。
+        txn = Transaction(wsr)
         empty_retries = 0
         http_retries = 0
         last_failed_sig = None  # 直前の失敗ツール呼び出し(名前+引数)の署名。連続失敗検出用
@@ -1919,7 +2170,7 @@ class Handler(BaseHTTPRequestHandler):
                     result = exec_tool(name, args, ws, ev, model=model,
                                        pending_images=pending_images,
                                        sid=sid, call_id=tc.get("id"),
-                                       messages=messages)
+                                       messages=messages, txn=txn)
                     diag_tool_call_count += 1
                     diag_tool_exec_seconds += time.time() - _tool_started
                     self._sse({"type": "tool_end", "name": name,
@@ -1970,6 +2221,10 @@ class Handler(BaseHTTPRequestHandler):
                 "unverified_changes": find_unverified_changes(messages[1:]),
                 "tool_call_count": diag_tool_call_count,
                 "compact_count": diag_compact_count,
+                # 可逆操作レイヤー: 台帳に操作があればUIに「元に戻す」を出せる
+                "txn_id": txn.id if txn.has_ops else None,
+                "txn_ops": len(txn.operations),
+                "workspace": str(wsr),
             }})
             # システムプロンプトを除いた全履歴を返す(次ターンで文脈維持)
             self._sse({"type": "history", "messages": messages[1:]})
@@ -1989,6 +2244,13 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
         finally:
+            # トランザクション台帳を確定する(書き込みが無ければ何も残らない)。
+            # 停止・エラー時も自動ロールバックはしない——途中までの変更が有益な
+            # 場合があるため、ユーザーが保持/復元を選ぶ(REVERSIBLE_OPERATIONS.md §10)。
+            try:
+                txn.finalize(turn_status)
+            except Exception:
+                pass
             # 会話を自動保存 (エラーや途中停止でもそこまでの内容を残す)
             # あわせて「プロンプトを受けてから完了/中断するまで」の時刻も記録する
             turn = {"started_at": turn_started_at, "ended_at": time.time(),
@@ -2002,7 +2264,9 @@ class Handler(BaseHTTPRequestHandler):
                     "tool_exec_seconds": round(diag_tool_exec_seconds, 1),
                     "iterations_used": diag_iterations_used,
                     "changed_files_count": len(extract_changed_files(messages[1:])),
-                    "unverified_changes_count": len(find_unverified_changes(messages[1:]))}
+                    "unverified_changes_count": len(find_unverified_changes(messages[1:])),
+                    "txn_id": txn.id if txn.has_ops else None,
+                    "txn_ops": len(txn.operations)}
             if len(messages) > 1:
                 try:
                     save_session(sid, model, str(ws), messages[1:], turn=turn)

@@ -324,16 +324,24 @@ GET  /api/transactions/<id>/diff
 
 ## 13. 実装順序
 
-### 第1段階: ファイル編集の可逆化
+### 第1段階: ファイル編集の可逆化 【実装済み 2026-07-15】
 
-1. ターン単位のtransaction IDを発行
-2. `write_file` / `edit_file` の変更前バックアップ
-3. 原子的書き込み
-4. `manifest.json`への操作記録
-5. ロールバックAPI
-6. UIに「今回の操作を元に戻す」を追加
+1. ターン単位のtransaction IDを発行 ✅
+2. `write_file` / `edit_file` の変更前バックアップ ✅
+3. 原子的書き込み ✅
+4. `manifest.json`への操作記録 ✅
+5. ロールバックAPI ✅ (`POST /api/transaction/rollback`。§12のREST形パスではなく
+   既存エンドポイントと同じフラット形式にした。再適用=redoの
+   `POST /api/transaction/reapply`も同時に実装——ロールバック自体を可逆にする
+   ため、復元直前の状態を`after/`へ退避してから戻す)
+6. UIに「今回の操作を元に戻す」を追加 ✅ (ターン終了サマリーカード内。
+   履歴を開き直した後も`turns`の`txn_id`から同じ操作が可能)
 
-この段階でLocalCoder自身が直接行う主要なファイル編集は可逆になる。
+この段階でLocalCoder自身が直接行う主要なファイル編集は可逆になった。
+実装メモ: 台帳領域(`.localcoder/`)自体へのwrite_file/edit_fileは拒否する
+(モデルが台帳を書き換えると可逆性の保証が壊れるため)。`.localcoder/.gitignore`
+(内容は`*`)を自動作成し、ユーザーのgitリポジトリを台帳で汚さない。
+単体テストは`tests/test_transactions.py`(26件)。
 
 ### 第2段階: 削除・移動の可逆化
 

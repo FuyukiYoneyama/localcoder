@@ -64,9 +64,10 @@ details.tool pre{background:#0d0f14;padding:8px;border-radius:6px;overflow-x:aut
   border-radius:8px;padding:6px 14px;font-size:13px}
 .summary{align-self:flex-start;max-width:860px;width:fit-content;background:var(--panel2);
   border:1px solid var(--border);border-radius:8px;padding:6px 12px;font-size:12px;
-  color:var(--dim);display:flex;flex-wrap:wrap;gap:4px 14px}
+  color:var(--dim);display:flex;flex-wrap:wrap;gap:4px 14px;align-items:center}
 .summary b{color:var(--text)}
 .summary.status-stuck,.summary.status-max_iter{border-color:#4a3f24;color:#e0b04a}
+.summary .undoBtn{padding:2px 8px;font-size:11px}
 footer{display:flex;gap:10px;padding:12px 16px;background:var(--panel);border-top:1px solid var(--border)}
 #input{flex:1;background:var(--panel2);color:var(--text);border:1px solid var(--border);
   border-radius:8px;padding:10px;font-size:14px;resize:none;font-family:inherit;min-height:44px;max-height:200px}
@@ -298,6 +299,33 @@ function summaryCard(data){
   if(Array.isArray(files)&&files.length)titleParts.push("変更:\n"+files.join("\n"));
   if(Array.isArray(unverified)&&unverified.length)titleParts.push("未検証:\n"+unverified.join("\n"));
   if(titleParts.length)d.title=titleParts.join("\n\n");
+  // 可逆操作レイヤー: このターンの書き込みが台帳に記録されていれば
+  // undo(ロールバック)/redo(再適用)ボタンを出す (REVERSIBLE_OPERATIONS.md §11)
+  if(data.txn_id&&data.txn_ops){
+    const btn=document.createElement("button");
+    btn.className="undoBtn";
+    btn.textContent="⎌ このターンの変更を元に戻す";
+    let rolledBack=false;
+    btn.onclick=async()=>{
+      btn.disabled=true;
+      try{
+        const url=rolledBack?"/api/transaction/reapply":"/api/transaction/rollback";
+        const r=await(await post(url,{workspace:data.workspace,txn_id:data.txn_id})).json();
+        if(r.error){el("div","err","⚠ "+r.error)}
+        else if(rolledBack){
+          rolledBack=false;
+          el("div","notice","↪ 変更を再適用しました ("+(r.reapplied||0)+"ファイル)");
+          btn.textContent="⎌ このターンの変更を元に戻す";
+        }else{
+          rolledBack=true;
+          el("div","notice","↩ 変更を元に戻しました (復元"+(r.restored||0)+" / 削除"+(r.removed||0)+")");
+          btn.textContent="↪ 元に戻した変更を再適用";
+        }
+      }catch(e){el("div","err","⚠ "+e)}
+      btn.disabled=false;
+    };
+    d.appendChild(btn);
+  }
   chat.appendChild(d); scroll(); return d;
 }
 function imageBubble(images){
@@ -327,11 +355,13 @@ function renderHistory(msgs,turns){
     }
   }
   // 直近ターンの診断情報(保存済み)があれば末尾にサマリーを表示する。
+  // txn_id付きのターンなら、履歴を開き直した後でもundo/redoボタンが使える。
   if(turns&&turns.length){
     const t=turns[turns.length-1];
     summaryCard({status:t.status, duration_seconds:Math.round((t.ended_at-t.started_at)*10)/10,
       tool_call_count:t.tool_call_count||0, compact_count:t.compact_count||0,
-      changed_files:t.changed_files_count||0, unverified_changes:t.unverified_changes_count||0});
+      changed_files:t.changed_files_count||0, unverified_changes:t.unverified_changes_count||0,
+      txn_id:t.txn_id||null, txn_ops:t.txn_ops||0, workspace:$("workspace").value});
   }
   scroll();
 }
