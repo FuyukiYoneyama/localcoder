@@ -62,6 +62,11 @@ details.tool pre{background:#0d0f14;padding:8px;border-radius:6px;overflow-x:aut
 .err{align-self:center;color:var(--red);font-size:13px}
 .notice{align-self:center;color:#e0b04a;background:#2a2418;border:1px solid #4a3f24;
   border-radius:8px;padding:6px 14px;font-size:13px}
+details.review{align-self:flex-start;max-width:860px;width:fit-content;background:#16202e;
+  border:1px solid #2a4a6e;border-radius:8px;padding:6px 10px;font-size:13px}
+details.review summary{cursor:pointer;color:#6ab0f3}
+details.review .rbody{padding:6px 2px;font-size:12px;color:var(--dim);white-space:pre-wrap}
+details.review .rbody b{color:var(--text)}
 .summary{align-self:flex-start;max-width:860px;width:fit-content;background:var(--panel2);
   border:1px solid var(--border);border-radius:8px;padding:6px 12px;font-size:12px;
   color:var(--dim);display:flex;flex-wrap:wrap;gap:4px 14px;align-items:center}
@@ -276,7 +281,9 @@ async function openSession(id){
 }
 
 const STATUS_LABEL={completed:"完了",max_iter:"最大ループ到達",stuck:"同一失敗で停止",
-  stopped:"ユーザー停止",error:"エラー",disconnected:"切断"};
+  stopped:"ユーザー停止",error:"エラー",disconnected:"切断",
+  review_stop:"方針再評価で停止"};
+const DECISION_LABEL={continue:"継続",adjust:"調整",change:"方針変更",stop:"停止"};
 function summaryCard(data){
   // changed_files/unverified_changes: ライブ実行中はファイルパスの配列
   // (ツールチップに使う)。履歴再表示時は保存された件数しか無いため数値も許容する。
@@ -329,6 +336,38 @@ function summaryCard(data){
   }
   chat.appendChild(d); scroll(); return d;
 }
+function reviewCard(meta){
+  // 自動方針再評価(METACOGNITIVE_REPLANNING.md §15)。CONTINUEを含む全判定を表示し、
+  // 「一度検討したうえで現在の方向を続けている」ことをユーザーが確認できるようにする。
+  const r=meta.review||{};
+  const ns=r.next_step||{};
+  const ra=r.review_after||{};
+  const trig=meta.trigger||{};
+  const d=document.createElement("details");
+  d.className="review";
+  const s=document.createElement("summary");
+  s.textContent="🧭 作業方針を自動的に見直しました — 判定: "
+    +(DECISION_LABEL[r.decision]||r.decision||"?")
+    +(r.assessment?(" — "+r.assessment.slice(0,60)):"");
+  d.appendChild(s);
+  const body=document.createElement("div");
+  body.className="rbody";
+  const lines=[];
+  if(trig.reasons&&trig.reasons.length)lines.push("発火理由: "+trig.reasons.join(", "));
+  if(r.assessment)lines.push("評価: "+r.assessment);
+  for(const e of (r.evidence||[]))lines.push("根拠: "+e);
+  for(const c of (r.counterevidence||[]))lines.push("反証・懸念: "+c);
+  if(ns.action)lines.push("次の行動: "+ns.action);
+  if(ns.expected_result)lines.push("期待結果: "+ns.expected_result);
+  if(ns.failure_means)lines.push("失敗時に分かること: "+ns.failure_means);
+  const cond=[];
+  if(ra.tool_calls)cond.push("あと"+ra.tool_calls+"ツール");
+  if(ra.max_seconds)cond.push(ra.max_seconds+"秒後");
+  if(cond.length)lines.push("次回評価: "+cond.join(" または "));
+  body.textContent=lines.join("\n");
+  d.appendChild(body);
+  chat.appendChild(d); scroll(); return d;
+}
 function imageBubble(images){
   const d=document.createElement("div"); d.className="msg assistant imgmsg";
   for(const b64 of images){
@@ -353,6 +392,8 @@ function renderHistory(msgs,turns){
     }else if(m.role==="tool"){
       const d=pending.shift();
       if(d)d.querySelector("pre").textContent=m.content;
+    }else if(m.role==="localcoder_meta"&&m.meta_type==="strategy_review"){
+      reviewCard(m);
     }
   }
   // 直近ターンの診断情報(保存済み)があれば末尾にサマリーを表示する。
@@ -449,6 +490,8 @@ async function send(){
       el("div","think","🗜 "+ev.message);
     }else if(ev.type==="summary"){
       summaryCard(ev.data);
+    }else if(ev.type==="strategy_review"){
+      reviewCard(ev.data);
     }else if(ev.type==="notice"){
       el("div","notice","🔔 "+ev.message);
     }else if(ev.type==="history"){

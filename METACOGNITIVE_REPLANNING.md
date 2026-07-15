@@ -589,24 +589,40 @@ CONTINUE
 
 ## 17. 段階的実装
 
-### 第1段階: 最小仕様
+### 第1段階: 最小仕様 【実装済み 2026-07-15】
 
-- ツールなしの再評価呼び出し
-- 4種類の判定
-- JSON検証
-- `CONTINUE`の根拠・期待結果・再評価条件を必須化
-- `localcoder_meta`保存
-- 次回呼び出しへの再提示
-- SSE通知
+- ツールなしの再評価呼び出し ✅ (`run_review_pass`。`REVIEW_SYSTEM_PROMPT`+
+  機械的に組み立てた`build_review_context`のみを渡し、toolsは渡さない)
+- 4種類の判定 ✅ (`continue`/`adjust`/`change`/`stop`。stopはターンを
+  `review_stop`として停止)
+- JSON検証 ✅ (`parse_review_output`+`validate_review_decision`。壊れていたら
+  1回だけ修正要求、それでも失敗なら不採用で通常作業を続行)
+- `CONTINUE`の根拠・期待結果・再評価条件を必須化 ✅ (§7の採用条件を
+  `validate_review_decision`で機械的に強制)
+- `localcoder_meta`保存 ✅ (role=`localcoder_meta`のメッセージとして履歴に永続化。
+  Ollamaへの入力からは`to_ollama_messages`で除外)
+- 次回呼び出しへの再提示 ✅ (`format_review_for_dashboard`が作業状態
+  ダッシュボードに「現在の実行方針」ブロックを毎回差し込む)
+- SSE通知 ✅ (`strategy_review`イベント。UIは🧭カードで全判定を表示、
+  履歴を開き直しても再表示される)
 
-### 第2段階: 初期発火条件
+### 第2段階: 初期発火条件 【実装済み 2026-07-15】
 
-- 12ツール呼び出し
-- 同じ失敗2回
-- 空応答回復後
-- 圧縮後4ツール
-- 8ツール進捗なし
-- `review_after`期限到達
+- 12ツール呼び出し ✅ (+2点)
+- 同じ失敗2回 ✅ (+3点、`track_tool_repeat`の連続失敗カウントを流用)
+- 空応答回復後 ✅ (+3点)
+- 圧縮後4ツール ✅ (+1点)
+- 8ツール進捗なし ✅ (+2点。進捗イベントは機械的判定のみ:
+  ファイル変更系ツールの成功と、直前に失敗していたrun_commandの成功)
+- `review_after`期限到達 ✅ (スコア・最小間隔に関係なく強制発火)
+- 追加(§11.8を前倒し): 内容不変の同一ファイル再読3回 ✅ (+2点。
+  差分中心の再読のキャッシュヒット通知から機械的に判定できるため)
+
+実装メモ: 環境変数`LOCALCODER_STRATEGY_REVIEW=off`で機能全体を無効化できる。
+発火閾値は`LOCALCODER_REVIEW_SCORE_THRESHOLD`/`LOCALCODER_REVIEW_AFTER_TOOL_CALLS`
+で調整可能(既定4点/12ツール)。単体テスト39件(`tests/test_strategy_review.py`)。
+実Ollama(gpt-oss:20b)で発火→有効なCONTINUE JSON→履歴保存→ダッシュボード
+再提示の全経路を確認済み。
 
 ### 第3段階: 前回予測との照合
 
