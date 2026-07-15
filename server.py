@@ -2123,6 +2123,7 @@ class ReviewState:
         self.decisions: list[str] = []
         self.last_review: dict | None = None
         self.last_review_at: float | None = None
+        self.last_review_seeded = False  # 前ターンの判定を履歴から引き継いだ場合True
         self.last_fire_reasons: list[str] = []
         self._last_cmd_ok: bool | None = None
 
@@ -2162,12 +2163,50 @@ class ReviewState:
         self.decisions.append(review.get("decision", "?"))
         self.last_review = review
         self.last_review_at = time.time()
+        self.last_review_seeded = False  # このターンで新たに採用された判定
         self.last_fire_reasons = list(reasons)
         self.tool_calls_since_review = 0
         self.compacted_since_review = False
         self.tools_after_compaction = 0
         self.empty_response_recovered = False
         self.unchanged_reread_count = 0
+
+
+def find_last_strategy_review(messages: list) -> dict | None:
+    """履歴から最後に採用された方針再評価(localcoder_metaメッセージ)を機械的に
+    探す。他の抽出関数(extract_changed_files等)と同じくLLM不使用。無ければNone。"""
+    last = None
+    for m in messages:
+        if m.get("role") == "localcoder_meta" \
+           and m.get("meta_type") == "strategy_review":
+            last = m
+    return last
+
+
+def seed_review_state_from_history(rev: ReviewState, messages: list) -> None:
+    """前ターンの判定をReviewStateへ引き継ぐ(§8のターン跨ぎ対応)。
+
+    localcoder_metaはOllamaへの入力から常に除外されるため、これをしないと
+    前ターンのSTOP/ADJUSTが残した具体的な計画がモデルから完全に見えなくなり、
+    新しいターンで同じ調査ループを最初からやり直す(実例: STOPが「CMakeLists.txt
+    とmain.cを1回で作成する」という計画を残したのに、次ターンで同じ
+    get_reference×13回の情報収集を繰り返した)。
+
+    引き継ぐのはlast_reviewのみ:
+    - 期限の時計(last_review_at)はこのターンの開始時刻から数え直す。実際の
+      created_atを使うと、古いセッションを何時間も後に再開しただけで
+      max_seconds期限が即時発火してしまう。
+    - last_fire_reasonsは引き継がない。同一理由の再発火抑止(§13)は同一ターン
+      内の連続発火対策であり、新しいユーザー指示の後の正当な再発火まで
+      塞ぐべきではない(実例のターン1はまさに前ターンと同じ理由の組
+      many_tool_calls+no_progressで発火する必要があった)。
+    - reviews_done(1ターン最大3回の発火予算)も引き継がない。
+    """
+    meta = find_last_strategy_review(messages)
+    if meta and isinstance(meta.get("review"), dict):
+        rev.last_review = meta["review"]
+        rev.last_review_at = rev.turn_started_at
+        rev.last_review_seeded = True
 
 
 def review_score(state: ReviewState, now: float | None = None) -> tuple[int, list[str]]:
@@ -2373,14 +2412,23 @@ def make_review_meta(review: dict, reasons: list[str], score: int) -> dict:
                        f"{str(review.get('assessment', ''))[:100]})"}
 
 
-def format_review_for_dashboard(review: dict) -> str:
+def format_review_for_dashboard(review: dict, from_previous_turn: bool = False) -> str:
     """直近の採用レビューを、次の通常モデル呼び出しの作業状態ダッシュボードへ
-    差し込むテキストに変換する(§14)。"""
+    差し込むテキストに変換する(§14)。
+
+    from_previous_turn=Trueは履歴から引き継いだ前ターンの判定
+    (seed_review_state_from_history)。新しいユーザー指示が前ターンの作業と
+    無関係な場合もあるため、その旨を明示して新しい指示を優先させる。
+    """
     ns = review.get("next_step") or {}
     ra = review.get("review_after") or {}
-    lines = ["(自動方針再評価 - 現在の実行方針)",
-             f"判定: {review.get('decision', '?').upper()}",
-             f"評価: {review.get('assessment', '')}"]
+    if from_previous_turn:
+        lines = ["(自動方針再評価 - 前ターンの判定。現在の作業の続きであれば"
+                 "この計画を踏まえること。新しい指示と矛盾する場合は新しい指示を優先)"]
+    else:
+        lines = ["(自動方針再評価 - 現在の実行方針)"]
+    lines += [f"判定: {review.get('decision', '?').upper()}",
+              f"評価: {review.get('assessment', '')}"]
     for e in review.get("evidence") or []:
         lines.append(f"根拠: {e}")
     for c in review.get("counterevidence") or []:
@@ -2391,6 +2439,14 @@ def format_review_for_dashboard(review: dict) -> str:
         lines.append(f"期待結果: {ns['expected_result']}")
     if ns.get("failure_means"):
         lines.append(f"失敗時に分かること: {ns['failure_means']}")
+    plan = [p for p in (review.get("plan") or []) if str(p).strip()]
+    if plan:
+        lines.append("計画:")
+        lines.extend(f"  {i}. {p}" for i, p in enumerate(plan, 1))
+    criteria = [c for c in (review.get("completion_criteria") or []) if str(c).strip()]
+    if criteria:
+        lines.append("完了条件:")
+        lines.extend(f"  - {c}" for c in criteria)
     cond = []
     if isinstance(ra.get("tool_calls"), (int, float)) and ra["tool_calls"] > 0:
         cond.append(f"あと{int(ra['tool_calls'])}ツール")
@@ -2728,7 +2784,9 @@ class Handler(BaseHTTPRequestHandler):
         # 書き込みが1件も無ければディスクには何も作られない。
         txn = Transaction(wsr)
         # 自動方針再評価(METACOGNITIVE_REPLANNING.md): 発火判定用の機械的カウンタ。
+        # 前ターンの判定(STOP/ADJUSTが残した計画)があれば引き継ぐ(§8ターン跨ぎ)。
         rev = ReviewState(turn_started_at)
+        seed_review_state_from_history(rev, messages[1:])
         empty_retries = 0
         http_retries = 0
         last_failed_sig = None  # 直前の失敗ツール呼び出し(名前+引数)の署名。連続失敗検出用
@@ -2756,7 +2814,8 @@ class Handler(BaseHTTPRequestHandler):
                 work_state = build_work_state(messages[1:])
                 if rev.last_review:
                     # 直近の方針再評価の結果を「現在の実行方針」として毎回再提示する
-                    review_block = format_review_for_dashboard(rev.last_review)
+                    review_block = format_review_for_dashboard(
+                        rev.last_review, from_previous_turn=rev.last_review_seeded)
                     work_state = (work_state + "\n\n" + review_block) if work_state \
                         else review_block
                 call_messages = messages

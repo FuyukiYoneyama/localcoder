@@ -318,6 +318,105 @@ class TestBuildReviewContext(unittest.TestCase):
         self.assertIn("ツール呼び出し: 4回", ctx)
 
 
+class TestFindLastStrategyReview(unittest.TestCase):
+    def test_none_when_no_meta(self):
+        msgs = [{"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"}]
+        self.assertIsNone(s.find_last_strategy_review(msgs))
+
+    def test_returns_last_of_multiple(self):
+        m1 = s.make_review_meta(valid_continue(), ["no_progress"], 4)
+        stop = {"decision": "stop", "assessment": "情報不足",
+                "plan": ["CMakeLists.txtとmain.cを1回で作成する"]}
+        m2 = s.make_review_meta(stop, ["many_tool_calls"], 4)
+        msgs = [{"role": "user", "content": "x"}, m1,
+                {"role": "assistant", "content": "y"}, m2,
+                {"role": "user", "content": "続けて"}]
+        found = s.find_last_strategy_review(msgs)
+        self.assertIs(found, m2)
+
+    def test_ignores_other_meta_types(self):
+        msgs = [{"role": "localcoder_meta", "meta_type": "something_else"}]
+        self.assertIsNone(s.find_last_strategy_review(msgs))
+
+
+class TestSeedReviewStateFromHistory(unittest.TestCase):
+    """ターン跨ぎの前回判定引き継ぎ(§8)。実障害: 前ターンのSTOPが具体的な計画
+    (CMakeLists.txt+main.cを1回で作成)を残したのに、次ターンでReviewStateが
+    真っさらに戻り、モデルから判定が見えず同じ調査ループを繰り返した。"""
+
+    def test_seeds_last_review_and_marks_seeded(self):
+        stop = {"decision": "stop", "assessment": "情報収集は完了、コード未作成",
+                "plan": ["CMakeLists.txtとmain.cの最小構成を1回で作成する"],
+                "review_after": {"tool_calls": 0, "max_seconds": 0}}
+        msgs = [{"role": "user", "content": "作って"},
+                s.make_review_meta(stop, ["many_tool_calls", "no_progress"], 4),
+                {"role": "user", "content": "実装を開始してください"}]
+        rev = s.ReviewState(turn_started_at=5000)
+        s.seed_review_state_from_history(rev, msgs)
+        self.assertTrue(rev.last_review_seeded)
+        self.assertEqual(rev.last_review["decision"], "stop")
+        # 期限の時計はこのターンの開始から数え直す(created_atではない)
+        self.assertEqual(rev.last_review_at, 5000)
+        # 同一理由の再発火抑止は引き継がない(新ターンでの正当な再発火を塞がない)
+        self.assertEqual(rev.last_fire_reasons, [])
+        self.assertEqual(rev.reviews_done, 0)
+
+    def test_no_meta_leaves_state_untouched(self):
+        rev = s.ReviewState(turn_started_at=5000)
+        s.seed_review_state_from_history(rev, [{"role": "user", "content": "x"}])
+        self.assertIsNone(rev.last_review)
+        self.assertFalse(rev.last_review_seeded)
+
+    def test_seeded_deadline_fires_across_turns(self):
+        """前ターンのCONTINUEのreview_after(tool_calls=4)が、新ターンでも
+        4ツール後に強制発火する。"""
+        msgs = [s.make_review_meta(valid_continue(), ["no_progress"], 4),
+                {"role": "user", "content": "続けてください"}]
+        rev = s.ReviewState(turn_started_at=5000)
+        s.seed_review_state_from_history(rev, msgs)
+        for _ in range(3):
+            rev.note_tool_result("read_file", "content", 0)
+        fire, _ = s.should_review_strategy(rev, now=5001)
+        self.assertFalse(fire)  # まだ3ツール(期限4未満)、スコアも0
+        rev.note_tool_result("read_file", "content", 0)
+        fire, reasons = s.should_review_strategy(rev, now=5001)
+        self.assertTrue(fire)
+        self.assertEqual(reasons, ["review_after_due"])
+
+    def test_stop_with_zero_review_after_does_not_force_fire(self):
+        stop = {"decision": "stop", "assessment": "停止",
+                "review_after": {"tool_calls": 0, "max_seconds": 0}}
+        msgs = [s.make_review_meta(stop, ["no_progress"], 4)]
+        rev = s.ReviewState(turn_started_at=5000)
+        s.seed_review_state_from_history(rev, msgs)
+        rev.note_tool_result("read_file", "content", 0)
+        fire, _ = s.should_review_strategy(rev, now=5001)
+        self.assertFalse(fire)
+
+    def test_seeded_max_seconds_counts_from_turn_start(self):
+        """古いセッションを何時間も後に再開しても、max_seconds期限は
+        ターン開始からの経過で判定される(即時発火しない)。"""
+        old = valid_continue()  # max_seconds=300
+        meta = s.make_review_meta(old, ["no_progress"], 4)
+        meta["created_at"] = 1000.0  # 実際の判定はずっと昔
+        rev = s.ReviewState(turn_started_at=100000.0)
+        s.seed_review_state_from_history(rev, [meta])
+        fire, _ = s.should_review_strategy(rev, now=100010.0)  # ターン開始10秒後
+        self.assertFalse(fire)
+        fire, reasons = s.should_review_strategy(rev, now=100000.0 + 301)
+        self.assertTrue(fire)
+        self.assertEqual(reasons, ["review_after_due"])
+
+    def test_new_review_in_turn_clears_seeded_flag(self):
+        msgs = [s.make_review_meta(valid_continue(), ["no_progress"], 4)]
+        rev = s.ReviewState(turn_started_at=5000)
+        s.seed_review_state_from_history(rev, msgs)
+        self.assertTrue(rev.last_review_seeded)
+        rev.note_review({"decision": "adjust", "assessment": "調整"}, ["no_progress"])
+        self.assertFalse(rev.last_review_seeded)
+
+
 class TestMetaAndFormatting(unittest.TestCase):
     def test_make_review_meta_shape(self):
         meta = s.make_review_meta(valid_continue(), ["no_progress"], 4)
@@ -332,6 +431,28 @@ class TestMetaAndFormatting(unittest.TestCase):
         self.assertIn("次に行うこと: 残る依存候補を検証する", text)
         self.assertIn("あと4ツール", text)
         self.assertIn("300秒後", text)
+        self.assertIn("現在の実行方針", text)
+        self.assertNotIn("前ターンの判定", text)
+
+    def test_dashboard_format_shows_plan_and_completion_criteria(self):
+        """実障害でSTOPのplan(CMakeLists.txt+main.cを1回で作成)が表示対象外
+        だったため、モデルに伝わらなかった。planと完了条件も表示する。"""
+        r = valid_continue()
+        r["plan"] = ["CMakeLists.txtを作成する", "main.cを作成しビルドする"]
+        r["completion_criteria"] = ["*.uf2が生成される"]
+        text = s.format_review_for_dashboard(r)
+        self.assertIn("計画:", text)
+        self.assertIn("1. CMakeLists.txtを作成する", text)
+        self.assertIn("2. main.cを作成しビルドする", text)
+        self.assertIn("完了条件:", text)
+        self.assertIn("- *.uf2が生成される", text)
+
+    def test_dashboard_format_labels_previous_turn_review(self):
+        text = s.format_review_for_dashboard(valid_continue(),
+                                             from_previous_turn=True)
+        self.assertIn("前ターンの判定", text)
+        self.assertIn("新しい指示を優先", text)
+        self.assertNotIn("現在の実行方針", text)
 
     def test_to_ollama_messages_filters_meta(self):
         msgs = [

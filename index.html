@@ -360,6 +360,10 @@ function reviewCard(meta){
   if(ns.action)lines.push("次の行動: "+ns.action);
   if(ns.expected_result)lines.push("期待結果: "+ns.expected_result);
   if(ns.failure_means)lines.push("失敗時に分かること: "+ns.failure_means);
+  const plan=(r.plan||[]).filter(p=>String(p).trim());
+  if(plan.length){lines.push("計画:");plan.forEach((p,i)=>lines.push("  "+(i+1)+". "+p))}
+  const crit=(r.completion_criteria||[]).filter(c=>String(c).trim());
+  if(crit.length){lines.push("完了条件:");crit.forEach(c=>lines.push("  - "+c))}
   const cond=[];
   if(ra.tool_calls)cond.push("あと"+ra.tool_calls+"ツール");
   if(ra.max_seconds)cond.push(ra.max_seconds+"秒後");
