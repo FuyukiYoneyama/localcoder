@@ -140,9 +140,13 @@ class TestShouldReviewStrategy(unittest.TestCase):
         fire, _ = s.should_review_strategy(st, now=1001)
         self.assertFalse(fire)
 
-    def test_max_reviews_per_turn(self):
+    def test_max_reviews_per_turn_counts_attempts(self):
+        """1ターン上限は採用数ではなく試行数で数える。採用数だとJSON不良で
+        不採用が続くモデルの場合に上限が効かず、再評価LLM呼び出しが
+        毎ツール後に走り続けてしまう。"""
         st = self._stalled_state()
-        st.reviews_done = s.REVIEW_MAX_PER_TURN
+        st.review_attempts = s.REVIEW_MAX_PER_TURN
+        st.reviews_done = 0  # 1回も採用されていなくても試行数で打ち止め
         fire, _ = s.should_review_strategy(st, now=1001)
         self.assertFalse(fire)
 
@@ -316,6 +320,173 @@ class TestBuildReviewContext(unittest.TestCase):
         self.assertIn("前回の判定: CONTINUE", ctx)
         self.assertIn("不一致の有無が確定する", ctx)
         self.assertIn("ツール呼び出し: 4回", ctx)
+
+
+class TestErrorSignature(unittest.TestCase):
+    """同種エラーの反復検知(§11.4)用のエラー署名正規化。"""
+
+    def test_paths_are_normalized_to_same_signature(self):
+        a = s.error_signature("list_dir",
+                              "ERROR: ValueError: path is outside the workspace: /home/user/pico/pico-sdk")
+        b = s.error_signature("read_file",
+                              "ERROR: ValueError: path is outside the workspace: /home/user/pico/pico-sdk/cmake/pico_sdk_import.cmake")
+        self.assertIsNotNone(a)
+        self.assertEqual(a, b)  # 毎回別のパスでも同じ署名になる
+
+    def test_numbers_are_normalized(self):
+        a = s.error_signature("run_command", "ERROR: command timed out after 180s")
+        b = s.error_signature("run_command", "ERROR: command timed out after 300s")
+        self.assertEqual(a, b)
+
+    def test_non_error_returns_none(self):
+        self.assertIsNone(s.error_signature("read_file", "file content here"))
+        self.assertIsNone(s.error_signature("write_file", "OK: wrote 5 chars to a.py"))
+        self.assertIsNone(s.error_signature("run_command", "exit_code=0\nok"))
+
+    def test_run_command_failure_uses_error_line(self):
+        result = ("exit_code=1\n-- Configuring incomplete, errors occurred!\n\n"
+                  "[stderr]\nCMake Error at CMakeLists.txt:5 (include):\n"
+                  "  include could not find requested file")
+        sig = s.error_signature("run_command", result)
+        self.assertIn("run_command:", sig)
+        # 最初のエラーらしい行が署名になる(同種のcmake失敗が同じ署名に集まる)
+        self.assertIn("Configuring incomplete", sig)
+        # exit_code行だけの汎用署名にはならない
+        self.assertNotEqual(sig, "run_command: exit_code=<n>")
+        # 同じ失敗が繰り返されたら同じ署名になる
+        self.assertEqual(sig, s.error_signature("run_command", result))
+
+    def test_different_error_kinds_have_different_signatures(self):
+        a = s.error_signature("read_file", "ERROR: file not found: a.txt")
+        b = s.error_signature("list_dir",
+                              "ERROR: ValueError: path is outside the workspace: /x")
+        self.assertNotEqual(a, b)
+
+
+class TestErrorSignatureCounting(unittest.TestCase):
+    def test_incident_pattern_scores_despite_progress(self):
+        """実障害の再現: ワークスペース外エラーが毎回別パスで大量に出るが、
+        合間に書き込みが成功するためno_progressはリセットされ続ける。
+        エラー署名の反復(+3)だけがこれを捕まえられる。"""
+        st = s.ReviewState(turn_started_at=1000)
+        for i in range(3):
+            st.note_tool_result(
+                "list_dir",
+                f"ERROR: ValueError: path is outside the workspace: /sdk/dir{i}", 0)
+            st.note_tool_result("write_file", f"OK: wrote 10 chars to f{i}.c", 0)
+        self.assertEqual(st.tools_since_last_progress, 0)  # 直前が成功
+        self.assertEqual(st.same_error_signature_count, 3)
+        score, reasons = s.review_score(st, now=1001)
+        self.assertGreaterEqual(score, 3)
+        self.assertIn("same_error", reasons)
+
+    def test_signature_counts_reset_on_adopted_review(self):
+        st = s.ReviewState(turn_started_at=1000)
+        st.note_tool_result("list_dir", "ERROR: ValueError: path is outside the workspace: /a", 0)
+        st.note_review(valid_continue(), ["no_progress"])
+        self.assertEqual(st.same_error_signature_count, 0)
+
+    def test_top_error_signature(self):
+        st = s.ReviewState(turn_started_at=1000)
+        st.note_tool_result("read_file", "ERROR: file not found: a.txt", 0)
+        st.note_tool_result("list_dir", "ERROR: ValueError: path is outside the workspace: /a", 0)
+        st.note_tool_result("list_dir", "ERROR: ValueError: path is outside the workspace: /b", 0)
+        sig, count = st.top_error_signature()
+        self.assertEqual(count, 2)
+        self.assertIn("outside the workspace", sig)
+
+
+class TestProgressEvents(unittest.TestCase):
+    def test_events_are_recorded_with_type(self):
+        st = s.ReviewState(turn_started_at=1000)
+        st.note_tool_result("run_command", "ERROR: command failed (exit 1)", 0)
+        st.note_tool_result("write_file", "OK: wrote 3 chars to a.py", 0)
+        st.note_tool_result("run_command", "exit_code=0\nok", 0)
+        types = [e["type"] for e in st.progress_events]
+        self.assertEqual(types, ["file_changed", "command_recovered"])
+        self.assertEqual(st.progress_since_review, 2)
+
+    def test_events_reset_on_adopted_review(self):
+        st = s.ReviewState(turn_started_at=1000)
+        st.note_tool_result("write_file", "OK: wrote 3 chars to a.py", 0)
+        st.note_review(valid_continue(), ["no_progress"])
+        self.assertEqual(st.progress_since_review, 0)
+
+
+class TestNoProgressContinueRejection(unittest.TestCase):
+    """第3段階の中核: 進捗なしで同じCONTINUEを機械的に禁止する。"""
+
+    def _state_after_continue(self):
+        st = s.ReviewState(turn_started_at=1000)
+        st.note_review(valid_continue(), ["no_progress"])
+        return st
+
+    def test_second_continue_without_progress_rejected(self):
+        st = self._state_after_continue()
+        st.note_tool_result("read_file", "content", 0)  # 読むだけ=進捗なし
+        ok, problem = s.validate_review_decision(valid_continue(), st)
+        self.assertFalse(ok)
+        self.assertIn("進捗", problem)
+
+    def test_second_continue_with_progress_accepted(self):
+        st = self._state_after_continue()
+        st.note_tool_result("write_file", "OK: wrote 3 chars to a.py", 0)
+        ok, problem = s.validate_review_decision(valid_continue(), st)
+        self.assertTrue(ok, problem)
+
+    def test_continue_after_adjust_is_allowed_without_progress(self):
+        st = s.ReviewState(turn_started_at=1000)
+        st.note_review({"decision": "adjust", "assessment": "手順変更",
+                        "next_step": {"action": "テストを先に書く"}}, ["no_progress"])
+        ok, problem = s.validate_review_decision(valid_continue(), st)
+        self.assertTrue(ok, problem)
+
+    def test_first_continue_without_state_is_allowed(self):
+        ok, problem = s.validate_review_decision(valid_continue())
+        self.assertTrue(ok, problem)
+        ok, problem = s.validate_review_decision(
+            valid_continue(), s.ReviewState(turn_started_at=1000))
+        self.assertTrue(ok, problem)  # last_reviewが無ければ制限なし
+
+    def test_run_review_pass_forces_decision_change(self):
+        """1回目のCONTINUEが機械却下され、修正要求の後のADJUSTが採用される。"""
+        st = self._state_after_continue()
+        st.note_tool_result("read_file", "content", 0)
+        adjust = {"decision": "adjust", "assessment": "実装フェーズへ切り替える",
+                  "next_step": {"action": "main.cを作成する"}}
+        fake = FakeOllama([json.dumps(valid_continue(), ensure_ascii=False),
+                           json.dumps(adjust, ensure_ascii=False)])
+        s_orig = s.ollama_ask
+        s.ollama_ask = fake
+        try:
+            review, retries = s.run_review_pass("m", "context", st)
+        finally:
+            s.ollama_ask = s_orig
+        self.assertEqual(review["decision"], "adjust")
+        self.assertEqual(retries, 1)
+        self.assertIn("進捗", fake.calls[1])  # 修正要求に却下理由が含まれる
+
+
+class TestFailedAttemptCooldown(unittest.TestCase):
+    def test_failed_attempt_blocks_immediate_refire_even_on_deadline(self):
+        """不採用に終わった試行の直後は、期限到達が立ちっぱなしでも
+        最小間隔を空ける(毎ツール後の連続LLM呼び出しを防ぐ)。"""
+        st = s.ReviewState(turn_started_at=1000)
+        st.note_review(valid_continue(), ["no_progress"])  # review_after: 4ツール
+        for _ in range(4):
+            st.note_tool_result("read_file", "content", 0)
+        fire, reasons = s.should_review_strategy(st, now=1001)
+        self.assertTrue(fire)  # 期限到達で発火
+        st.note_attempt()
+        st.note_attempt_failed()  # 不採用に終わった
+        st.note_tool_result("read_file", "content", 0)
+        fire, _ = s.should_review_strategy(st, now=1001)
+        self.assertFalse(fire)  # 直後は再発火しない
+        for _ in range(s.REVIEW_MIN_INTERVAL_TOOLS):
+            st.note_tool_result("read_file", "content", 0)
+        fire, reasons = s.should_review_strategy(st, now=1001)
+        self.assertTrue(fire)  # 間隔を空ければ期限到達で再発火できる
+        self.assertEqual(reasons, ["review_after_due"])
 
 
 class TestFindLastStrategyReview(unittest.TestCase):

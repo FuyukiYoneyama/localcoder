@@ -2086,6 +2086,11 @@ REVIEW_SYSTEM_PROMPT = """これは作業継続のための自動方針再評価
 - 自律継続が不適切ならstopです。
 - 「まず確認してから作成する」という宣言を繰り返すだけで実際の作成・編集が
   進んでいない場合、それは停滞です。continueの根拠にはなりません。
+- 「前回の判定」が与えられている場合、前回の期待がその後の実績で実現したかを
+  previous_reviewで必ず判定してください。期待が外れた場合、それ自体が
+  counterevidenceです。前回と同じ理由でのcontinueを繰り返さないでください。
+- 前回もcontinueで、その後に進捗イベントが1件も無い場合、continueは
+  採用されません。adjust/change/stopのいずれかを選んでください。
 
 事実と推測を分離してください。既に失敗した手順を理由なく繰り返さないでください。
 変更済みファイルとユーザーの固定指示を維持してください。
@@ -2096,6 +2101,8 @@ REVIEW_SYSTEM_PROMPT = """これは作業継続のための自動方針再評価
   "assessment": "現状の一文評価",
   "evidence": ["現在の方針を支持する具体的な証拠"],
   "counterevidence": ["現在の方針に反する証拠または懸念"],
+  "previous_review": {"exists": true, "prediction_met": false,
+                      "details": "前回の期待と実績の照合結果(前回判定が無ければexists: false)"},
   "next_step": {
     "action": "次に実行する最小の具体的な行動",
     "expected_result": "期待する結果",
@@ -2105,6 +2112,41 @@ REVIEW_SYSTEM_PROMPT = """これは作業継続のための自動方針再評価
   "completion_criteria": ["完了と判断する条件"],
   "review_after": {"tool_calls": 4, "max_seconds": 300}
 }"""
+
+
+_ERROR_SIG_PATH_RE = re.compile(r"(/|[A-Za-z]:\\)[^\s:'\"()]+")  # unix/Windowsパス
+_ERROR_SIG_NUM_RE = re.compile(r"\d+")
+
+
+def error_signature(name: str, result: str) -> str | None:
+    """ツール結果がエラーなら、パス・行番号・数値などの可変部分を除いた正規化
+    済みの署名を返す(§11.4)。エラーでなければNone。
+
+    完全一致の連続失敗検知(track_tool_repeat)では、引数のパスが毎回違う同種
+    エラーを捕まえられない。実障害では「path is outside the workspace: <毎回
+    別のパス>」が1ターンに17回発生したが、書き込みが時々成功していたため
+    no_progressにもならず、どの発火条件にも乗らなかった。
+    """
+    if not isinstance(result, str) or not result:
+        return None
+    line = None
+    if result.startswith("ERROR"):
+        line = result.splitlines()[0]
+    elif name == "run_command" and parse_command_result(result).get("ok") is False:
+        # run_commandの失敗はexit_code行が先頭で全部同じ署名になってしまうため、
+        # 本文から最初のエラーらしい行を探す(無ければexit_code行)。
+        for cand in result.splitlines():
+            if "error" in cand.lower():
+                line = cand.strip()
+                break
+        if line is None:
+            line = result.splitlines()[0]
+        line = f"run_command: {line}"
+    if line is None:
+        return None
+    sig = _ERROR_SIG_PATH_RE.sub("<path>", line)
+    sig = _ERROR_SIG_NUM_RE.sub("<n>", sig)
+    return sig[:160]
 
 
 class ReviewState:
@@ -2125,14 +2167,34 @@ class ReviewState:
         self.tools_after_compaction = 0
         self.empty_response_recovered = False
         self.unchanged_reread_count = 0
-        self.reviews_done = 0
+        self.reviews_done = 0       # 採用された再評価の数
+        self.review_attempts = 0    # 発火した再評価の数(不採用含む)。1ターン上限はこちらで数える
+        self.tools_since_failed_attempt = 10 ** 9  # 不採用に終わった試行からのツール数
         self.json_retries = 0
         self.decisions: list[str] = []
         self.last_review: dict | None = None
         self.last_review_at: float | None = None
         self.last_review_seeded = False  # 前ターンの判定を履歴から引き継いだ場合True
         self.last_fire_reasons: list[str] = []
+        # 前回の採用済み再評価以降の進捗イベント(§10)とエラー署名(§11.4)
+        self.progress_events: list[dict] = []
+        self.error_sig_counts: dict[str, int] = {}
         self._last_cmd_ok: bool | None = None
+
+    @property
+    def progress_since_review(self) -> int:
+        return len(self.progress_events)
+
+    @property
+    def same_error_signature_count(self) -> int:
+        """前回の採用済み再評価以降で最も多く繰り返された同種エラーの回数。"""
+        return max(self.error_sig_counts.values(), default=0)
+
+    def top_error_signature(self) -> tuple[str, int] | None:
+        if not self.error_sig_counts:
+            return None
+        sig = max(self.error_sig_counts, key=self.error_sig_counts.get)
+        return sig, self.error_sig_counts[sig]
 
     def note_compaction(self) -> None:
         self.compacted_since_review = True
@@ -2142,26 +2204,42 @@ class ReviewState:
         self.empty_response_recovered = True
 
     def note_tool_result(self, name: str, result: str, repeat_count: int) -> None:
-        """ツール実行1回ごとに呼ぶ。進捗イベントの機械的判定もここで行う。"""
+        """ツール実行1回ごとに呼ぶ。進捗イベントとエラー署名の機械的判定もここで行う。"""
         self.tool_calls_since_review += 1
+        self.tools_since_failed_attempt += 1
         if self.compacted_since_review:
             self.tools_after_compaction += 1
         self.same_tool_failure_count = repeat_count
-        progress = False
+        progress_type = None
         if name in MUTATING_TOOLS and isinstance(result, str) and result.startswith("OK"):
-            progress = True
+            progress_type = "file_changed"
         if name == "run_command":
             ok = parse_command_result(result or "").get("ok")
             if ok and self._last_cmd_ok is False:
-                progress = True  # 失敗していたコマンドが通った=状態の改善
+                progress_type = "command_recovered"  # 失敗していたコマンドが通った=改善
             self._last_cmd_ok = ok
         if name == "read_file" and isinstance(result, str) \
            and result.startswith(UNCHANGED_READ_NOTICE_PREFIX):
             self.unchanged_reread_count += 1
-        if progress:
+        sig = error_signature(name, result)
+        if sig:
+            self.error_sig_counts[sig] = self.error_sig_counts.get(sig, 0) + 1
+        if progress_type:
             self.tools_since_last_progress = 0
+            self.progress_events.append({"type": progress_type, "tool": name,
+                                         "at": self.tool_calls_since_review})
         else:
             self.tools_since_last_progress += 1
+
+    def note_attempt(self) -> None:
+        """再評価が発火したら(採用の成否が決まる前に)呼ぶ。"""
+        self.review_attempts += 1
+
+    def note_attempt_failed(self) -> None:
+        """再評価が不採用(JSON不良・採用条件不成立)に終わったら呼ぶ。
+        これが無いとreview_after期限が立ちっぱなしのまま毎ツール呼び出しで
+        再発火し、失敗し続けるLLM呼び出しを延々と繰り返してしまう。"""
+        self.tools_since_failed_attempt = 0
 
     def note_review(self, review: dict, reasons: list[str]) -> None:
         """再評価が採用されたら呼ぶ。発火系カウンタをリセットする
@@ -2177,6 +2255,9 @@ class ReviewState:
         self.tools_after_compaction = 0
         self.empty_response_recovered = False
         self.unchanged_reread_count = 0
+        # 「前回判定後の実績」(§8)の起点をここに置き直す
+        self.progress_events = []
+        self.error_sig_counts = {}
 
 
 def find_last_strategy_review(messages: list) -> dict | None:
@@ -2230,6 +2311,13 @@ def review_score(state: ReviewState, now: float | None = None) -> tuple[int, lis
     if state.same_tool_failure_count >= 2:
         score += 3
         reasons.append("same_tool_failure")
+    if state.same_error_signature_count >= 3:
+        # 同種エラーの反復(§11.4)。パス等の可変部分を正規化した署名で数える
+        # ため、「毎回別のパスで同じ種類のエラー」も捕まる(完全一致の
+        # same_tool_failureや、書き込み成功が混ざるとリセットされる
+        # no_progressでは捕まらなかった実障害への対応)。
+        score += 3
+        reasons.append("same_error")
     if state.compacted_since_review and state.tools_after_compaction >= 4:
         score += 1
         reasons.append("after_compaction")
@@ -2266,8 +2354,13 @@ def should_review_strategy(state: ReviewState, now: float | None = None) -> tupl
     """発火判定(§11〜13)。(発火するか, 発火理由リスト)を返す。"""
     if not STRATEGY_REVIEW_ENABLED:
         return False, []
-    if state.reviews_done >= REVIEW_MAX_PER_TURN:
+    # 1ターンの上限は「採用数」ではなく「試行数」で数える。採用数で数えると、
+    # JSON不良等で不採用が続くモデルの場合に上限が一生効かず、期限到達が
+    # 立ちっぱなしのまま毎ツール呼び出しで再評価LLMを呼び続けてしまう。
+    if state.review_attempts >= REVIEW_MAX_PER_TURN:
         return False, []
+    if state.tools_since_failed_attempt < REVIEW_MIN_INTERVAL_TOOLS:
+        return False, []  # 不採用に終わった試行の直後は(期限到達でも)少し空ける
     if _review_after_due(state, now):
         return True, ["review_after_due"]
     if state.reviews_done and state.tool_calls_since_review < REVIEW_MIN_INTERVAL_TOOLS:
@@ -2324,6 +2417,9 @@ def build_review_context(messages: list, state: ReviewState,
     lines.append(f"  - 進捗イベントなしのツール呼び出し: {state.tools_since_last_progress}")
     lines.append(f"  - 内容が変わっていない同一ファイルの再読: {state.unchanged_reread_count}")
     lines.append(f"  - 同一ツール呼び出しの連続失敗: {state.same_tool_failure_count}")
+    top_err = state.top_error_signature()
+    if top_err:
+        lines.append(f"  - 最多の同種エラー: {top_err[1]}回 「{top_err[0]}」")
     lines.append(f"  - 経過時間: {int(now - state.turn_started_at)}秒")
 
     if state.last_review:
@@ -2337,7 +2433,20 @@ def build_review_context(messages: list, state: ReviewState,
             lines.append(f"  前回の期待: {ns['expected_result']}")
         lines.append("  その後の実績:")
         lines.append(f"    - ツール呼び出し: {state.tool_calls_since_review}回")
-        lines.append(f"    - 進捗イベントなしのツール呼び出し: {state.tools_since_last_progress}回")
+        if state.progress_events:
+            kinds = {}
+            for ev in state.progress_events:
+                kinds[ev["type"]] = kinds.get(ev["type"], 0) + 1
+            detail = ", ".join(f"{k}×{v}" for k, v in kinds.items())
+            lines.append(f"    - 進捗イベント: {len(state.progress_events)}件 ({detail})")
+        else:
+            lines.append("    - 進捗イベント: なし")
+        if top_err and top_err[1] >= 2:
+            lines.append(f"    - 同種エラーの反復: {top_err[1]}回 「{top_err[0]}」")
+        lines.append("")
+        lines.append("中心の質問: 前回この方針を継続または変更すると判断した根拠は、"
+                     "その後の実績によって支持されましたか。前回の期待が外れた場合は、"
+                     "それ自体をcounterevidenceとして扱ってください。")
     return "\n".join(lines)
 
 
@@ -2355,9 +2464,18 @@ def parse_review_output(raw: str) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def validate_review_decision(review: dict) -> tuple[bool, str | None]:
+def validate_review_decision(review: dict,
+                             state: ReviewState | None = None) -> tuple[bool, str | None]:
     """判定の採用条件(§7)。CONTINUEは根拠・具体的な次の行動・検証可能な期待・
-    有限の再評価条件が全て揃っている場合だけ採用する。"""
+    有限の再評価条件が全て揃っている場合だけ採用する。
+
+    stateが与えられた場合は「進捗なしで同じCONTINUEを禁止」(第3段階)も機械的に
+    強制する: 前回の採用済み判定がCONTINUEで、それ以降に進捗イベント(ファイル
+    変更・失敗コマンドの回復)が1件も無いのに再びCONTINUEと判定した場合、
+    LLMの自己申告(evidence等)がいくら揃っていても採用しない。実障害では
+    2回目のCONTINUEが「前回もcontinueと判断された点」を根拠に挙げる自己強化に
+    陥っていた。
+    """
     decision = str(review.get("decision", "")).lower()
     if decision not in REVIEW_VALID_DECISIONS:
         return False, f"decisionは{'/'.join(REVIEW_VALID_DECISIONS)}のいずれかにしてください"
@@ -2379,13 +2497,22 @@ def validate_review_decision(review: dict) -> tuple[bool, str | None]:
         if not (isinstance(ra.get("tool_calls"), (int, float)) and ra["tool_calls"] > 0) \
            and not (isinstance(ra.get("max_seconds"), (int, float)) and ra["max_seconds"] > 0):
             return False, "continueには有限のreview_after(tool_callsまたはmax_seconds)が必要です"
+        if state is not None and state.last_review \
+           and str(state.last_review.get("decision", "")).lower() == "continue" \
+           and state.progress_since_review == 0:
+            return False, ("前回もCONTINUEと判定しましたが、その後に進捗イベント"
+                           "(ファイルの作成・編集、失敗していたコマンドの成功)が"
+                           "1件もありません。進捗のないまま同じCONTINUEは採用"
+                           "できません。手順を変えるならadjust、方針を変えるなら"
+                           "change、自律継続が不適切ならstopへ判定を修正してください")
     elif decision in ("adjust", "change"):
         if not str(ns.get("action", "")).strip():
             return False, f"{decision}には具体的なnext_step.actionが必要です"
     return True, None
 
 
-def run_review_pass(model: str, context: str) -> tuple[dict | None, int]:
+def run_review_pass(model: str, context: str,
+                    state: ReviewState | None = None) -> tuple[dict | None, int]:
     """ツールなしの再評価呼び出し(§4〜5)。(採用されたレビュー or None, リトライ回数)。
 
     JSONが壊れている・採用条件を満たさない場合は1回だけ修正要求を行い、
@@ -2394,7 +2521,7 @@ def run_review_pass(model: str, context: str) -> tuple[dict | None, int]:
     prompt = REVIEW_SYSTEM_PROMPT + "\n\n" + context
     raw = ollama_ask(model, prompt)
     review = parse_review_output(raw)
-    ok, problem = validate_review_decision(review) if review else \
+    ok, problem = validate_review_decision(review, state) if review else \
         (False, "出力からJSONオブジェクトを解釈できません")
     if ok:
         return review, 0
@@ -2402,7 +2529,7 @@ def run_review_pass(model: str, context: str) -> tuple[dict | None, int]:
                     + f"\n\n問題: {problem}\n指定されたJSON形式だけで出力し直してください。")
     raw2 = ollama_ask(model, retry_prompt)
     review2 = parse_review_output(raw2)
-    ok2, _ = validate_review_decision(review2) if review2 else (False, None)
+    ok2, _ = validate_review_decision(review2, state) if review2 else (False, None)
     return (review2 if ok2 else None), 1
 
 
@@ -2436,6 +2563,12 @@ def format_review_for_dashboard(review: dict, from_previous_turn: bool = False) 
         lines = ["(自動方針再評価 - 現在の実行方針)"]
     lines += [f"判定: {review.get('decision', '?').upper()}",
               f"評価: {review.get('assessment', '')}"]
+    prev_check = review.get("previous_review") or {}
+    if prev_check.get("exists"):
+        met = prev_check.get("prediction_met")
+        verdict = "実現した" if met else "実現しなかった"
+        detail = str(prev_check.get("details") or "")[:120]
+        lines.append(f"前回の期待の検証: {verdict}" + (f" ({detail})" if detail else ""))
     for e in review.get("evidence") or []:
         lines.append(f"根拠: {e}")
     for c in review.get("counterevidence") or []:
@@ -2971,18 +3104,23 @@ class Handler(BaseHTTPRequestHandler):
                 if not stuck:
                     fire, fire_reasons = should_review_strategy(rev)
                     if fire:
+                        rev.note_attempt()
                         self._sse({"type": "notice",
                                    "message": "🧭 作業方針を自動的に見直しています…"})
                         score, _ = review_score(rev)
                         review = None
                         try:
                             context = build_review_context(messages[1:], rev)
-                            review, retries = run_review_pass(model, context)
+                            review, retries = run_review_pass(model, context, rev)
                             rev.json_retries += retries
                         except Exception as e:  # noqa: BLE001
                             self._sse({"type": "notice",
                                        "message": f"方針再評価に失敗したため通常作業を続けます"
                                                   f" ({type(e).__name__})"})
+                        if not review:
+                            # 不採用(JSON不良・採用条件不成立)。次の発火まで最小間隔を
+                            # 空け、期限到達の立ちっぱなしによる連続再発火を防ぐ
+                            rev.note_attempt_failed()
                         if review:
                             meta = make_review_meta(review, fire_reasons, score)
                             messages.append(meta)
@@ -3069,6 +3207,7 @@ class Handler(BaseHTTPRequestHandler):
                     "external_sends": len(txn.external_sends),
                     # 自動方針再評価の診断情報(METACOGNITIVE_REPLANNING.md §16の一部)
                     "strategy_review_count": rev.reviews_done,
+                    "strategy_review_attempts": rev.review_attempts,
                     "strategy_review_decisions": rev.decisions,
                     "review_json_retry_count": rev.json_retries}
             if len(messages) > 1:

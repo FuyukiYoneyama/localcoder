@@ -355,6 +355,11 @@ function reviewCard(meta){
   const lines=[];
   if(trig.reasons&&trig.reasons.length)lines.push("発火理由: "+trig.reasons.join(", "));
   if(r.assessment)lines.push("評価: "+r.assessment);
+  const pr=r.previous_review||{};
+  if(pr.exists){
+    lines.push("前回の期待の検証: "+(pr.prediction_met?"実現した":"実現しなかった")
+      +(pr.details?(" ("+String(pr.details).slice(0,120)+")"):""));
+  }
   for(const e of (r.evidence||[]))lines.push("根拠: "+e);
   for(const c of (r.counterevidence||[]))lines.push("反証・懸念: "+c);
   if(ns.action)lines.push("次の行動: "+ns.action);
