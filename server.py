@@ -2313,6 +2313,98 @@ def seed_review_state_from_history(rev: ReviewState, messages: list) -> None:
         rev.last_review_seeded = True
 
 
+def replay_review_triggers(messages: list, turn_started_at: float | None = None,
+                           now_step_seconds: float = 1.0) -> list[dict]:
+    """保存済みセッションのmessagesを、**現在の**ReviewState/review_score/
+    should_review_strategyロジックへ通し直し、「今のコードならいつ・どの
+    スコア・どの理由で発火するか」を機械的に再現する(§12「閾値や重みは実
+    セッションの診断情報から調整する」の道具化)。LLMは一切呼ばないため、
+    発火した場合に実際にどう判定される(CONTINUE/ADJUST/…)かは分からない
+    ——分かるのは発火タイミングだけ。これは意図的な範囲限定で、閾値・
+    スコアリングのチューニングをOllama無しで検証するためのツール。
+
+    履歴中のlocalcoder_metaは「その時点で実際に採用された判定」として扱う:
+    その位置で現在のロジックでも発火すると判定された場合のみ、その判定を
+    note_reviewで採用したことにする(review_afterによる次の強制発火などが
+    正しく連鎖するように)。現在のロジックでは発火しない(例: ウォームアップ
+    で抑制される)場合は採用せず、「歴史的には発火したが今は発火しない」と
+    して記録するだけに留める——判定内容そのものを再生成する手段が無いため。
+
+    戻り値は発火イベントのリスト。各要素:
+    {tool_call_index, tool_name, score, reasons,
+     historical: bool(その位置に実際のlocalcoder_metaがあったか),
+     adopted: bool(現在のロジックでも発火し、その判定を採用したか)}
+    """
+    rev = ReviewState(turn_started_at=turn_started_at or 0.0)
+    events: list[dict] = []
+    last_failed_sig = None
+    tool_repeat = 0
+    tool_call_index = 0
+    now = rev.turn_started_at
+
+    def _now():
+        nonlocal now
+        now += now_step_seconds
+        return now
+
+    i, n = 0, len(messages)
+    while i < n:
+        m = messages[i]
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            j = i + 1
+            for tc in m["tool_calls"]:
+                fn = tc.get("function", {})
+                name = fn.get("name", "?")
+                args = fn.get("arguments") or {}
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args or "{}")
+                    except json.JSONDecodeError:
+                        args = {}
+                result = ""
+                if j < n and messages[j].get("role") == "tool":
+                    result = messages[j].get("content", "") or ""
+                    j += 1
+                tool_call_index += 1
+                last_failed_sig, tool_repeat, _ = track_tool_repeat(
+                    name, args, result, last_failed_sig, tool_repeat)
+                rev.note_tool_result(name, result, tool_repeat)
+                t = _now()
+                fire, reasons = should_review_strategy(rev, now=t)
+                if fire:
+                    rev.note_attempt()
+                    score, _ = review_score(rev, now=t)
+                    # 直後にlocalcoder_metaが実際に存在するなら、それを
+                    # 「採用された判定」として使い、review_after連鎖を再現する。
+                    # 無ければ(=歴史的にはこの位置で発火していない、または
+                    # 現在のロジックが新たに検知した位置)採用はできない。
+                    historical_meta = None
+                    k = j
+                    while k < n and messages[k].get("role") != "user" \
+                          and messages[k].get("role") != "assistant":
+                        if messages[k].get("role") == "localcoder_meta":
+                            historical_meta = messages[k]
+                            break
+                        k += 1
+                    adopted = False
+                    if historical_meta and isinstance(historical_meta.get("review"), dict):
+                        rev.note_review(historical_meta["review"],
+                                       historical_meta.get("trigger", {}).get("reasons", reasons))
+                        adopted = True
+                    else:
+                        rev.note_attempt_failed()
+                    events.append({"tool_call_index": tool_call_index, "tool_name": name,
+                                  "score": score, "reasons": reasons,
+                                  "historical": historical_meta is not None,
+                                  "adopted": adopted})
+            i = j
+        elif m.get("role") == "localcoder_meta":
+            i += 1
+        else:
+            i += 1
+    return events
+
+
 def review_score(state: ReviewState, now: float | None = None) -> tuple[int, list[str]]:
     """発火スコア(§11〜12)。単一条件の即発火ではなく複数の兆候を合算する。
     エラー署名の正規化(§11.4)・節目発火(§11.9)は第4段階の対象で未実装。"""

@@ -536,6 +536,77 @@ class TestFailedAttemptCooldown(unittest.TestCase):
         self.assertEqual(reasons, ["review_after_due"])
 
 
+class TestReplayReviewTriggers(unittest.TestCase):
+    """LLM不要のリプレイ(§12の道具化)。実セッションでの回帰は
+    test_review_replay.pyで検証する。ここでは合成データで基本動作を確認する。"""
+
+    def _msgs(self, name, args, result):
+        return [
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"function": {"name": name, "arguments": args}}]},
+            {"role": "tool", "name": name, "content": result},
+        ]
+
+    def test_no_events_for_short_session(self):
+        msgs = self._msgs("read_file", {"path": "a.py"}, "content")
+        self.assertEqual(s.replay_review_triggers(msgs, turn_started_at=0.0), [])
+
+    def test_fires_at_warmup_boundary_with_no_progress(self):
+        msgs = []
+        for i in range(s.REVIEW_WARMUP_TOOLS):
+            msgs += self._msgs("read_file", {"path": f"f{i}.py"}, "content")
+        events = s.replay_review_triggers(msgs, turn_started_at=0.0)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["tool_call_index"], s.REVIEW_WARMUP_TOOLS)
+        self.assertFalse(events[0]["historical"])
+        self.assertFalse(events[0]["adopted"])
+
+    def test_same_error_signal_is_not_gated_by_warmup(self):
+        """same_error単独(+3)は閾値(4)に届かないため、ウォームアップ非依存の
+        same_tool_failure(完全一致の連続失敗、+3)と組み合わせて閾値内に収める。
+        ここで確認したいのはウォームアップ境界(12)より前に発火すること
+        ——same_errorやsame_tool_failureのような病的シグナルは、探索猶予の
+        対象であるno_progress/many_tool_callsとは独立に効くべきという設計。"""
+        msgs = []
+        same_result = "ERROR: ValueError: path is outside the workspace: /sdk/fixed"
+        for _ in range(3):
+            msgs += self._msgs("list_dir", {"path": "/sdk/fixed"}, same_result)
+        events = s.replay_review_triggers(msgs, turn_started_at=0.0)
+        self.assertEqual(len(events), 1)
+        self.assertLess(events[0]["tool_call_index"], s.REVIEW_WARMUP_TOOLS)
+        self.assertIn("same_error", events[0]["reasons"])
+        self.assertIn("same_tool_failure", events[0]["reasons"])
+
+    def test_historical_meta_is_adopted_and_enables_review_after(self):
+        """発火位置の直後に実際のlocalcoder_metaがあれば採用し、その
+        review_afterによる次の強制発火が連鎖する。"""
+        review = {"decision": "continue", "assessment": "x", "evidence": ["e"],
+                  "next_step": {"action": "a", "expected_result": "r",
+                                "failure_means": "f"},
+                  "review_after": {"tool_calls": 2}}
+        meta = {"role": "localcoder_meta", "meta_type": "strategy_review",
+               "review": review, "trigger": {"reasons": ["no_progress"]}}
+        msgs = []
+        for i in range(s.REVIEW_WARMUP_TOOLS):
+            msgs += self._msgs("read_file", {"path": f"f{i}.py"}, "content")
+        msgs.append(meta)
+        for i in range(2):
+            msgs += self._msgs("read_file", {"path": f"g{i}.py"}, "content")
+        events = s.replay_review_triggers(msgs, turn_started_at=0.0)
+        self.assertEqual(len(events), 2)
+        self.assertTrue(events[0]["adopted"])
+        self.assertEqual(events[1]["reasons"], ["review_after_due"])
+        self.assertEqual(events[1]["tool_call_index"], s.REVIEW_WARMUP_TOOLS + 2)
+
+    def test_no_historical_meta_marks_not_adopted(self):
+        msgs = []
+        for i in range(s.REVIEW_WARMUP_TOOLS):
+            msgs += self._msgs("read_file", {"path": f"f{i}.py"}, "content")
+        events = s.replay_review_triggers(msgs, turn_started_at=0.0)
+        self.assertFalse(events[0]["adopted"])
+        self.assertFalse(events[0]["historical"])
+
+
 class TestFindLastStrategyReview(unittest.TestCase):
     def test_none_when_no_meta(self):
         msgs = [{"role": "user", "content": "hi"},

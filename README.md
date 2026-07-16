@@ -156,3 +156,16 @@ python3 -m unittest discover -s tests -t .
 
 Ollama不要、標準ライブラリのみで完結する回帰テスト。詳細は
 [REBUILD.md](REBUILD.md) §4-1参照。
+
+## セッションログの分析(方針再評価のデバッグ)
+
+停滞・早すぎる介入等が疑われるセッションがあれば、`tools/replay_review.py`で
+現在のコードによる方針再評価の発火タイミングを機械的に(Ollama不要で)確認できる。
+
+```bash
+python3 tools/replay_review.py history/<sid>.json
+```
+
+新しい実障害パターンを見つけたら`tests/fixtures/review_incidents/`へ
+パス匿名化のうえ追加し、`tests/test_review_replay.py`に期待値を回帰テストとして
+固定する運用にしている(詳細はREBUILD.md該当セクション参照)。
