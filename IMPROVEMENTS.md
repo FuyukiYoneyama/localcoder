@@ -1,5 +1,7 @@
 # LocalCoder 改善提案
 
+> 文書の役割: 今後の改善候補と優先順位を管理するロードマップ。ここに記載された項目は、明示的に実装済みと記録されたものを除いて計画として扱う。現在の実装状況は README.md と CHANGELOG.md を参照する。
+
 LocalCoder を、限界のあるローカルLLMでも長時間・実作業で安定して使えるコーディングエージェントへ発展させるための改善案。
 
 不可逆な操作を抑制する安全設計については [REVERSIBLE_OPERATIONS.md](REVERSIBLE_OPERATIONS.md) を、作業方針の自動再評価（停滞・目的逸脱の検知とCONTINUE/ADJUST/CHANGE/STOP判定）については [METACOGNITIVE_REPLANNING.md](METACOGNITIVE_REPLANNING.md) を参照する。本書では、それ以外の信頼性、観測性、テスト、性能、操作性、保守性、配布運用に関する改善を扱う。
