@@ -1234,7 +1234,12 @@ class BuiltinToolProvider:
                     ctx.txn.record_before_write(f)  # mkdirより前(新規親dir検出のため)
                 f.parent.mkdir(parents=True, exist_ok=True)
                 atomic_write(f, args["content"])
-                return f"OK: wrote {len(args['content'])} chars to {args['path']}"
+                # 入力パスではなく解決済みの絶対パスを返す。相対パスの解釈違いで
+                # 意図しない場所に書いてしまった場合(例: 先頭の"/"を落として
+                # ワークスペース起点で二重にネストしたパスになる)、モデル自身が
+                # 次の応答で気づけるようにするため(実例: この不一致に誰も気づかず
+                # 進み、最終的に無関係な別の相対パス誤りでスタックした)。
+                return f"OK: wrote {len(args['content'])} chars to {f}"
             if name == "edit_file":
                 f = resolve_path(ws, args["path"])
                 if in_ledger_area(ws, f):
@@ -1262,11 +1267,14 @@ class BuiltinToolProvider:
                     ctx.txn.record_before_write(f)
                 atomic_write(f, t.replace(old, new))
                 return (f"OK: replaced {n if args.get('replace_all') else 1} "
-                        f"occurrence(s) in {args['path']}")
+                        f"occurrence(s) in {f}")
             if name == "list_dir":
                 f = resolve_path(ws, args.get("path") or ".")
                 items = sorted(e.name + ("/" if e.is_dir() else "") for e in f.iterdir())
-                return "\n".join(items)[:8000] or "(empty)"
+                # 先頭に解決済みの絶対パスを付け、入力が相対パスの解釈違いで
+                # 意図しない場所を指していないかモデルが確認できるようにする。
+                body = "\n".join(items)[:8000] or "(empty)"
+                return f"{f}:\n{body}"
             if name == "delete_file":
                 f = resolve_path(ws, args["path"])
                 if in_ledger_area(ws, f):
@@ -1278,7 +1286,7 @@ class BuiltinToolProvider:
                 if ctx.txn is not None:
                     ctx.txn.record_delete(f)   # trashへ退避してから消す
                 f.unlink()
-                return f"OK: deleted {args['path']} (reversible for this turn)"
+                return f"OK: deleted {f} (reversible for this turn)"
             if name == "delete_directory":
                 f = resolve_path(ws, args["path"])
                 if in_ledger_area(ws, f):
@@ -1290,7 +1298,7 @@ class BuiltinToolProvider:
                 if ctx.txn is not None:
                     ctx.txn.record_delete(f)
                 shutil.rmtree(f)
-                return f"OK: deleted directory {args['path']} and its contents (reversible for this turn)"
+                return f"OK: deleted directory {f} and its contents (reversible for this turn)"
             if name in ("move_file", "copy_file"):
                 src = resolve_path(ws, args["src"])
                 dst = resolve_path(ws, args["dst"])
@@ -1308,11 +1316,11 @@ class BuiltinToolProvider:
                     os.replace(src, dst)
                     if ctx.txn is not None:
                         ctx.txn.record_move(src, dst, dst_existed, created_dirs)
-                    return f"OK: moved {args['src']} -> {args['dst']} (reversible for this turn)"
+                    return f"OK: moved {src} -> {dst} (reversible for this turn)"
                 shutil.copy2(src, dst)
                 if ctx.txn is not None:
                     ctx.txn.record_copy(dst, dst_existed, created_dirs)
-                return f"OK: copied {args['src']} -> {args['dst']} (reversible for this turn)"
+                return f"OK: copied {src} -> {dst} (reversible for this turn)"
             if name == "web_search":
                 return web_search(args["query"], int(args.get("max_results") or 6))
             if name == "fetch_url":
@@ -1332,7 +1340,7 @@ class BuiltinToolProvider:
                     return f"ERROR: image too large (>{IMAGE_MAX_BYTES // 1_000_000}MB)"
                 if pending_images is not None:
                     pending_images.append(base64.b64encode(data).decode())
-                return f"OK: loaded {args['path']}, it will be shown to you now"
+                return f"OK: loaded {f}, it will be shown to you now"
             return f"ERROR: unknown tool {name}"
         except KeyError as e:
             # 弱いローカルモデルほど引数を一部欠落させたツール呼び出しを返しがちなので、

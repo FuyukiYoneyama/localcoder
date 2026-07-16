@@ -133,5 +133,28 @@ class TestEarlyIntervention(unittest.TestCase):
         self.assertIn("many_tool_calls", fire["reasons"])
 
 
+class TestStuckRelativePath(unittest.TestCase):
+    """mrnfwve8nnr3t2.json: 方針再評価自体は正しく機能した(3回の発火が
+    現在のロジックとも完全一致)例。実際にターンを止めたのは無関係な既存の
+    TOOL_STUCK_LIMIT(相対パスの解釈違いで同一エラーが3回連続)だった。
+    この回帰テストは「発火タイミングが妥当な良い例」を固定化し、以後の
+    チューニングがこの正常系を壊していないかを確認する目的。write_file等の
+    結果メッセージを解決済み絶対パスにする修正はこのセッションが動機だが、
+    それ自体は方針再評価と無関係なのでtest_tool_provider.pyで別途検証する。"""
+
+    def setUp(self):
+        self.events = s.replay_review_triggers(
+            _fixture("stuck_relative_path.json"), turn_started_at=0.0)
+
+    def test_fires_match_history_exactly(self):
+        self.assertEqual(len(self.events), 3)
+        for e in self.events:
+            self.assertTrue(e["historical"])
+            self.assertTrue(e["adopted"])
+        self.assertEqual(self.events[0]["tool_call_index"], 12)
+        self.assertEqual(set(self.events[0]["reasons"]),
+                         {"many_tool_calls", "no_progress"})
+
+
 if __name__ == "__main__":
     unittest.main()

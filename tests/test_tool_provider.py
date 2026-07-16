@@ -44,6 +44,54 @@ class TestBuiltinToolProviderCallTool(unittest.TestCase):
             read_result = provider.call_tool("read_file", {"path": "a.txt"}, ctx)
             self.assertEqual(read_result, "hi")
 
+    def test_write_file_reports_resolved_absolute_path_not_raw_input(self):
+        """相対パスの解釈違い(例: 先頭の"/"を落としてワークスペース起点で
+        二重にネストしたパスになる)にモデル自身が次の応答で気づけるよう、
+        成功メッセージは入力パスではなく解決済みの絶対パスを返す。実例:
+        入力パスをそのままエコーしていた時は、この不一致に誰も気づかず
+        意図しない場所へ書き込み続けた。"""
+        provider = s.BuiltinToolProvider()
+        with tempfile.TemporaryDirectory() as d:
+            ctx = s.ToolContext(ws=Path(d))
+            # 先頭の"/"が無い、ワークスペース名を含む紛らわしい相対パス
+            result = provider.call_tool(
+                "write_file", {"path": "home/user/project/a.txt", "content": "hi"}, ctx)
+        expected = str((Path(d) / "home/user/project/a.txt").resolve())
+        self.assertIn(expected, result)
+        self.assertNotIn("home/user/project/a.txt to home/user/project/a.txt", result)
+
+    def test_edit_file_reports_resolved_absolute_path(self):
+        provider = s.BuiltinToolProvider()
+        with tempfile.TemporaryDirectory() as d:
+            ctx = s.ToolContext(ws=Path(d))
+            provider.call_tool("write_file", {"path": "a.txt", "content": "hi"}, ctx)
+            result = provider.call_tool(
+                "edit_file", {"path": "a.txt", "old_string": "hi", "new_string": "bye"}, ctx)
+        expected = str((Path(d) / "a.txt").resolve())
+        self.assertIn(expected, result)
+
+    def test_list_dir_reports_resolved_absolute_path_header(self):
+        provider = s.BuiltinToolProvider()
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "sub").mkdir()
+            (Path(d) / "sub" / "f.txt").write_text("x")
+            result = provider.call_tool("list_dir", {"path": "sub"}, s.ToolContext(ws=Path(d)))
+        expected = str((Path(d) / "sub").resolve())
+        self.assertTrue(result.startswith(expected + ":"))
+        self.assertIn("f.txt", result)
+
+    def test_delete_and_move_report_resolved_absolute_paths(self):
+        provider = s.BuiltinToolProvider()
+        with tempfile.TemporaryDirectory() as d:
+            ctx = s.ToolContext(ws=Path(d))
+            provider.call_tool("write_file", {"path": "a.txt", "content": "hi"}, ctx)
+            move_result = provider.call_tool(
+                "move_file", {"src": "a.txt", "dst": "b.txt"}, ctx)
+            self.assertIn(str((Path(d) / "a.txt").resolve()), move_result)
+            self.assertIn(str((Path(d) / "b.txt").resolve()), move_result)
+            delete_result = provider.call_tool("delete_file", {"path": "b.txt"}, ctx)
+            self.assertIn(str((Path(d) / "b.txt").resolve()), delete_result)
+
     def test_unknown_tool_reports_clearly(self):
         provider = s.BuiltinToolProvider()
         with tempfile.TemporaryDirectory() as d:
