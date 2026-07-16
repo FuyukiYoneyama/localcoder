@@ -103,6 +103,11 @@ REVIEW_SCORE_THRESHOLD = int(os.environ.get(
 REVIEW_AFTER_TOOL_CALLS = int(os.environ.get(
     "LOCALCODER_REVIEW_AFTER_TOOL_CALLS", "12"))  # 前回評価からのツール数(+2点)
 REVIEW_NO_PROGRESS_TOOLS = 8    # 進捗イベントなしのツール数(+2点)
+REVIEW_WARMUP_TOOLS = int(os.environ.get(
+    "LOCALCODER_REVIEW_WARMUP_TOOLS", "12"))  # ターン開始からこのツール数までは
+    # no_progressを加点しない(タスク序盤の読み取り専用の探索は正当なため。
+    # §2.1「停滞に見えたが必要な探索である」)。same_error等の病的シグナルは
+    # ウォームアップ中も有効のまま——エラーの嵐は序盤でも本物
 REVIEW_MIN_INTERVAL_TOOLS = 6   # 再発火までに空ける最小ツール数(期限到達は除く)
 REVIEW_MAX_PER_TURN = 3         # 1ターン(1リクエスト)の最大再評価回数
 REVIEW_UNCHANGED_REREAD_LIMIT = 3  # 内容不変の同一ファイル再読がこの回数で+2点
@@ -2091,6 +2096,8 @@ REVIEW_SYSTEM_PROMPT = """これは作業継続のための自動方針再評価
   counterevidenceです。前回と同じ理由でのcontinueを繰り返さないでください。
 - 前回もcontinueで、その後に進捗イベントが1件も無い場合、continueは
   採用されません。adjust/change/stopのいずれかを選んでください。
+- next_step.actionとplanには「使用可能なツール」に列挙されたツールだけを
+  使ってください。列挙されていないツール名を提案してはいけません。
 
 事実と推測を分離してください。既に失敗した手順を理由なく繰り返さないでください。
 変更済みファイルとユーザーの固定指示を維持してください。
@@ -2160,6 +2167,7 @@ class ReviewState:
 
     def __init__(self, turn_started_at: float | None = None):
         self.turn_started_at = turn_started_at or time.time()
+        self.total_tool_calls = 0   # このターンの総ツール数(ウォームアップ判定用、リセットしない)
         self.tool_calls_since_review = 0
         self.tools_since_last_progress = 0
         self.same_tool_failure_count = 0
@@ -2200,11 +2208,19 @@ class ReviewState:
         self.compacted_since_review = True
         self.tools_after_compaction = 0
 
-    def note_empty_recovery(self) -> None:
-        self.empty_response_recovered = True
+    def note_empty_recovery(self, compacted: bool = True) -> None:
+        """空応答からの自動回復時に呼ぶ。§11.6が空応答回復に+3点を与えるのは
+        「予算の天井付近で文脈が枯渇した」シナリオを想定しているため、強制圧縮が
+        実際に履歴を縮めた(=文脈圧迫が原因だった)場合のみシグナルとして扱う。
+        低トークンでの単発の空応答はモデルの一時的な不調で、既存のnudgeだけで
+        回復する——実セッションで、予算の1割時点の空応答が+3点となり
+        ターン序盤の探索中に再評価が発火しすぎた実例があった。"""
+        if compacted:
+            self.empty_response_recovered = True
 
     def note_tool_result(self, name: str, result: str, repeat_count: int) -> None:
         """ツール実行1回ごとに呼ぶ。進捗イベントとエラー署名の機械的判定もここで行う。"""
+        self.total_tool_calls += 1
         self.tool_calls_since_review += 1
         self.tools_since_failed_attempt += 1
         if self.compacted_since_review:
@@ -2305,7 +2321,10 @@ def review_score(state: ReviewState, now: float | None = None) -> tuple[int, lis
     if state.tool_calls_since_review >= REVIEW_AFTER_TOOL_CALLS:
         score += 2
         reasons.append("many_tool_calls")
-    if state.tools_since_last_progress >= REVIEW_NO_PROGRESS_TOOLS:
+    if state.tools_since_last_progress >= REVIEW_NO_PROGRESS_TOOLS \
+       and state.total_tool_calls >= REVIEW_WARMUP_TOOLS:
+        # ターン序盤(ウォームアップ中)の読み取り専用の探索は正当なので、
+        # no_progressはウォームアップを過ぎてから加点する
         score += 2
         reasons.append("no_progress")
     if state.same_tool_failure_count >= 2:
@@ -2410,6 +2429,12 @@ def build_review_context(messages: list, state: ReviewState,
     if recent:
         lines.append("直近のツール呼び出し:")
         lines.extend(recent[-10:])
+
+    # 存在しないツールをnext_stepに推奨する判定を防ぐ(実例: unknown toolで
+    # 失敗し続けたopen_fileを、ADJUST判定が「再度呼び出せ」と勧めてしまった)
+    tool_names = [t.get("function", {}).get("name", "") for t in all_tools()]
+    lines.append("使用可能なツール(これ以外のツールは存在しない): "
+                 + ", ".join(n for n in tool_names if n))
 
     lines.append("")
     lines.append("機械的カウンタ:")
@@ -3034,7 +3059,9 @@ class Handler(BaseHTTPRequestHandler):
                         if messages is not _before_compact:
                             diag_compact_count += 1
                             rev.note_compaction()
-                        rev.note_empty_recovery()
+                        # 圧縮が実際に縮めた場合のみ再評価シグナルにする(文脈圧迫が
+                        # 原因の空応答と、低トークンでの単発の不調を区別する)
+                        rev.note_empty_recovery(compacted=messages is not _before_compact)
                         self._sse({"type": "notice",
                                    "message": "モデルが空の応答を返したため、文脈を圧縮してから"
                                               "続行を促しています…"})

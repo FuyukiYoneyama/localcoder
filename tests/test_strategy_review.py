@@ -81,9 +81,35 @@ class TestReviewScore(unittest.TestCase):
         st = s.ReviewState(turn_started_at=1000)
         st.tool_calls_since_review = s.REVIEW_AFTER_TOOL_CALLS
         st.tools_since_last_progress = s.REVIEW_NO_PROGRESS_TOOLS
+        st.total_tool_calls = s.REVIEW_WARMUP_TOOLS  # ウォームアップは通過済み
         score, reasons = s.review_score(st, now=1001)
         self.assertEqual(score, 4)
         self.assertEqual(set(reasons), {"many_tool_calls", "no_progress"})
+
+    def test_no_progress_is_suppressed_during_warmup(self):
+        """ターン序盤(ウォームアップ中)の読み取り専用の探索はno_progressに
+        加点しない。実セッションで、タスク開始直後の正当な資料調査11回+
+        低トークンでの空応答(+3)により早すぎる介入が起きた。"""
+        st = s.ReviewState(turn_started_at=1000)
+        for _ in range(s.REVIEW_WARMUP_TOOLS - 1):
+            st.note_tool_result("read_file", "content", 0)
+        self.assertGreaterEqual(st.tools_since_last_progress, s.REVIEW_NO_PROGRESS_TOOLS)
+        score, reasons = s.review_score(st, now=1001)
+        self.assertNotIn("no_progress", reasons)  # ウォームアップ中は加点しない
+        st.note_tool_result("read_file", "content", 0)  # 12回目で通過
+        score, reasons = s.review_score(st, now=1001)
+        self.assertIn("no_progress", reasons)
+
+    def test_pathological_signals_active_during_warmup(self):
+        """エラーの嵐はターン序盤でも本物——same_errorはウォームアップ中も有効。"""
+        st = s.ReviewState(turn_started_at=1000)
+        for i in range(3):
+            st.note_tool_result(
+                "read_file", f"ERROR: FileNotFoundError: no such file: /x/f{i}.py", 0)
+        self.assertLess(st.total_tool_calls, s.REVIEW_WARMUP_TOOLS)
+        score, reasons = s.review_score(st, now=1001)
+        self.assertIn("same_error", reasons)
+        self.assertGreaterEqual(score, 3)
 
     def test_same_tool_failure_scores_three(self):
         st = s.ReviewState(turn_started_at=1000)
@@ -99,6 +125,15 @@ class TestReviewScore(unittest.TestCase):
         self.assertEqual(score, 3)
         self.assertIn("empty_response_recovered", reasons)
 
+    def test_empty_recovery_without_compaction_is_not_a_signal(self):
+        """§11.6の+3点は文脈枯渇のシナリオ用。強制圧縮が何も縮めなかった
+        (=低トークンでの単発の不調だった)場合はシグナルにしない。"""
+        st = s.ReviewState(turn_started_at=1000)
+        st.note_empty_recovery(compacted=False)
+        score, reasons = s.review_score(st, now=1001)
+        self.assertEqual(score, 0)
+        self.assertNotIn("empty_response_recovered", reasons)
+
     def test_long_elapsed_needs_no_progress_too(self):
         st = s.ReviewState(turn_started_at=1000)
         score, _ = s.review_score(st, now=1000 + s.REVIEW_ELAPSED_SECONDS)
@@ -111,10 +146,11 @@ class TestReviewScore(unittest.TestCase):
         self.assertEqual(reasons, ["long_elapsed"])
 
     def test_incident_pattern_reaches_threshold(self):
-        """実障害と同型: エラーゼロ・書き込みなしの確認ループ+内容不変の再読。"""
+        """実障害と同型: エラーゼロ・書き込みなしの確認ループ+内容不変の再読。
+        ウォームアップ(12ツール)を過ぎた時点で発火水準に達する。"""
         st = s.ReviewState(turn_started_at=1000)
         notice = s.UNCHANGED_READ_NOTICE_PREFIX + "。SHA256=x、9文字)"
-        for i in range(8):
+        for i in range(s.REVIEW_WARMUP_TOOLS):
             st.note_tool_result("read_file", notice if i < 3 else "content", 0)
         score, reasons = s.review_score(st, now=1005)
         self.assertGreaterEqual(score, s.REVIEW_SCORE_THRESHOLD)
@@ -127,6 +163,7 @@ class TestShouldReviewStrategy(unittest.TestCase):
         st = s.ReviewState(turn_started_at=1000)
         st.tool_calls_since_review = s.REVIEW_AFTER_TOOL_CALLS
         st.tools_since_last_progress = s.REVIEW_NO_PROGRESS_TOOLS
+        st.total_tool_calls = max(s.REVIEW_WARMUP_TOOLS, s.REVIEW_AFTER_TOOL_CALLS)
         return st
 
     def test_fires_at_threshold(self):
@@ -311,6 +348,16 @@ class TestBuildReviewContext(unittest.TestCase):
         self.assertIn("進捗イベントなしのツール呼び出し: 9", ctx)
         self.assertIn("read_file", ctx)
         self.assertIn("(まだ無い)", ctx)  # 変更ファイルなしを明示
+
+    def test_lists_available_tools(self):
+        """存在しないツール(open_file等)をnext_stepに推奨する判定を防ぐため、
+        使用可能なツール一覧をコンテキストに明記する。"""
+        st = s.ReviewState(turn_started_at=1000)
+        ctx = s.build_review_context([], st, now=1001)
+        self.assertIn("使用可能なツール", ctx)
+        self.assertIn("read_file", ctx)
+        self.assertIn("run_command", ctx)
+        self.assertNotIn("open_file", ctx)
 
     def test_includes_previous_review_and_outcome(self):
         st = s.ReviewState(turn_started_at=1000)
