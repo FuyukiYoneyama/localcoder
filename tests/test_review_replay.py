@@ -134,26 +134,70 @@ class TestEarlyIntervention(unittest.TestCase):
 
 
 class TestStuckRelativePath(unittest.TestCase):
-    """mrnfwve8nnr3t2.json: 方針再評価自体は正しく機能した(3回の発火が
+    """mrnfwve8nnr3t2.json: 方針再評価自体は正しく機能した(最初の3回の発火が
     現在のロジックとも完全一致)例。実際にターンを止めたのは無関係な既存の
     TOOL_STUCK_LIMIT(相対パスの解釈違いで同一エラーが3回連続)だった。
     この回帰テストは「発火タイミングが妥当な良い例」を固定化し、以後の
     チューニングがこの正常系を壊していないかを確認する目的。write_file等の
     結果メッセージを解決済み絶対パスにする修正はこのセッションが動機だが、
-    それ自体は方針再評価と無関係なのでtest_tool_provider.pyで別途検証する。"""
+    それ自体は方針再評価と無関係なのでtest_tool_provider.pyで別途検証する。
+
+    REVIEW_MAX_PER_TURNを3→8へ引き上げた後は、当時の上限(3回)で打ち切られて
+    いた4回目のチェックが#24で新たに発生する(採用実績は無いので不採用扱い)。
+    これは意図した改善であり、当時存在しなかった追加チェック自体を固定化する。
+    """
 
     def setUp(self):
         self.events = s.replay_review_triggers(
             _fixture("stuck_relative_path.json"), turn_started_at=0.0)
 
-    def test_fires_match_history_exactly(self):
-        self.assertEqual(len(self.events), 3)
-        for e in self.events:
+    def test_first_three_fires_match_history_exactly(self):
+        self.assertGreaterEqual(len(self.events), 3)
+        for e in self.events[:3]:
+            self.assertTrue(e["historical"])
+            self.assertTrue(e["adopted"])
+
+    def test_fourth_fire_is_new_from_raised_per_turn_cap(self):
+        """REVIEW_MAX_PER_TURN引き上げ前は3回で打ち切られていた。"""
+        self.assertEqual(len(self.events), 4)
+        fourth = self.events[3]
+        self.assertEqual(fourth["tool_call_index"], 24)
+        self.assertFalse(fourth["historical"])
+        self.assertEqual(self.events[0]["tool_call_index"], 12)
+        self.assertEqual(set(self.events[0]["reasons"]),
+                         {"many_tool_calls", "no_progress"})
+
+
+class TestUnmonitoredThrash(unittest.TestCase):
+    """mrnnt9oripnrok.json: MAX_ITER(80)まで走った長いターンで、当時の上限
+    (REVIEW_MAX_PER_TURN=3)により最初の20ツール呼び出し分しか監視されず、
+    残り60回(同じ小さなmain.cppをrun_command検証なしで30回以上write_file
+    し続ける停滞)が完全に無監視だった。上限を8へ引き上げ、かつ同一パスへの
+    未検証な連続書き込みを進捗に数えないよう修正した後は、#20以降も
+    review_after期限により複数回の追加チェックが発生することを固定化する。
+    """
+
+    def setUp(self):
+        self.events = s.replay_review_triggers(
+            _fixture("unmonitored_thrash.json"), turn_started_at=0.0)
+
+    def test_first_three_fires_match_history(self):
+        self.assertGreaterEqual(len(self.events), 3)
+        for e in self.events[:3]:
             self.assertTrue(e["historical"])
             self.assertTrue(e["adopted"])
         self.assertEqual(self.events[0]["tool_call_index"], 12)
         self.assertEqual(set(self.events[0]["reasons"]),
-                         {"many_tool_calls", "no_progress"})
+                         {"many_tool_calls", "no_progress", "same_error"})
+
+    def test_oversight_continues_past_the_old_three_shot_cap(self):
+        """旧上限(3回)では発生し得なかった、tool_call_index 20超の追加発火。"""
+        later_fires = [e for e in self.events if e["tool_call_index"] > 20]
+        self.assertTrue(later_fires, "20回目より後に一切発火していない(旧上限のまま)")
+
+    def test_hits_the_raised_per_turn_cap_not_left_unbounded(self):
+        """上限自体は依然として有効(無制限ではない)。"""
+        self.assertEqual(len(self.events), s.REVIEW_MAX_PER_TURN)
 
 
 if __name__ == "__main__":

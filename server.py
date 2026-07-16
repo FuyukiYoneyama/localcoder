@@ -109,7 +109,15 @@ REVIEW_WARMUP_TOOLS = int(os.environ.get(
     # §2.1「停滞に見えたが必要な探索である」)。same_error等の病的シグナルは
     # ウォームアップ中も有効のまま——エラーの嵐は序盤でも本物
 REVIEW_MIN_INTERVAL_TOOLS = 6   # 再発火までに空ける最小ツール数(期限到達は除く)
-REVIEW_MAX_PER_TURN = 3         # 1ターン(1リクエスト)の最大再評価回数
+REVIEW_MAX_PER_TURN = int(os.environ.get(
+    "LOCALCODER_REVIEW_MAX_PER_TURN", "8"))  # 1ターン(1リクエスト)の最大再評価回数。
+    # 実障害: MAX_ITER(80)近くまで走った長いターンで、序盤に3回発火して上限に
+    # 達した後、残り60回のツール呼び出しが完全に無監視のまま進んだ(同じ
+    # 小さなファイルへのwrite_fileを30回以上繰り返す停滞が検知されなかった)。
+    # §13の「連続発火の防止」は同一ターン内のスパム抑止が目的で、ターンの
+    # 長さに関わらず高々3回しか介入しないという意味ではなかったため、
+    # MAX_ITERに対して十分な回数(REVIEW_MIN_INTERVAL_TOOLS=6間隔で最大約
+    # 13回発火し得るところ、余裕を持って8回)に引き上げた。
 REVIEW_UNCHANGED_REREAD_LIMIT = 3  # 内容不変の同一ファイル再読がこの回数で+2点
 REVIEW_ELAPSED_SECONDS = 600    # 経過時間の発火条件(進捗なし5ツール以上と併用で+1点)
 REVIEW_VALID_DECISIONS = ("continue", "adjust", "change", "stop")
@@ -2195,6 +2203,13 @@ class ReviewState:
         # 前回の採用済み再評価以降の進捗イベント(§10)とエラー署名(§11.4)
         self.progress_events: list[dict] = []
         self.error_sig_counts: dict[str, int] = {}
+        # write_file/edit_fileで変更したが、その後run_commandによる検証を
+        # 一度も試みていないパスの集合(find_unverified_changesと同じ考え方)。
+        # 同じパスへの2回目以降の書き込みは「進捗」に数えない——実障害では、
+        # 同じ小さなファイルへのwrite_fileを30回以上繰り返すだけで一度も
+        # ビルドを試みない停滞が、書き込みの成功のたびにno_progressを
+        # リセットしてしまうため検知できなかった。
+        self.unverified_write_paths: set[str] = set()
         self._last_cmd_ok: bool | None = None
 
     @property
@@ -2226,7 +2241,8 @@ class ReviewState:
         if compacted:
             self.empty_response_recovered = True
 
-    def note_tool_result(self, name: str, result: str, repeat_count: int) -> None:
+    def note_tool_result(self, name: str, result: str, repeat_count: int,
+                         args: dict | None = None) -> None:
         """ツール実行1回ごとに呼ぶ。進捗イベントとエラー署名の機械的判定もここで行う。"""
         self.total_tool_calls += 1
         self.tool_calls_since_review += 1
@@ -2236,8 +2252,20 @@ class ReviewState:
         self.same_tool_failure_count = repeat_count
         progress_type = None
         if name in MUTATING_TOOLS and isinstance(result, str) and result.startswith("OK"):
-            progress_type = "file_changed"
+            if name in ("write_file", "edit_file"):
+                path = (args or {}).get("path")
+                # 同じパスへ、間に検証(run_command)を挟まず繰り返し書き込んで
+                # いる場合は進捗として数えない。最初の1回だけ進捗になる。
+                if not path or path not in self.unverified_write_paths:
+                    progress_type = "file_changed"
+                    if path:
+                        self.unverified_write_paths.add(path)
+            else:
+                progress_type = "file_changed"
         if name == "run_command":
+            # 検証を試みた(成否は問わない)ので、次の書き込みはまた「新規」扱いに
+            # する——find_unverified_changesと同じ「検証を試みたか」基準
+            self.unverified_write_paths.clear()
             ok = parse_command_result(result or "").get("ok")
             if ok and self._last_cmd_ok is False:
                 progress_type = "command_recovered"  # 失敗していたコマンドが通った=改善
@@ -2376,7 +2404,7 @@ def replay_review_triggers(messages: list, turn_started_at: float | None = None,
                 tool_call_index += 1
                 last_failed_sig, tool_repeat, _ = track_tool_repeat(
                     name, args, result, last_failed_sig, tool_repeat)
-                rev.note_tool_result(name, result, tool_repeat)
+                rev.note_tool_result(name, result, tool_repeat, args)
                 t = _now()
                 fire, reasons = should_review_strategy(rev, now=t)
                 if fire:
@@ -3213,7 +3241,7 @@ class Handler(BaseHTTPRequestHandler):
                     messages.append(tool_msg)
                     last_failed_sig, tool_repeat, is_stuck = track_tool_repeat(
                         name, args, result, last_failed_sig, tool_repeat)
-                    rev.note_tool_result(name, result, tool_repeat)
+                    rev.note_tool_result(name, result, tool_repeat, args)
                     if is_stuck:
                         stuck = True
                         break

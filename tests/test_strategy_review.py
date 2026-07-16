@@ -61,6 +61,67 @@ class TestReviewStateProgress(unittest.TestCase):
         st.note_tool_result("run_command", "exit_code=0\nls output", 0)
         self.assertEqual(st.tools_since_last_progress, 1)
 
+    def test_repeated_write_to_same_unverified_path_is_not_progress(self):
+        """実障害: 同じ小さなファイルへのwrite_fileを30回以上、一度も
+        run_commandで検証せずに繰り返す停滞が、書き込み成功のたびに
+        no_progressをリセットしてしまい検知できなかった。2回目以降の
+        同一パスへの書き込みは(検証を挟まない限り)進捗に数えない。"""
+        st = s.ReviewState(turn_started_at=0)
+        st.note_tool_result("write_file", "OK: wrote 10 chars to a.py", 0,
+                            {"path": "a.py", "content": "x"})
+        self.assertEqual(st.tools_since_last_progress, 0)  # 1回目は進捗
+        for _ in range(10):
+            st.note_tool_result("write_file", "OK: wrote 12 chars to a.py", 0,
+                                {"path": "a.py", "content": "xy"})
+        self.assertEqual(st.tools_since_last_progress, 10)  # 以降は進捗にならない
+
+    def test_different_paths_each_count_as_progress(self):
+        st = s.ReviewState(turn_started_at=0)
+        st.note_tool_result("write_file", "OK: wrote 1 chars to a.py", 0,
+                            {"path": "a.py"})
+        st.note_tool_result("write_file", "OK: wrote 1 chars to b.py", 0,
+                            {"path": "b.py"})
+        self.assertEqual(st.tools_since_last_progress, 0)
+
+    def test_run_command_clears_unverified_paths_allowing_progress_again(self):
+        """run_commandによる検証を試みれば(成否問わず)、同じファイルへの
+        次の書き込みは再び「新規」の進捗として扱われる。"""
+        st = s.ReviewState(turn_started_at=0)
+        st.note_tool_result("write_file", "OK: wrote 1 chars to a.py", 0,
+                            {"path": "a.py"})
+        st.note_tool_result("write_file", "OK: wrote 2 chars to a.py", 0,
+                            {"path": "a.py"})
+        self.assertEqual(st.tools_since_last_progress, 1)
+        st.note_tool_result("run_command", "exit_code=1\nbuild failed", 0)
+        st.note_tool_result("write_file", "OK: wrote 3 chars to a.py", 0,
+                            {"path": "a.py"})
+        self.assertEqual(st.tools_since_last_progress, 0)
+
+    def test_missing_args_falls_back_to_always_counting_as_progress(self):
+        """argsを渡さない既存の呼び出し元(後方互換)では、パス単位の抑制を
+        適用できないため常に進捗として扱う(従来の挙動のまま)。"""
+        st = s.ReviewState(turn_started_at=0)
+        for _ in range(5):
+            st.note_tool_result("write_file", "OK: wrote 1 chars to a.py", 0)
+        self.assertEqual(st.tools_since_last_progress, 0)
+
+    def test_edit_file_same_path_repetition_is_also_suppressed(self):
+        st = s.ReviewState(turn_started_at=0)
+        st.note_tool_result("edit_file", "OK: replaced 1 occurrence(s) in a.py", 0,
+                            {"path": "a.py"})
+        st.note_tool_result("edit_file", "OK: replaced 1 occurrence(s) in a.py", 0,
+                            {"path": "a.py"})
+        self.assertEqual(st.tools_since_last_progress, 1)
+
+    def test_delete_move_copy_are_not_subject_to_path_suppression(self):
+        """削除・移動・コピーは「同じ内容を繰り返し書き直す」パターンでは
+        ないため、パス単位の抑制対象外(常に進捗)のまま。"""
+        st = s.ReviewState(turn_started_at=0)
+        for _ in range(3):
+            st.note_tool_result("delete_file", "OK: deleted a.py (reversible for this turn)",
+                                0, {"path": "a.py"})
+        self.assertEqual(st.tools_since_last_progress, 0)
+
     def test_unchanged_reread_is_counted(self):
         st = s.ReviewState(turn_started_at=0)
         notice = s.UNCHANGED_READ_NOTICE_PREFIX + "。SHA256=abc、10文字)"
@@ -156,6 +217,14 @@ class TestReviewScore(unittest.TestCase):
         self.assertGreaterEqual(score, s.REVIEW_SCORE_THRESHOLD)
         self.assertIn("no_progress", reasons)
         self.assertIn("unchanged_reread", reasons)
+
+
+class TestReviewMaxPerTurn(unittest.TestCase):
+    def test_default_allows_oversight_across_a_long_turn(self):
+        """実障害: 上限3回で長いターン(80イテレーション)の後半60回が完全に
+        無監視になった。MAX_ITER(80)とREVIEW_MIN_INTERVAL_TOOLS(6)に対し、
+        最低でも6回程度は間隔を空けて発火できる余地が要る。"""
+        self.assertGreaterEqual(s.REVIEW_MAX_PER_TURN, 6)
 
 
 class TestShouldReviewStrategy(unittest.TestCase):
