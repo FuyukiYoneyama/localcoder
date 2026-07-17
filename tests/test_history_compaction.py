@@ -213,6 +213,67 @@ class TestCompactHistoryGoalImmutability(unittest.TestCase):
         self.assertEqual(goal, original)
 
 
+class TestArchiveRawMessages(unittest.TestCase):
+    """圧縮で要約に置き換えられる直前の生ログを、コンテキストとは別に
+    history/raw/<sid>.jsonlへ残す(analyze-without-losing-detailの要望)。"""
+
+    def setUp(self):
+        import tempfile
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._orig_raw_dir = s.RAW_HISTORY_DIR
+        s.RAW_HISTORY_DIR = Path(self._tmpdir.name)
+        self._orig_estimate = s.estimate_tokens
+        self._orig_ask = s.ollama_ask
+        self._orig_keep = s.KEEP_RECENT_MSGS
+        s.KEEP_RECENT_MSGS = 2
+
+    def tearDown(self):
+        s.RAW_HISTORY_DIR = self._orig_raw_dir
+        s.estimate_tokens = self._orig_estimate
+        s.ollama_ask = self._orig_ask
+        s.KEEP_RECENT_MSGS = self._orig_keep
+        self._tmpdir.cleanup()
+
+    def test_archive_raw_messages_appends_jsonl(self):
+        s.archive_raw_messages("mysid", [user("a"), assistant("b")])
+        s.archive_raw_messages("mysid", [user("c")])
+        path = s.RAW_HISTORY_DIR / "mysid.jsonl"
+        lines = path.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 3)
+        import json
+        self.assertEqual(json.loads(lines[0]), user("a"))
+        self.assertEqual(json.loads(lines[2]), user("c"))
+
+    def test_archive_raw_messages_noop_for_empty_list(self):
+        s.archive_raw_messages("mysid", [])
+        self.assertFalse((s.RAW_HISTORY_DIR / "mysid.jsonl").exists())
+
+    def test_compact_history_archives_the_portion_it_discards(self):
+        s.estimate_tokens = lambda m: 999999
+        sysm = {"role": "system", "content": "sys"}
+        old = [user("original goal"), assistant("a")] + [user("u"), assistant("a")] * 3
+        recent = [user("r1"), assistant("r2")]
+        s.ollama_ask = FakeOllama(default="要約")
+        s.compact_history([sysm] + old + recent, "model", lambda x: None, sid="mysid")
+
+        path = s.RAW_HISTORY_DIR / "mysid.jsonl"
+        self.assertTrue(path.is_file())
+        import json
+        archived = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        # recent(直近KEEP_RECENT_MSGS件)はまだ圧縮されていないのでアーカイブされず、
+        # oldの部分(要約に置き換えられた分)だけがアーカイブされる
+        self.assertEqual(archived, old)
+
+    def test_compact_history_without_sid_does_not_archive(self):
+        s.estimate_tokens = lambda m: 999999
+        sysm = {"role": "system", "content": "sys"}
+        old = [user("original goal"), assistant("a")] + [user("u"), assistant("a")] * 3
+        recent = [user("r1"), assistant("r2")]
+        s.ollama_ask = FakeOllama(default="要約")
+        s.compact_history([sysm] + old + recent, "model", lambda x: None)
+        self.assertEqual(list(s.RAW_HISTORY_DIR.iterdir()), [])
+
+
 class TestExtractCurrentGoal(unittest.TestCase):
     """IMPROVEMENTS.md §3.1: 圧縮マーカーに保持された現在のゴールを取り出す。"""
 

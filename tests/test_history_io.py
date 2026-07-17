@@ -80,5 +80,66 @@ class TestSaveSessionTitlePersistence(unittest.TestCase):
         self.assertEqual(data["turns"][0], turn)
 
 
+class TestReconstructRaw(unittest.TestCase):
+    """history/raw/<sid>.jsonl(圧縮で捨てられた生ログ)とhistory/<sid>.json
+    (現在の圧縮され続けるセッション本体)を連結し、完全な非圧縮ログを
+    組み立てるtools/reconstruct_raw.pyの単体テスト。"""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        root = Path(self._tmpdir.name)
+        self.history_dir = root
+        self.raw_dir = root / "raw"
+        self.raw_dir.mkdir()
+
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
+        import reconstruct_raw as rr
+        self.rr = rr
+        self.orig_history_dir = rr.HISTORY_DIR
+        self.orig_raw_dir = rr.RAW_HISTORY_DIR
+        rr.HISTORY_DIR = self.history_dir
+        rr.RAW_HISTORY_DIR = self.raw_dir
+
+    def tearDown(self):
+        self.rr.HISTORY_DIR = self.orig_history_dir
+        self.rr.RAW_HISTORY_DIR = self.orig_raw_dir
+        self._tmpdir.cleanup()
+
+    def _write_raw(self, sid, msgs):
+        with open(self.raw_dir / f"{sid}.jsonl", "w", encoding="utf-8") as f:
+            for m in msgs:
+                f.write(json.dumps(m, ensure_ascii=False) + "\n")
+
+    def _write_session(self, sid, messages, **extra):
+        data = {"sid": sid, "model": "m", "workspace": "/ws",
+                "turns": [], "messages": messages, **extra}
+        (self.history_dir / f"{sid}.json").write_text(
+            json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+    def test_concatenates_raw_archive_and_tail_when_no_marker(self):
+        """まだ一度も圧縮されていないセッションは、raw archiveが空で
+        現在のmessagesがそのまま完全ログになる。"""
+        self._write_session("s1", [{"role": "user", "content": "hello"}])
+        out = self.rr.reconstruct("s1")
+        self.assertEqual(out["messages"], [{"role": "user", "content": "hello"}])
+        self.assertEqual(out["reconstructed_from"]["raw_jsonl_messages"], 0)
+
+    def test_prepends_raw_archive_and_drops_compaction_marker(self):
+        old_raw = [{"role": "user", "content": "元の依頼"},
+                   {"role": "assistant", "content": "了解"}]
+        self._write_raw("s2", old_raw)
+        marker = self.rr.MARKER_SUMMARY + "\n要約本文"
+        tail = [{"role": "assistant", "content": "続きの返答"}]
+        self._write_session("s2", [{"role": "user", "content": marker}] + tail)
+
+        out = self.rr.reconstruct("s2")
+        self.assertEqual(out["messages"], old_raw + tail)
+        self.assertTrue(out["reconstructed_from"]["had_compaction_marker"])
+
+    def test_missing_session_file_raises(self):
+        with self.assertRaises(SystemExit):
+            self.rr.reconstruct("does-not-exist")
+
+
 if __name__ == "__main__":
     unittest.main()

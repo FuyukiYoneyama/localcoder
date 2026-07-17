@@ -10,6 +10,25 @@ LocalCoder の主な変更を時系列で記録する。形式は
 
 ---
 
+## 2026-07-18
+
+### 追加
+- **圧縮で要約に置き換えられる直前の生ログを、コンテキストとは別に
+  `history/raw/<sid>.jsonl`へ残すようにした。** `compact_history`が古い
+  部分をLLM要約に置き換えると、その生ログはどこにも残らず、「最後の
+  セッションを検討して」と言われて`tools/replay_review.py`にかけても、
+  圧縮済みの前半部分で方針再評価が何回目のツール呼び出しで最初に発火
+  したかを正確な位置で追えないセッションがあった。`archive_raw_messages`
+  を`compact_history`内の要約置き換え直前に1箇所フックし、置き換えられる
+  分を1メッセージ1行のJSONLで追記するだけ(モデルに渡す・保存する側の
+  `messages`は今まで通り圧縮され続けるので文脈予算への影響なし)。分析時は
+  新設の`tools/reconstruct_raw.py <sid>`で生ログアーカイブと現在の
+  `history/<sid>.json`を連結し、`replay_review.py`にかけられる完全な
+  非圧縮ログを組み立てる。README.mdの「セッションログの分析」セクションを
+  この2段階の運用に更新した。テスト7件追加(`tests/test_history_compaction.py`
+  の`TestArchiveRawMessages`、`tests/test_history_io.py`の
+  `TestReconstructRaw`)、計308件。詳細はREBUILD.md該当セクション参照。
+
 ## 2026-07-17
 
 ### 修正
