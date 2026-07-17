@@ -2227,6 +2227,58 @@ def error_signature(name: str, result: str) -> str | None:
     return sig[:160]
 
 
+# no_progress判定で「探索」として扱う読み取り専用ツール(§14)。
+EXPLORATION_TOOLS = {"read_file", "list_dir", "read_source", "search",
+                     "get_reference", "list_projects"}
+
+
+def _normalize_path_for_novelty(p: str) -> str:
+    """no_progressの再訪判定専用のパス正規化。`./demo2`と`demo2`と`/demo2`の
+    ような表記ゆれ(相対/絶対/`./`接頭辞)だけを同一視する軽量処理——
+    resolve_pathのようなワークスペース基準の実解決はしない(この関数は
+    ワークスペースを知らない純粋関数のまま保つ)。実障害セッションで、
+    パスの言い換えを繰り返すだけの足踏み(`/a/b`→`./a/b`→`a/b`)が、単純な
+    文字列比較では「毎回新しい対象」に見えてno_progressをすり抜けていた。
+    """
+    p = p.strip()
+    while p.startswith("./"):
+        p = p[2:]
+    p = "/" + p.lstrip("/")
+    p = re.sub(r"/+", "/", p).rstrip("/")
+    return p or "/"
+
+
+def _exploration_target(name: str, args: dict | None) -> tuple | None:
+    """読み取り系ツール呼び出しの対象をno_progressの再訪判定用に正規化する。
+
+    対象を特定できない場合(探索ツール以外、または対象を識別する引数が
+    無い)はNoneを返す。Noneは「常に足踏みとして数える」(呼び出し側の
+    フォールバック)——書き込み系でパスが無い場合を常に進捗扱いする既存の
+    フォールバック(test_missing_args_falls_back_to_always_counting_as_progress)
+    と対称的に、安全側(=見逃さない側)に倒す。
+
+    read_file/read_sourceはstart_line/end_lineも対象に含める——同じ
+    ファイルの続きのページを読むのは(たとえパスが同じでも)新しい情報を
+    得ているので、これは再訪ではなく前進として扱う。
+    """
+    if name not in EXPLORATION_TOOLS:
+        return None
+    a = args or {}
+    if name == "search":
+        query = a.get("query")
+        return (name, query, a.get("project"), a.get("kind")) if query else None
+    if name == "get_reference":
+        topic = a.get("topic")
+        return (name, topic, a.get("section")) if topic else None
+    path = a.get("path")
+    if not path:
+        return None
+    norm = _normalize_path_for_novelty(path)
+    if name in ("read_file", "read_source"):
+        return (name, norm, a.get("start_line"), a.get("end_line"))
+    return (name, norm)
+
+
 class ReviewState:
     """1ターン(1リクエスト)内の方針再評価に使う機械的カウンタ群。
 
@@ -2234,6 +2286,15 @@ class ReviewState:
     ファイル変更系ツールの成功、および直前に失敗していたrun_commandの成功
     (=ビルド/テスト結果の改善)の2種類のみ。読むだけの操作は何回成功しても
     進捗に数えない——実障害セッションでは「確認」だけが延々と続いた。
+
+    ただし読み取り専用の探索は、同じ対象への再訪でない限りno_progressにも
+    数えない(§14)。実セッションで、参考資料限定という課題の指示に従って
+    list_projects→ワークフロー文書→実装契約→LCD正本文書→移植元ソースと
+    一貫して新しい対象を掘り下げていたところ、12回目でADJUST、16回目
+    (移植元ファイルを読んでいる最中)でSTOPが発火しターンごと打ち切られた
+    実例があった。エラー0件・同一対象への再訪0件という「前進している探索」
+    と、同じ確認を繰り返す「本当の足踏み」を区別せず一律にカウントしていた
+    のが原因。
     """
 
     def __init__(self, turn_started_at: float | None = None):
@@ -2266,6 +2327,10 @@ class ReviewState:
         # リセットしてしまうため検知できなかった。
         self.unverified_write_paths: set[str] = set()
         self._last_cmd_ok: bool | None = None
+        # no_progress判定用: 前回の進捗イベント以降に訪れた探索対象(§14)。
+        # 同じ対象への再訪でない限りno_progressを進めない(新規対象を掘り下げて
+        # いる間は「足踏み」ではなく「前進」として扱う)。
+        self.exploration_targets_since_progress: set = set()
 
     @property
     def progress_since_review(self) -> int:
@@ -2333,10 +2398,15 @@ class ReviewState:
             self.error_sig_counts[sig] = self.error_sig_counts.get(sig, 0) + 1
         if progress_type:
             self.tools_since_last_progress = 0
+            self.exploration_targets_since_progress = set()
             self.progress_events.append({"type": progress_type, "tool": name,
                                          "at": self.tool_calls_since_review})
         else:
-            self.tools_since_last_progress += 1
+            target = _exploration_target(name, args)
+            if target is None or target in self.exploration_targets_since_progress:
+                self.tools_since_last_progress += 1
+            if target is not None:
+                self.exploration_targets_since_progress.add(target)
 
     def note_attempt(self) -> None:
         """再評価が発火したら(採用の成否が決まる前に)呼ぶ。"""

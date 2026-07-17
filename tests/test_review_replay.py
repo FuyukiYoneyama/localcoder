@@ -32,9 +32,19 @@ def _fixture(name: str) -> list:
 
 class TestRunawayNoProgress(unittest.TestCase):
     """mrm597jy640ydz.json: 資料収集後にモデルが前ターンのSTOPを踏まえて
-    実際に8ファイル作成した「成功」セッション。今回のチューニング変更後も、
-    序盤の探索(12ツール目まで)には介入せず、その後は履歴の実際の発火と
-    一致することを固定化する。"""
+    実際に8ファイル作成した「成功」セッション。序盤の探索(12ツール目まで)には
+    介入しない。
+
+    §14(探索対象の再訪判定)導入後、実際のツール#1〜13は一貫して新規の
+    パス・topicを読んでおり(list_projects→get_reference×2→read_source×2→
+    get_reference×2→read_source×3→search→read_source→list_dir)、これは
+    もう足踏みとして数えない。一方#14・#16・#17は同じ`list_dir
+    /home/user/project/test/demo2`(空フォルダ)への完全な再訪であり、これは
+    従来通りno_progressに積み上がる。結果、最初の発火は元の履歴(#12)より
+    後ろの#25にずれるが、「序盤の探索には介入しない」という主旨自体は
+    変わらず、むしろより正確に「本当に足踏みしている箇所」で発火する
+    ようになった(2026-07-18、ユーザーからの実セッション指摘を受けた
+    チューニング)。"""
 
     def setUp(self):
         self.events = s.replay_review_triggers(
@@ -44,38 +54,40 @@ class TestRunawayNoProgress(unittest.TestCase):
         self.assertTrue(all(e["tool_call_index"] >= s.REVIEW_WARMUP_TOOLS
                             for e in self.events))
 
-    def test_first_fire_matches_history(self):
+    def test_first_fire_is_after_the_repeated_empty_dir_check(self):
+        """#14/#16/#17で同じ空フォルダを3回list_dirしている(再訪=足踏み)。
+        その後の最初のno_progress到達点で発火する(元の履歴の#12より後ろ)。"""
         first = self.events[0]
-        self.assertEqual(first["tool_call_index"], 12)
+        self.assertGreater(first["tool_call_index"], 12)
         self.assertEqual(set(first["reasons"]), {"many_tool_calls", "no_progress"})
-        self.assertTrue(first["historical"])
-        self.assertTrue(first["adopted"])
 
-    def test_at_least_two_fires(self):
-        self.assertGreaterEqual(len(self.events), 2)
+    def test_at_least_one_fire(self):
+        """§14導入前は2回発火していたが、序盤の新規探索の分がno_progress
+        から除外されるようになり、後半の1回(同じ空フォルダの再訪+
+        run_command)にまとまった。実際に問題があった箇所自体が検知
+        されなくなったわけではないことを確認する。"""
+        self.assertGreaterEqual(len(self.events), 1)
 
 
 class TestEarlyStopWeakerModel(unittest.TestCase):
     """mrmkx5xnep2b1c.json: ornith:35bが17ツール・8イテレーションで
-    CONTINUE→STOPと素早く介入されたセッション。実障害(74回)と比べ
-    一桁少ない段階での検知を維持できていることを固定化する。"""
+    CONTINUE→STOPと素早く介入されたセッション。
+
+    実際のツール列を見直すと、17回すべてが新規の対象(list_projects→
+    list_dir→get_reference×複数トピック・複数セクション→search→
+    read_source→類似プロジェクトの参照実装の下見)で、エラーも再訪も
+    0件——まさに「序盤の全体像把握」そのものだった。§14(探索対象の
+    再訪判定)導入前は、これが当時の実障害(74回の生の足踏み)と
+    同列に扱われ、CONTINUE→STOPで打ち切られていた。§14導入後は
+    一切発火しない(2026-07-18、ユーザーからの実セッション指摘を
+    受けたチューニング)。"""
 
     def setUp(self):
         self.events = s.replay_review_triggers(
             _fixture("early_stop_weaker_model.json"), turn_started_at=0.0)
 
-    def test_fires_match_history_exactly(self):
-        self.assertEqual(len(self.events), 2)
-        first, second = self.events
-        self.assertEqual(first["tool_call_index"], 12)
-        self.assertTrue(first["adopted"])
-        self.assertEqual(second["tool_call_index"], 16)
-        self.assertEqual(second["reasons"], ["review_after_due"])
-        self.assertTrue(second["adopted"])
-
-    def test_detected_within_20_tool_calls(self):
-        """介入が74回停滞と同レベルまで遅延していないことの目安。"""
-        self.assertLess(self.events[-1]["tool_call_index"], 20)
+    def test_no_intervention_during_pure_exploration(self):
+        self.assertEqual(self.events, [])
 
 
 class TestWorkspaceBoundaryErrors(unittest.TestCase):
@@ -111,9 +123,15 @@ class TestEarlyIntervention(unittest.TestCase):
     発火が遅延する」と見積もっていたが、実際にreplay_review_triggersで
     確認するとREVIEW_AFTER_TOOL_CALLSとREVIEW_WARMUP_TOOLSが偶然どちらも
     12であるため、ウォームアップ終了と同時にmany_tool_calls(+2)が
-    独立に加点され、結局12ツール目で(理由は変わるが)発火する。
-    机上の見積もりと実際の挙動が食い違うことをこの回帰テストとCLIツールが
-    実際に検出した——これが本ツールを作った動機そのものである。
+    独立に加点され、結局12ツール目で(理由は変わるが)発火していた。
+
+    §14(探索対象の再訪判定)導入後は、12ツール目までの中に含まれていた
+    新規対象の探索がno_progressに数えられなくなったため、発火は当初の
+    見積もり通りsame_tool_failure/same_error(病的シグナル、探索猶予の対象
+    外)が効く15ツール目まで遅延する。「机上の見積もりと実際の挙動が
+    食い違うことをこのツールが検出した」という当初の教訓と、
+    「その後の追加チューニングで見積もりに近づいた」という結果の両方を
+    記録として残す。
     """
 
     def setUp(self):
@@ -123,49 +141,43 @@ class TestEarlyIntervention(unittest.TestCase):
     def test_old_eleven_call_firing_is_gone(self):
         self.assertTrue(all(e["tool_call_index"] != 11 for e in self.events))
 
-    def test_fires_at_warmup_boundary_not_optimistic_estimate(self):
-        """現状: ウォームアップ境界(12)でmany_tool_calls+no_progressにより発火。
-        当初の見積もり(15ツール目でsame_error)ではないことを明示的に固定化する
-        ——閾値定数を独立に変えた場合、この整合はすぐ崩れうる。"""
+    def test_fires_via_pathological_signal_not_plain_no_progress(self):
+        """新規対象の探索(no_progress)ではなく、same_tool_failure/same_error
+        (探索猶予の対象外の病的シグナル)によって発火することを固定化する。"""
         self.assertEqual(len(self.events), 1)
         fire = self.events[0]
-        self.assertEqual(fire["tool_call_index"], s.REVIEW_WARMUP_TOOLS)
-        self.assertIn("many_tool_calls", fire["reasons"])
+        self.assertGreaterEqual(fire["tool_call_index"], s.REVIEW_WARMUP_TOOLS)
+        self.assertIn("same_tool_failure", fire["reasons"])
+        self.assertIn("same_error", fire["reasons"])
 
 
 class TestStuckRelativePath(unittest.TestCase):
-    """mrnfwve8nnr3t2.json: 方針再評価自体は正しく機能した(最初の3回の発火が
-    現在のロジックとも完全一致)例。実際にターンを止めたのは無関係な既存の
-    TOOL_STUCK_LIMIT(相対パスの解釈違いで同一エラーが3回連続)だった。
-    この回帰テストは「発火タイミングが妥当な良い例」を固定化し、以後の
-    チューニングがこの正常系を壊していないかを確認する目的。write_file等の
-    結果メッセージを解決済み絶対パスにする修正はこのセッションが動機だが、
-    それ自体は方針再評価と無関係なのでtest_tool_provider.pyで別途検証する。
+    """mrnfwve8nnr3t2.json: 実際にターンを止めたのは方針再評価とは無関係な
+    既存のTOOL_STUCK_LIMIT(相対パスの解釈違いで同一エラーが3回連続)だった。
+    write_file等の結果メッセージを解決済み絶対パスにする修正はこのセッション
+    が動機だが、それ自体は方針再評価と無関係なのでtest_tool_provider.pyで
+    別途検証する。
 
-    REVIEW_MAX_PER_TURNを3→8へ引き上げた後は、当時の上限(3回)で打ち切られて
-    いた4回目のチェックが#24で新たに発生する(採用実績は無いので不採用扱い)。
-    これは意図した改善であり、当時存在しなかった追加チェック自体を固定化する。
-    """
+    §14(探索対象の再訪判定)導入前は#12で(many_tool_calls+no_progress)、
+    その後#16・#20と3回連続で発火していた。実際の呼び出し列を見ると、
+    #1〜12は`mcp`配下の場所・検索語を変えながらの新規探索(list_projects→
+    search×複数語→list_dir×複数パス)で、これはno_progressの対象外になる。
+    #13・#14のwrite_file成功後、#16/#18/#20は同じ`test/demo2`を、
+    #23〜25は同じ`~/pico`を繰り返しlist_dirしており(再訪)、この部分は
+    従来通りno_progressに積み上がる。加えて実際のエラー(FileNotFoundError
+    5回)によりsame_errorも効くため、最終的に1回(#23、many_tool_calls+
+    same_error)だけ発火する——探索猶予の対象外である病的シグナルは
+    健在なことを確認する。"""
 
     def setUp(self):
         self.events = s.replay_review_triggers(
             _fixture("stuck_relative_path.json"), turn_started_at=0.0)
 
-    def test_first_three_fires_match_history_exactly(self):
-        self.assertGreaterEqual(len(self.events), 3)
-        for e in self.events[:3]:
-            self.assertTrue(e["historical"])
-            self.assertTrue(e["adopted"])
-
-    def test_fourth_fire_is_new_from_raised_per_turn_cap(self):
-        """REVIEW_MAX_PER_TURN引き上げ前は3回で打ち切られていた。"""
-        self.assertEqual(len(self.events), 4)
-        fourth = self.events[3]
-        self.assertEqual(fourth["tool_call_index"], 24)
-        self.assertFalse(fourth["historical"])
-        self.assertEqual(self.events[0]["tool_call_index"], 12)
-        self.assertEqual(set(self.events[0]["reasons"]),
-                         {"many_tool_calls", "no_progress"})
+    def test_fires_once_on_the_real_error_repetition(self):
+        self.assertEqual(len(self.events), 1)
+        fire = self.events[0]
+        self.assertGreater(fire["tool_call_index"], 12)
+        self.assertIn("same_error", fire["reasons"])
 
 
 class TestUnmonitoredThrash(unittest.TestCase):
@@ -187,8 +199,12 @@ class TestUnmonitoredThrash(unittest.TestCase):
             self.assertTrue(e["historical"])
             self.assertTrue(e["adopted"])
         self.assertEqual(self.events[0]["tool_call_index"], 12)
+        # §14(探索対象の再訪判定)導入後: #1〜12の大半は新規パスの探索
+        # (相対/絶対/`./`表記ゆれを正規化しても異なる対象)だったため
+        # no_progressは外れる。実際のエラー反復によるsame_errorは従来通り
+        # 効き、位置(#12)・採用状況は変わらない。
         self.assertEqual(set(self.events[0]["reasons"]),
-                         {"many_tool_calls", "no_progress", "same_error"})
+                         {"many_tool_calls", "same_error"})
 
     def test_oversight_continues_past_the_old_three_shot_cap(self):
         """旧上限(3回)では発生し得なかった、tool_call_index 20超の追加発火。"""

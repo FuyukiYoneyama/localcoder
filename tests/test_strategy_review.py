@@ -131,6 +131,71 @@ class TestReviewStateProgress(unittest.TestCase):
         self.assertEqual(st.unchanged_reread_count, 2)
 
 
+class TestExplorationTarget(unittest.TestCase):
+    """§14: no_progressの再訪判定(_exploration_target/_normalize_path_for_novelty)。
+    実セッションで、参考資料限定という課題の指示に従って一貫して新しい対象を
+    掘り下げていた探索(エラー0件・再訪0件)が、序盤の概観フェーズだと
+    区別されずに介入されていた問題への対応。"""
+
+    def test_read_only_tools_with_distinct_paths_are_each_novel(self):
+        st = s.ReviewState(turn_started_at=0)
+        for p in ("a.py", "b.py", "dir/c.py"):
+            st.note_tool_result("read_file", "content", 0, {"path": p})
+        self.assertEqual(st.tools_since_last_progress, 0)
+
+    def test_revisiting_the_same_path_counts(self):
+        st = s.ReviewState(turn_started_at=0)
+        st.note_tool_result("list_dir", "a b c", 0, {"path": "/x/y"})
+        st.note_tool_result("list_dir", "a b c", 0, {"path": "/x/y"})
+        self.assertEqual(st.tools_since_last_progress, 1)
+
+    def test_leading_dot_slash_and_missing_leading_slash_are_the_same_target(self):
+        """実障害: `/a/b`→`./a/b`→`a/b`という表記ゆれの繰り返しが、単純な
+        文字列比較では「毎回新しい対象」に見えてno_progressをすり抜けていた。"""
+        st = s.ReviewState(turn_started_at=0)
+        st.note_tool_result("list_dir", "x", 0, {"path": "/home/user/demo2"})
+        st.note_tool_result("list_dir", "x", 0, {"path": "./home/user/demo2"})
+        st.note_tool_result("list_dir", "x", 0, {"path": "home/user/demo2"})
+        self.assertEqual(st.tools_since_last_progress, 2)
+
+    def test_different_line_ranges_of_the_same_file_are_each_novel(self):
+        """同じファイルの続きのページを読むのは再訪ではなく前進。"""
+        st = s.ReviewState(turn_started_at=0)
+        st.note_tool_result("read_source", "part1", 0,
+                            {"path": "doc.md", "start_line": 1, "end_line": 100})
+        st.note_tool_result("read_source", "part2", 0,
+                            {"path": "doc.md", "start_line": 100, "end_line": 200})
+        self.assertEqual(st.tools_since_last_progress, 0)
+
+    def test_search_and_get_reference_use_their_own_distinguishing_args(self):
+        st = s.ReviewState(turn_started_at=0)
+        st.note_tool_result("search", "r1", 0, {"query": "sdcard"})
+        st.note_tool_result("search", "r2", 0, {"query": "keyboard"})
+        st.note_tool_result("get_reference", "r3", 0, {"topic": "lcd"})
+        st.note_tool_result("get_reference", "r4", 0,
+                            {"topic": "lcd", "section": "配線"})
+        self.assertEqual(st.tools_since_last_progress, 0)
+        st.note_tool_result("search", "r5", 0, {"query": "sdcard"})
+        self.assertEqual(st.tools_since_last_progress, 1)
+
+    def test_mutating_tools_are_not_subject_to_the_novelty_exemption(self):
+        """write_file等は探索ツールではないので、失敗すれば常に足踏みとして
+        数える(パスが毎回違っても免除しない)。"""
+        st = s.ReviewState(turn_started_at=0)
+        st.note_tool_result("write_file", "ERROR: disk full", 0, {"path": "a.py"})
+        st.note_tool_result("write_file", "ERROR: disk full", 0, {"path": "b.py"})
+        self.assertEqual(st.tools_since_last_progress, 2)
+
+    def test_progress_event_clears_seen_targets(self):
+        """進捗イベントの後は、以前訪れた対象への再訪も改めて「新規」扱いに
+        戻る(その対象について何か変わった可能性があるため)。"""
+        st = s.ReviewState(turn_started_at=0)
+        st.note_tool_result("list_dir", "empty", 0, {"path": "/demo2"})
+        st.note_tool_result("write_file", "OK: wrote 1 chars to a.py", 0, {"path": "a.py"})
+        st.note_tool_result("list_dir", "a.py", 0, {"path": "/demo2"})
+        self.assertEqual(st.tools_since_last_progress, 0)
+
+
 class TestReviewScore(unittest.TestCase):
     def test_zero_for_fresh_state(self):
         st = s.ReviewState(turn_started_at=1000)
@@ -620,13 +685,27 @@ class TestReplayReviewTriggers(unittest.TestCase):
         msgs = self._msgs("read_file", {"path": "a.py"}, "content")
         self.assertEqual(s.replay_review_triggers(msgs, turn_started_at=0.0), [])
 
-    def test_fires_at_warmup_boundary_with_no_progress(self):
+    def test_distinct_targets_never_reach_no_progress(self):
+        """§14: 新しい対象を読み続ける限り(同じ対象への再訪が無い限り)、
+        ウォームアップを過ぎても何十回呼んでもno_progressには加点しない。
+        many_tool_calls単独(+2)は閾値(4)に届かないため一切発火しない。"""
         msgs = []
-        for i in range(s.REVIEW_WARMUP_TOOLS):
+        for i in range(s.REVIEW_WARMUP_TOOLS * 3):
             msgs += self._msgs("read_file", {"path": f"f{i}.py"}, "content")
+        events = s.replay_review_triggers(msgs, turn_started_at=0.0)
+        self.assertEqual(events, [])
+
+    def test_revisiting_the_same_target_fires_at_warmup_boundary(self):
+        """§14: 同じ対象(同じpath)への再訪はこれまで通りno_progressに数える。
+        「新規対象の探索」だけが猶予対象であり、「同じ確認の繰り返し」は
+        従来通り検知する。"""
+        msgs = []
+        for _ in range(s.REVIEW_WARMUP_TOOLS):
+            msgs += self._msgs("read_file", {"path": "a.py"}, "content")
         events = s.replay_review_triggers(msgs, turn_started_at=0.0)
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["tool_call_index"], s.REVIEW_WARMUP_TOOLS)
+        self.assertIn("no_progress", events[0]["reasons"])
         self.assertFalse(events[0]["historical"])
         self.assertFalse(events[0]["adopted"])
 
@@ -656,8 +735,8 @@ class TestReplayReviewTriggers(unittest.TestCase):
         meta = {"role": "localcoder_meta", "meta_type": "strategy_review",
                "review": review, "trigger": {"reasons": ["no_progress"]}}
         msgs = []
-        for i in range(s.REVIEW_WARMUP_TOOLS):
-            msgs += self._msgs("read_file", {"path": f"f{i}.py"}, "content")
+        for _ in range(s.REVIEW_WARMUP_TOOLS):
+            msgs += self._msgs("read_file", {"path": "a.py"}, "content")
         msgs.append(meta)
         for i in range(2):
             msgs += self._msgs("read_file", {"path": f"g{i}.py"}, "content")
@@ -669,8 +748,8 @@ class TestReplayReviewTriggers(unittest.TestCase):
 
     def test_no_historical_meta_marks_not_adopted(self):
         msgs = []
-        for i in range(s.REVIEW_WARMUP_TOOLS):
-            msgs += self._msgs("read_file", {"path": f"f{i}.py"}, "content")
+        for _ in range(s.REVIEW_WARMUP_TOOLS):
+            msgs += self._msgs("read_file", {"path": "a.py"}, "content")
         events = s.replay_review_triggers(msgs, turn_started_at=0.0)
         self.assertFalse(events[0]["adopted"])
         self.assertFalse(events[0]["historical"])
