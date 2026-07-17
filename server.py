@@ -157,6 +157,7 @@ GOAL_SECTION_HEADER = "\n--- 現在のゴール(要約対象外) ---\n"
 GOAL_LINE_RE = re.compile(r"^GOAL:[ \t]*(.*)$", re.MULTILINE)  # 要約LLM出力の先頭行を抽出
 # ([ \t]*であって\s*ではない点に注意: \sは改行にもマッチするため、GOAL値が空の
 # 場合に次行の内容まで巻き込んで抽出してしまうバグが実際にあった)
+GOAL_MAX_CHARS = 4000  # extract_original_user_goalで原文を保持する上限(超えたら切り詰め)
 
 # --- 可逆操作レイヤー (REVERSIBLE_OPERATIONS.md 第1段階: ファイル編集の可逆化) ---
 LEDGER_DIR_NAME = ".localcoder"                    # ワークスペース配下の台帳置き場
@@ -2001,6 +2002,38 @@ def build_marker(summary_text: str, files: list[str], pinned: list[str] | None =
     return body
 
 
+def extract_original_user_goal(messages: list) -> str | None:
+    """ユーザーの最初の(実質的な)発言を、言い換えずそのまま「ゴール」として
+    機械的に取り出す(IMPROVEMENTS.md §3.1)。
+
+    以前はLLMが圧縮のたびにGOAL:行を判定し直していたが、実障害で「他の完成済み
+    アプリは参照しない」という指示があったにもかかわらず、探索中に見つけた
+    無関係な既存プロジェクトが再要約のたびにゴールへ紛れ込み(「PicoCalc LVGL
+    Graphics Demo と test/demo2 の Minimal Editor Demo をビルドする」という
+    誤った二重ゴールへ変質)、存在しない「Editor Demo」を3時間近く探し続ける
+    という重大な事故につながった。言い換え自体がすり替えの原因だったため、
+    原文をそのまま保持することで構造的に防ぐ(このリポジトリの一貫した方針
+    「重要な状態はLLMの記憶ではなくパースではなく機械的に保持する」の適用)。
+
+    空応答/未完了応答の自動nudge、圧縮マーカー自体はゴールとして扱わない。
+    """
+    for m in messages:
+        if m.get("role") != "user":
+            continue
+        c = m.get("content")
+        if not isinstance(c, str):
+            continue
+        c = c.strip()
+        if not c or c in (EMPTY_RESPONSE_NUDGE, UNFINISHED_RESPONSE_NUDGE):
+            continue
+        if c.startswith(MARKER_SUMMARY) or c.startswith(MARKER_OMIT):
+            continue
+        if len(c) > GOAL_MAX_CHARS:
+            c = c[:GOAL_MAX_CHARS] + "\n…(以下省略。原文は最初のユーザー発言を参照)"
+        return c
+    return None
+
+
 def extract_current_goal(messages: list) -> str | None:
     """会話履歴の先頭が圧縮マーカーであれば、そこに保持されている「現在のゴール」
     (IMPROVEMENTS.md §3.1)を取り出す。まだ一度も圧縮が起きていない(＝先頭が
@@ -2825,16 +2858,22 @@ def compact_history(messages: list, model: str, sse, force: bool = False) -> lis
             summary_text, new_goal = summarize_old(new_raw, model)
         else:
             summary_text, new_goal = prev_summary or "", None
-        # ゴールは要約LLMが毎回判定し直すため、新しい判定が得られればそれを採用し、
-        # 得られなければ(GOAL行を出力しなかった等)前回のゴールを引き継ぐ。
-        goal = new_goal or prev_goal
+        # ゴールは一度確定したら以後は不変のまま引き継ぐ(要約LLMには言い換え
+        # させない)。実障害: 圧縮のたびにLLMへゴールを判定し直させていたところ、
+        # 探索中に見つけた無関係な既存プロジェクトが再要約のたびに「ビルド対象」
+        # としてゴールへ紛れ込み、存在しない対象を3時間近く探し続ける事故が
+        # あった。初回のみ、ユーザーの最初の発言そのもの(言い換えなし)を機械的に
+        # ゴールとする。LLMのGOAL:行(new_goal)は、その機械抽出が万一失敗した
+        # 場合のフォールバックとしてのみ使う。
+        goal = prev_goal or extract_original_user_goal(old) or new_goal
         marker = build_marker(summary_text, all_files, all_pinned, goal)
     except Exception as e:
         # 新規分の要約に失敗しても、既存の要約(あれば)・ファイル一覧・固定指示・
         # ゴールは機械的に保持する。全て消すより情報を残す方が安全。
         note = f"(直近の新規会話部分の要約に失敗したため未反映: {type(e).__name__})"
         summary_text = f"{prev_summary}\n{note}" if prev_summary else note
-        marker = build_marker(summary_text, all_files, all_pinned, prev_goal, failed=not prev_summary)
+        goal = prev_goal or extract_original_user_goal(old)
+        marker = build_marker(summary_text, all_files, all_pinned, goal, failed=not prev_summary)
     compacted = [messages[0], {"role": "user", "content": marker}, *recent]
     est3 = estimate_tokens(compacted)
     sse({"type": "compact",

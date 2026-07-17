@@ -149,6 +149,70 @@ class TestExtractGoalLine(unittest.TestCase):
         self.assertEqual(body, "本文")
 
 
+class TestExtractOriginalUserGoal(unittest.TestCase):
+    """ゴールをユーザーの最初の発言そのものから機械的に(言い換えずに)取り出す。
+
+    実障害: 圧縮のたびに要約LLMへゴールを判定し直させていたところ、探索中に
+    見つけた無関係な既存プロジェクトが再要約のたびに「ビルド対象」として
+    ゴールへ紛れ込み、存在しない対象を3時間近く探し続けた。原文をそのまま
+    使うことで言い換えによるすり替えを構造的に防ぐ。
+    """
+
+    def test_returns_first_user_message_verbatim(self):
+        msgs = [user("PicoCalc向けエディタを作ってください"), assistant("了解")]
+        self.assertEqual(s.extract_original_user_goal(msgs),
+                         "PicoCalc向けエディタを作ってください")
+
+    def test_skips_empty_and_nudge_messages(self):
+        msgs = [user(s.EMPTY_RESPONSE_NUDGE), user(s.UNFINISHED_RESPONSE_NUDGE),
+                user("   "), user("本物の最初の指示")]
+        self.assertEqual(s.extract_original_user_goal(msgs), "本物の最初の指示")
+
+    def test_skips_existing_compaction_markers(self):
+        marker = s.build_marker("要約", [], [], "以前のゴール")
+        msgs = [{"role": "user", "content": marker}, user("新しい実質的な発言")]
+        self.assertEqual(s.extract_original_user_goal(msgs), "新しい実質的な発言")
+
+    def test_returns_none_when_no_real_user_message(self):
+        msgs = [assistant("a"), {"role": "tool", "content": "x"}]
+        self.assertIsNone(s.extract_original_user_goal(msgs))
+
+    def test_truncates_very_long_original_message(self):
+        long_text = "x" * (s.GOAL_MAX_CHARS + 500)
+        msgs = [user(long_text)]
+        goal = s.extract_original_user_goal(msgs)
+        self.assertLessEqual(len(goal), s.GOAL_MAX_CHARS + 100)
+        self.assertTrue(goal.startswith("x" * 100))
+
+
+class TestCompactHistoryGoalImmutability(unittest.TestCase):
+    """compact_historyがゴールをLLMに言い換えさせず、一度確定したら不変のまま
+    引き継ぐことを直接検証する(TestCompactHistoryHysteresisの統合テストより
+    ピンポイント)。"""
+
+    def setUp(self):
+        self._orig_estimate = s.estimate_tokens
+        self._orig_ask = s.ollama_ask
+        self._orig_keep = s.KEEP_RECENT_MSGS
+        s.KEEP_RECENT_MSGS = 2
+
+    def tearDown(self):
+        s.estimate_tokens = self._orig_estimate
+        s.ollama_ask = self._orig_ask
+        s.KEEP_RECENT_MSGS = self._orig_keep
+
+    def test_llm_goal_line_is_ignored_on_first_compaction(self):
+        s.estimate_tokens = lambda m: 999999
+        sysm = {"role": "system", "content": "sys"}
+        original = "demo2にPicoCalc向けテキストエディタを新規作成してください"
+        old = [user(original), assistant("a")] + [user("u"), assistant("a")] * 3
+        recent = [user("r1"), assistant("r2")]
+        s.ollama_ask = FakeOllama(default="GOAL: 別の無関係なプロジェクトを探す\n要約")
+        out = s.compact_history([sysm] + old + recent, "model", lambda x: None)
+        _, _, _, goal = s._parse_marker(out[1]["content"])
+        self.assertEqual(goal, original)
+
+
 class TestExtractCurrentGoal(unittest.TestCase):
     """IMPROVEMENTS.md §3.1: 圧縮マーカーに保持された現在のゴールを取り出す。"""
 
@@ -435,9 +499,14 @@ class TestCompactHistoryHysteresis(unittest.TestCase):
         _summary2, _files2, pinned2, _goal2 = s._parse_marker(out2[1]["content"])
         self.assertEqual(pinned2, ["覚えておいて: 外部送信は絶対にしないでください"])
 
-    def test_goal_extracted_and_carried_across_compactions(self):
-        """要約LLMが出力したGOAL行が、圧縮を跨いで引き継がれる(IMPROVEMENTS.md §3.1)。
-        新規分にGOAL行が無い(=判定が得られない)回は前回のゴールを維持する。
+    def test_goal_is_original_user_message_and_immutable_across_compactions(self):
+        """ゴールはユーザーの最初の発言そのもの(機械抽出、言い換えなし)であり、
+        以後の圧縮でLLMが別のGOAL:行を出力しても変わらない(IMPROVEMENTS.md §3.1)。
+
+        実障害: 圧縮のたびにLLMへゴールを判定し直させていたところ、探索中に
+        見つけた無関係な既存プロジェクトが再要約のたびに「ビルド対象」として
+        ゴールへ紛れ込み、存在しない対象を3時間近く探し続ける事故があった。
+        言い換え自体が原因だったため、原文を不変のまま保持する設計へ変更した。
         """
         s.KEEP_RECENT_MSGS = 2
         calls = {"n": 0}
@@ -448,22 +517,25 @@ class TestCompactHistoryHysteresis(unittest.TestCase):
 
         s.estimate_tokens = fake_estimate
         sysm = {"role": "system", "content": "sys"}
-        old = [user("u"), assistant("a")] * 4
+        original_request = "既存APIとの互換性を保ったまま新機能を追加してほしい"
+        old = [user(original_request), assistant("a")] + [user("u"), assistant("a")] * 3
         recent = [user("r1"), assistant("r2")]
 
-        s.ollama_ask = FakeOllama(default="GOAL: 既存APIとの互換性を保つ\n要約本文")
+        # LLMがGOAL:行に何を出力しても(あるいは出力しなくても)無視され、
+        # ユーザーの最初の発言そのものが機械的にゴールとして採用される。
+        s.ollama_ask = FakeOllama(default="GOAL: 無関係な別プロジェクトをビルドする\n要約本文")
         out1 = s.compact_history([sysm] + old + recent, "model", lambda x: None)
         _s1, _f1, _p1, goal1 = s._parse_marker(out1[1]["content"])
-        self.assertEqual(goal1, "既存APIとの互換性を保つ")
+        self.assertEqual(goal1, original_request)
 
-        # 2回目: 新規分の要約でGOAL行を出力しなかった(モデルが判定できなかった)状況
-        # をFakeOllamaで再現しても、前回のゴールが消えないことを確認する。
+        # 2回目の圧縮でLLMが全く別のGOAL:行を出力しても、ゴールは最初の発言の
+        # ままで変わらない(要約LLMには言い換えさせない)。
         calls["n"] = 0
-        s.ollama_ask = FakeOllama(default="GOAL行の無い要約本文だけ")
+        s.ollama_ask = FakeOllama(default="GOAL: 探索中に見つけた別の既存デモ\n要約本文2")
         old2 = [out1[1]] + [user("u2"), assistant("a2")] * 4
         out2 = s.compact_history([sysm] + old2 + recent, "model", lambda x: None)
         _s2, _f2, _p2, goal2 = s._parse_marker(out2[1]["content"])
-        self.assertEqual(goal2, "既存APIとの互換性を保つ")
+        self.assertEqual(goal2, original_request)
 
 
 class TestEmptyResponseNearBudgetFixture(unittest.TestCase):
