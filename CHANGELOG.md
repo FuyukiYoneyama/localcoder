@@ -27,7 +27,7 @@ LocalCoder の主な変更を時系列で記録する。形式は
   非圧縮ログを組み立てる。README.mdの「セッションログの分析」セクションを
   この2段階の運用に更新した。テスト7件追加(`tests/test_history_compaction.py`
   の`TestArchiveRawMessages`、`tests/test_history_io.py`の
-  `TestReconstructRaw`)、計308件。詳細はREBUILD.md該当セクション参照。
+  `TestReconstructRaw`)、計308件。詳細はREBUILD.md該当セクション参照。(`57b801b`)
 
 ## 2026-07-17
 
