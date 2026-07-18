@@ -189,7 +189,12 @@ function toolCard(name,argstr,live){
 function setRunning(v){
   running=v;
   $("sendBtn").disabled=v;
-  $("stopBtn").style.display=v?"inline-block":"none";
+  const stopBtn=$("stopBtn");
+  stopBtn.style.display=v?"inline-block":"none";
+  // 新しいターンの開始時(v=true)は、前回の「停止中…」表示が残っていれば
+  // 元のクリック可能な状態に戻す。
+  stopBtn.disabled=false;
+  stopBtn.textContent="■ 停止";
   status.innerHTML=v?'<span class="spin"></span> 実行中…':"";
 }
 
@@ -567,7 +572,31 @@ $("sendBtn").onclick=send;
 input.addEventListener("keydown",e=>{
   if(e.key==="Enter"&&!e.shiftKey&&!e.isComposing){e.preventDefault();send()}
 });
-$("stopBtn").onclick=()=>{stoppedByUser=true;post("/api/stop",{sid})};
+async function requestStop(){
+  // クリック直後に即座に「停止中」へ見た目を変える(押した反応が無いように
+  // 見える問題への対応)。実際に止まるまで多少時間がかかっても構わないが、
+  // POST自体が失敗した場合は取りこぼさず再試行できるようにする。
+  const btn=$("stopBtn");
+  stoppedByUser=true;
+  btn.disabled=true;
+  btn.textContent="■ 停止中…";
+  try{
+    const r=await(await post("/api/stop",{sid})).json();
+    if(!r.ok){
+      throw new Error(r.error||"unknown error");
+    }
+    // found=falseは「対象のターンが見つからなかった」——既に終わっている
+    // 可能性が高いのでエラー扱いにはしない。ボタンは"停止中…"のまま維持し、
+    // 実際のターン終了(setRunning(false))で通常表示に戻す。
+  }catch(e){
+    // POSTがサーバーに届かなかった/失敗した場合はここに来る。取りこぼしを
+    // 防ぐため、再クリックできるよう明示的に戻して知らせる。
+    el("div","err","⚠ 停止コマンドの送信に失敗しました。もう一度お試しください: "+e);
+    btn.disabled=false;
+    btn.textContent="■ 停止";
+  }
+}
+$("stopBtn").onclick=requestStop;
 $("newBtn").onclick=newChat;
 $("diagBtn").onclick=downloadDiagnosticBundle;
 if(window.LC_DEFAULT_WORKSPACE)$("workspace").value=window.LC_DEFAULT_WORKSPACE;

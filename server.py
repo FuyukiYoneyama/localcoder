@@ -3147,11 +3147,15 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "forbidden"}, 403)
             return
         if self.path == "/api/stop":
+            # 「取りこぼしのないように必ず停止する」ため、対象ターンが実際に
+            # 見つかったか(found)をレスポンスに含める——クライアント側はこれを
+            # 見て、見つからなければ再試行するかユーザーに伝えられる。
             body = self._read_body()
             ev = CANCEL.get(body.get("sid", ""))
+            found = ev is not None
             if ev:
                 ev.set()
-            self._json({"ok": True})
+            self._json({"ok": True, "found": found})
             return
         if self.path == "/api/session/delete":
             body = self._read_body()
