@@ -88,6 +88,7 @@ wsl -d ubuntu-24.04 -- bash -lc "python3 ~/localcoder/server.py"
 - [IMPROVEMENTS.md](IMPROVEMENTS.md) — 信頼性・観測性・テスト・性能・保守・配布を含む改善ロードマップ
 - [METACOGNITIVE_REPLANNING.md](METACOGNITIVE_REPLANNING.md) — 停滞・目的逸脱を検知して作業方針を自動再構築するメタ認知・再計画パス設計
 - [EXTERNAL_MCP_SECURITY.md](EXTERNAL_MCP_SECURITY.md) — 内部MCPを安全な既定値として維持しつつ、将来の外部MCP連携に必要な認証・ポリシー・承認・監査を定義する計画書
+- [LOCAL_LLM_CAPABILITY.md](LOCAL_LLM_CAPABILITY.md) — 実プロンプト検証から見えた、現時点のローカルLLM(8GB VRAM級)の実力の輪郭(資料の有無で成否が分かれる傾向)
 
 ## テスト
 
