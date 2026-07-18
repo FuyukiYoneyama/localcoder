@@ -3136,6 +3136,28 @@ class Handler(BaseHTTPRequestHandler):
                 f.unlink()
             self._json({"ok": True})
             return
+        if self.path == "/api/session/rename":
+            # サイドバーの右クリック→名前を変更(codex/claude同様)。derive_title
+            # による自動タイトルはexisting_title優先で上書きされないため
+            # (save_session参照)、ここで書き込めばそのまま定着する。
+            body = self._read_body()
+            title = str(body.get("title", "")).strip()[:60]
+            if not title:
+                self._json({"error": "title is empty"}, 400)
+                return
+            f = HISTORY_DIR / f"{_safe_sid(body.get('sid', ''))}.json"
+            if not f.exists():
+                self._json({"error": "not found"}, 404)
+                return
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+            except Exception as e:
+                self._json({"error": f"{type(e).__name__}: {e}"}, 500)
+                return
+            data["title"] = title
+            f.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            self._json({"ok": True, "title": title})
+            return
         if self.path == "/api/transaction/rollback":
             self._handle_txn_action(rollback_transaction)
             return

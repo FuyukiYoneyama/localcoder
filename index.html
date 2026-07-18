@@ -77,6 +77,14 @@ footer{display:flex;gap:10px;padding:12px 16px;background:var(--panel);border-to
 #input{flex:1;background:var(--panel2);color:var(--text);border:1px solid var(--border);
   border-radius:8px;padding:10px;font-size:14px;resize:none;font-family:inherit;min-height:44px;max-height:200px}
 #sendBtn{background:var(--accent);color:#fff;border:none;padding:0 22px;font-weight:600}
+#sendBtn:disabled{background:var(--panel2);color:var(--dim);border:1px solid var(--border);
+  cursor:not-allowed}
+.sess .st input{width:100%;background:var(--panel);color:var(--text);border:1px solid var(--accent);
+  border-radius:4px;padding:2px 4px;font-size:13px;font-family:inherit}
+.ctxmenu{position:fixed;z-index:200;background:var(--panel2);border:1px solid var(--border);
+  border-radius:6px;padding:4px;box-shadow:0 6px 20px rgba(0,0,0,.4);min-width:140px}
+.ctxmenu .item{padding:6px 10px;font-size:13px;border-radius:4px;cursor:pointer}
+.ctxmenu .item:hover{background:var(--panel)}
 .spin{display:inline-block;width:12px;height:12px;border:2px solid var(--dim);
   border-top-color:var(--accent);border-radius:50%;animation:sp 1s linear infinite;vertical-align:-2px}
 @keyframes sp{to{transform:rotate(360deg)}}
@@ -253,6 +261,7 @@ async function loadSessions(){
       item.querySelector(".st").textContent=s.title;
       item.querySelector(".sd").textContent=ds;
       item.onclick=()=>openSession(s.sid);
+      item.oncontextmenu=ev=>{ev.preventDefault();ev.stopPropagation();showCtxMenu(ev.pageX,ev.pageY,s,item)};
       item.querySelector(".del").onclick=async ev=>{
         ev.stopPropagation();
         if(!confirm("この会話を削除しますか？\n"+s.title))return;
@@ -263,6 +272,48 @@ async function loadSessions(){
       box.appendChild(item);
     }
   }catch(e){/* sidebar failure is non-fatal */}
+}
+
+// ---------- 履歴の右クリックメニュー(名前を変更) ----------
+function showCtxMenu(x,y,s,item){
+  hideCtxMenu();
+  const m=document.createElement("div"); m.className="ctxmenu";
+  const rename=document.createElement("div"); rename.className="item"; rename.textContent="✏️ 名前を変更";
+  rename.onclick=()=>{hideCtxMenu();startRename(s,item)};
+  m.appendChild(rename);
+  document.body.appendChild(m);
+  const w=innerWidth, h=innerHeight, r=m.getBoundingClientRect();
+  m.style.left=Math.min(x,w-r.width-8)+"px";
+  m.style.top=Math.min(y,h-r.height-8)+"px";
+  setTimeout(()=>document.addEventListener("click",hideCtxMenu,{once:true}),0);
+}
+function hideCtxMenu(){document.querySelector(".ctxmenu")?.remove()}
+function startRename(s,item){
+  const stDiv=item.querySelector(".st");
+  const oldText=stDiv.textContent;
+  stDiv.textContent="";
+  const inp=document.createElement("input");
+  inp.type="text"; inp.value=s.title;
+  stDiv.appendChild(inp); inp.focus(); inp.select();
+  let done=false;
+  const commit=async()=>{
+    if(done)return; done=true;
+    const v=inp.value.trim();
+    if(!v||v===s.title){stDiv.textContent=oldText;return}
+    try{
+      const r=await(await post("/api/session/rename",{sid:s.sid,title:v})).json();
+      if(r.error){el("div","err","名前の変更に失敗: "+r.error);stDiv.textContent=oldText;return}
+      s.title=r.title;
+    }catch(e){el("div","err","名前の変更に失敗: "+e);stDiv.textContent=oldText;return}
+    loadSessions();
+  };
+  const cancel=()=>{if(done)return;done=true;stDiv.textContent=oldText};
+  inp.addEventListener("keydown",e=>{
+    if(e.key==="Enter"){e.preventDefault();commit()}
+    else if(e.key==="Escape"){e.preventDefault();cancel()}
+  });
+  inp.addEventListener("blur",commit);
+  inp.addEventListener("click",e=>e.stopPropagation());
 }
 
 async function openSession(id){
