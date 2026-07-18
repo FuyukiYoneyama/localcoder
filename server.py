@@ -205,6 +205,12 @@ HISTORY_DIR.mkdir(exist_ok=True)
 # (RAW_HISTORY.md参照)。history/配下なので.gitignoreの`history/`で自動除外される。
 RAW_HISTORY_DIR = HISTORY_DIR / "raw"
 RAW_HISTORY_DIR.mkdir(exist_ok=True)
+# モデルの think(推論)ストリームは、会話履歴(messages)には一切含めず
+# (含めると独り言そのものが次の文脈を圧迫する)、分析専用にここへ追記する。
+# 通常のturn_done後は表示用DOMごと破棄され、これまでどこにも残らなかった
+# (tools/show_thinking.py参照)。
+THINKING_LOG_DIR = HISTORY_DIR / "thinking"
+THINKING_LOG_DIR.mkdir(exist_ok=True)
 
 # CSRF対策: 起動ごとのランダムトークン。index.html配信時に埋め込み、
 # 全POST APIで X-LocalCoder-Token ヘッダとして要求する。
@@ -605,6 +611,24 @@ def archive_raw_messages(sid: str, msgs: list) -> None:
     with open(path, "a", encoding="utf-8") as f:
         for m in msgs:
             f.write(json.dumps(m, ensure_ascii=False) + "\n")
+
+
+def log_thinking(sid: str, iteration: int, thinking: str, content_len: int) -> None:
+    """モデルのthink(推論)ストリームを分析専用ログへ追記する。
+
+    実セッションで、PIOかGPIOビットバンギングかを何十往復も「FINAL DECISION」
+    と言っては覆す独り言が数千語続き、それが空応答・強制圧縮の一因になった
+    疑いがある実例があった。この独り言はmessages(会話履歴、モデルへ再度渡る
+    方)には一切含めない——含めると独り言自体が次の文脈を圧迫し悪化させる。
+    含めるのはこの分析専用ログだけ(1イテレーション1行のJSONL、追記のみ)。
+    """
+    if not thinking:
+        return
+    path = THINKING_LOG_DIR / f"{_safe_sid(sid)}.jsonl"
+    rec = {"iteration": iteration, "thinking": thinking, "content_len": content_len,
+           "thinking_len": len(thinking), "ts": time.time()}
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
 def save_session(sid: str, model: str, workspace: str, messages: list,
@@ -3309,6 +3333,7 @@ class Handler(BaseHTTPRequestHandler):
                 if tool_calls:
                     amsg["tool_calls"] = tool_calls
                 messages.append(amsg)
+                log_thinking(sid, it, thinking, len(content))
                 self._sse({"type": "turn_done"})
 
                 if not tool_calls:

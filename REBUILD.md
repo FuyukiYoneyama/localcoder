@@ -1440,6 +1440,33 @@ JS実行で右クリック→メニュー表示→リネーム確定→ページ
 無し(HTTPハンドラ層は既存コードでも単体テスト対象外——`/api/session/delete`
 等も同様——ブラウザでの手動/JS検証のみ)。
 
+**thinkストリームの分析専用ログ化の設計ノート**(`log_thinking`/
+`tools/show_thinking.py`): 実セッションで、SPI送信をPIOで書くかGPIO
+ビットバンギングでやるかを「FINAL DECISION」と言っては何度も覆す独り言が
+数千語続き、コードを一行も書かないまま空応答・強制圧縮を招いた疑いのある
+実例があった。ところがこの独り言(Ollamaの`message.thinking`ストリーム)は
+`amsg = {"role":"assistant","content":content}`の通り最終的な`content`
+にしか残らず、`thinking`自体はSSEで一度クライアントに流した後は
+`index.html`側でも表示用DOMごと`turn_done`で破棄されており、どこにも
+保存されていなかった。ユーザーから「今後の解析用に生ログに残した方が
+いいのではないか」との指摘を受けて対応した。
+
+方針は生ログアーカイブ(`archive_raw_messages`)と同じ——**会話履歴
+(`messages`、モデルへ再度渡る方)には含めない**。独り言をそのまま次の
+文脈に含めると、今回のような巨大な独り言がさらに文脈を圧迫し悪化させる
+だけなので、含めるのは分析専用ログ(`history/thinking/<sid>.jsonl`)だけに
+した。メインループで`amsg`を`messages`に追加する直後の1箇所に
+`log_thinking(sid, it, thinking, len(content))`を追加するだけの変更
+(`thinking`が空なら何もしない)。1イテレーション1行のJSONLで、
+`iteration`/`thinking`/`thinking_len`/`content_len`/`ts`を記録する。
+
+分析用に`tools/show_thinking.py <sid>`を新設(一覧表示は長さ+冒頭200文字、
+`--full`で全文、`--iteration N`で特定イテレーションのみ)。実Ollama
+(`qwen3:8b`)で実際にthinkingを発生させ、`history/thinking/<sid>.jsonl`に
+記録され`show_thinking.py`で読み出せることを確認した。単体テスト9件追加
+(`tests/test_history_io.py`の`TestLogThinking`、`tests/test_show_thinking.py`)、
+計320件。
+
 ---
 
 ## 3. ファイル一式

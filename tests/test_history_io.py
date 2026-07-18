@@ -80,6 +80,43 @@ class TestSaveSessionTitlePersistence(unittest.TestCase):
         self.assertEqual(data["turns"][0], turn)
 
 
+class TestLogThinking(unittest.TestCase):
+    """モデルのthink(推論)ストリームを、会話履歴とは別にhistory/thinking/
+    <sid>.jsonlへ残すlog_thinkingの単体テスト。"""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.orig_dir = s.THINKING_LOG_DIR
+        s.THINKING_LOG_DIR = Path(self._tmpdir.name)
+
+    def tearDown(self):
+        s.THINKING_LOG_DIR = self.orig_dir
+        self._tmpdir.cleanup()
+
+    def test_appends_one_line_per_call(self):
+        s.log_thinking("sid1", 0, "うーん、どうしよう", 10)
+        s.log_thinking("sid1", 1, "やっぱりこうする", 20)
+        path = s.THINKING_LOG_DIR / "sid1.jsonl"
+        lines = path.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 2)
+        r0 = json.loads(lines[0])
+        self.assertEqual(r0["iteration"], 0)
+        self.assertEqual(r0["thinking"], "うーん、どうしよう")
+        self.assertEqual(r0["content_len"], 10)
+        self.assertEqual(r0["thinking_len"], len("うーん、どうしよう"))
+        self.assertIn("ts", r0)
+
+    def test_empty_thinking_is_not_logged(self):
+        s.log_thinking("sid2", 0, "", 5)
+        self.assertFalse((s.THINKING_LOG_DIR / "sid2.jsonl").exists())
+
+    def test_separate_sids_go_to_separate_files(self):
+        s.log_thinking("a", 0, "x", 1)
+        s.log_thinking("b", 0, "y", 1)
+        self.assertTrue((s.THINKING_LOG_DIR / "a.jsonl").exists())
+        self.assertTrue((s.THINKING_LOG_DIR / "b.jsonl").exists())
+
+
 class TestReconstructRaw(unittest.TestCase):
     """history/raw/<sid>.jsonl(圧縮で捨てられた生ログ)とhistory/<sid>.json
     (現在の圧縮され続けるセッション本体)を連結し、完全な非圧縮ログを

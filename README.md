@@ -124,3 +124,14 @@ python3 tools/replay_review.py /tmp/<sid>_full.json
 新しい実障害パターンを見つけたら`tests/fixtures/review_incidents/`へ
 パス匿名化のうえ追加し、`tests/test_review_replay.py`に期待値を回帰テストとして
 固定する運用にしている(詳細はREBUILD.md該当セクション参照)。
+
+モデルのthink(推論)ストリームは会話履歴(`history/<sid>.json`)には一切
+含まれず、通常は表示後に破棄される(含めると独り言自体が次の文脈を圧迫
+するため)。分析専用に`history/thinking/<sid>.jsonl`へ1イテレーション1行で
+別途記録しており、異常に長い・同じ言い回しを繰り返す独り言が無いかは
+これで確認する:
+
+```bash
+python3 tools/show_thinking.py <sid>          # 一覧(長さ・冒頭のみ)
+python3 tools/show_thinking.py <sid> --full   # 全文
+```
