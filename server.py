@@ -3377,6 +3377,11 @@ class Handler(BaseHTTPRequestHandler):
                         messages.append({"role": "user", "content": EMPTY_RESPONSE_NUDGE})
                         continue
                     if not content.strip():
+                        # 空応答リトライを使い切って諦めた場合。何もせず既定の
+                        # "completed"のままループを抜けると、実際にゴールへ
+                        # 到達したターンと区別がつかず記録として紛らわしいため、
+                        # 専用のステータスにする(IMPROVEMENTS.md参照)。
+                        turn_status = "empty_exhausted"
                         self._sse({"type": "notice",
                                    "message": "⚠ モデルが空の応答のまま停止しました。"
                                               "具体的な指示を送って続けさせてください。"})
@@ -3484,7 +3489,8 @@ class Handler(BaseHTTPRequestHandler):
 
             # ターン単位の作業サマリー(IMPROVEMENTS.md §7.1)。診断情報(§2.3)を
             # そのままUIに出す。stopped/エラー/切断時は(SSEが既に途切れている
-            # 可能性が高いため)送らない——completed/max_iter/stuckのみ対象。
+            # 可能性が高いため)送らない——completed/max_iter/stuck/
+            # empty_exhaustedのみ対象。
             self._sse({"type": "summary", "data": {
                 "status": turn_status,
                 "duration_seconds": round(time.time() - turn_started_at, 1),

@@ -1467,6 +1467,28 @@ JS実行で右クリック→メニュー表示→リネーム確定→ページ
 (`tests/test_history_io.py`の`TestLogThinking`、`tests/test_show_thinking.py`)、
 計320件。
 
+**`empty_exhausted`ステータスの設計ノート**: 新設したthinkingログを使って
+実セッション(gpt-oss:20b、簡略化した「テキストビューワー」課題)を分析
+したところ、保存された記録が`status: completed`なのに、実際にはCMakeLists.txt
+すら一度も作られておらず、45回のツール呼び出しの大半(42回)が探索で
+終わっていたセッションが見つかった。原因は、空応答リトライ
+(`EMPTY_RETRY_LIMIT=1`)を1回使い切ってもモデルがまた空応答を返した場合、
+ループはただ`break`するだけで`turn_status`をターン開始時の既定値
+`"completed"`のまま変えていなかったこと。ユーザーの指摘(「そこは切り分けた
+方がいい」)を受けて、この経路専用に`turn_status = "empty_exhausted"`を
+設定するようにした(`server.py`の空応答リトライ枯渇箇所、1行追加)。
+`index.html`の`STATUS_LABEL`に`empty_exhausted:"空応答で断念"`を追加し、
+`stuck`/`max_iter`と同じ警告色(`.summary.status-empty_exhausted`)で
+表示する。
+
+これは[[localcoder-scope-philosophy]]的には「生成物の中身の判定」ではなく
+「ターンがどう終わったかという記録の正確さ」の話——実際に完了したのか、
+単に力尽きたのかを開発者が一目で区別できるようにする、外形的な記録の
+話なので対応した。HTTPハンドラ層(`handle_chat`)は既存コードでも単体
+テスト対象外のため、実サーバーで正常系(通常の応答は引き続き`completed`
+になること)のみ確認した——`empty_exhausted`経路自体は空応答がモデルの
+挙動に依存し確実に再現できないため、コードレビューでの確認に留める。
+
 ---
 
 ## 3. ファイル一式

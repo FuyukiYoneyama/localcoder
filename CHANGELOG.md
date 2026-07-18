@@ -82,6 +82,20 @@ LocalCoder の主な変更を時系列で記録する。形式は
   実際にthinkingを発生させ記録・読み出しを確認済み。単体テスト9件追加、
   計320件。詳細はREBUILD.md該当セクション参照。
 
+### 修正
+- **空応答リトライを使い切って諦めたターンが、実際に完了したターンと同じ
+  `status: completed`になっていたのを、専用の`empty_exhausted`ステータスに
+  分けた。** 新設したthinkingログで実セッションを分析した際、保存記録は
+  `completed`なのに実際にはCMakeLists.txtすら一度も作られていなかった
+  セッションが見つかった。原因は、空応答リトライ(`EMPTY_RETRY_LIMIT=1`)を
+  使い切った後モデルがまた空応答を返した場合、ループが`turn_status`を
+  ターン開始時の既定値`"completed"`のまま`break`していたこと。空応答
+  枯渇箇所で`turn_status = "empty_exhausted"`を設定するようにし(`server.py`
+  1行)、`index.html`の`STATUS_LABEL`に「空応答で断念」を追加、`stuck`/
+  `max_iter`と同じ警告色で表示するようにした。実サーバーで正常系
+  (通常の応答は引き続き`completed`になること)を確認。詳細はREBUILD.md
+  該当セクション参照。
+
 ## 2026-07-17
 
 ### 修正

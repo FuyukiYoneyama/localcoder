@@ -71,7 +71,8 @@ details.review .rbody b{color:var(--text)}
   border:1px solid var(--border);border-radius:8px;padding:6px 12px;font-size:12px;
   color:var(--dim);display:flex;flex-wrap:wrap;gap:4px 14px;align-items:center}
 .summary b{color:var(--text)}
-.summary.status-stuck,.summary.status-max_iter{border-color:#4a3f24;color:#e0b04a}
+.summary.status-stuck,.summary.status-max_iter,.summary.status-empty_exhausted{
+  border-color:#4a3f24;color:#e0b04a}
 .summary .undoBtn{padding:2px 8px;font-size:11px}
 footer{display:flex;gap:10px;padding:12px 16px;background:var(--panel);border-top:1px solid var(--border)}
 #input{flex:1;background:var(--panel2);color:var(--text);border:1px solid var(--border);
@@ -333,7 +334,7 @@ async function openSession(id){
 
 const STATUS_LABEL={completed:"完了",max_iter:"最大ループ到達",stuck:"同一失敗で停止",
   stopped:"ユーザー停止",error:"エラー",disconnected:"切断",
-  review_stop:"方針再評価で停止"};
+  review_stop:"方針再評価で停止",empty_exhausted:"空応答で断念"};
 const DECISION_LABEL={continue:"継続",adjust:"調整",change:"方針変更",stop:"停止"};
 function summaryCard(data){
   // changed_files/unverified_changes: ライブ実行中はファイルパスの配列
