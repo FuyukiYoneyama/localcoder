@@ -14,8 +14,13 @@ web_search / fetch_url を使うと検索語やアクセス先URLはインター
 >
 > **`run_command` ツールにサンドボックスはありません。** LLMが実行するコマンドは
 > **あなたのユーザーアカウントと全く同じ権限**で、承認プロンプト無しにそのまま
-> 実行されます。制限されているのは「ファイル読み書き（read_file/write_file/
-> list_dir）の対象パス」が作業フォルダ配下に限られることだけです。
+> 実行されます。ファイル操作ツール（read_file/write_file/edit_file/delete_file/
+> delete_directory/move_file/copy_file/list_dir）には制限がありますが、
+> 読み書きで範囲が異なります。**読み取り**（read_file/list_dir/copy_fileの
+> コピー元）は作業フォルダ全体から自由にできます。**書き込み**（write_file/
+> edit_file/delete_file/delete_directory/move_file/copy_fileのコピー先）は
+> 作業フォルダ（または書き込み範囲を指定していればさらに狭いそのフォルダ）
+> 配下に限られます。
 >
 > **`run_command` はこの制限を受けません。** 作業フォルダの外のファイルを消す、
 > 上書きする、`git push --force` する、`curl`で外部にデータを送信する、
