@@ -42,7 +42,13 @@ LocalCoder の主な変更を時系列で記録する。形式は
   踏まえ、任意の自然言語指示からの逸脱を検知する方向ではなく、
   ユーザー自身が境界を機械的に強制できる設定を用意する方向で設計した。
   UIに「書き込み範囲」欄を追加(省略可、`/api/chat`に`write_root`として送信、
-  セッション保存/再開にも追随)。サーバー側は`resolve_path(ws, path, boundary=...)`
+  セッション保存/再開にも追随)。「作業フォルダ」に既存の📁参照ボタンがある
+  のに書き込み範囲だけテキスト手入力ではUIの一貫性が無いという指摘を受け、
+  同じフォルダ選択ダイアログを書き込み範囲用にも共用する📁選択ボタンを追加
+  した(ダイアログのタイトルと開始位置(現在の書き込み範囲、無ければ作業
+  フォルダ)を選択対象に応じて切り替える`browseTarget`変数のみ追加、
+  ダイアログ自体・`/api/browse`は共通のまま)。サーバー側は
+  `resolve_path(ws, path, boundary=...)`
   の`boundary`引数(省略時は`ws`自身=従来通り)で実現し、`write_file`/`edit_file`/
   `delete_file`/`delete_directory`と`move_file`のsrc/dstを`write_root`に、
   `copy_file`のdstのみ`write_root`に限定した。`copy_file`のsrcと`read_file`/

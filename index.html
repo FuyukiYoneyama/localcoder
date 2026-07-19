@@ -124,6 +124,7 @@ footer{display:flex;gap:10px;padding:12px 16px;background:var(--panel);border-to
   <label>作業フォルダ <input type="text" id="workspace" placeholder="/home/youruser/project"></label>
   <button id="browseBtn" title="フォルダを選ぶ">📁 参照</button>
   <label title="省略可。指定すると、読み取りは作業フォルダ全体のままで、書き込み(作成・編集・削除・移動・コピー先)だけをこのサブフォルダ配下に限定する">書き込み範囲 <input type="text" id="writeRoot" placeholder="(省略可) test/demo1"></label>
+  <button id="browseWriteRootBtn" title="書き込み範囲のフォルダを選ぶ">📁 選択</button>
   <button id="newBtn">＋ 新規チャット</button>
   <button id="stopBtn">■ 停止</button>
   <button id="diagBtn" title="問題報告用の診断情報(バージョン・設定・モデル一覧・現在のセッションの診断ログ)をJSONでダウンロード。会話本文や個人パスは含まない">🩺 診断</button>
@@ -132,7 +133,7 @@ footer{display:flex;gap:10px;padding:12px 16px;background:var(--panel);border-to
 <div id="selfCheckBanner" style="display:none"></div>
 <div id="browseModal" class="modal-overlay" style="display:none">
   <div class="modal">
-    <h3>📁 作業フォルダを選ぶ</h3>
+    <h3 id="browseTitle">📁 作業フォルダを選ぶ</h3>
     <div class="curpath" id="browsePath"></div>
     <div class="dirlist" id="browseList"></div>
     <div class="modal-footer">
@@ -656,9 +657,15 @@ loadSelfCheck();
 
 // ---------- フォルダ選択ダイアログ ----------
 let browsePath="";
-async function openBrowse(){
+let browseTarget="workspace";
+async function openBrowse(target){
+  browseTarget=target;
+  $("browseTitle").textContent=target==="writeRoot"?"📁 書き込み範囲を選ぶ":"📁 作業フォルダを選ぶ";
   $("browseModal").style.display="flex";
-  await browseTo($("workspace").value.trim());
+  const start=target==="writeRoot"
+    ?($("writeRoot").value.trim()||$("workspace").value.trim())
+    :$("workspace").value.trim();
+  await browseTo(start);
 }
 async function browseTo(path){
   try{
@@ -684,10 +691,11 @@ async function browseTo(path){
     }
   }catch(e){el("div","err","フォルダ一覧の取得に失敗: "+e)}
 }
-$("browseBtn").onclick=openBrowse;
+$("browseBtn").onclick=()=>openBrowse("workspace");
+$("browseWriteRootBtn").onclick=()=>openBrowse("writeRoot");
 $("browseCancel").onclick=()=>{$("browseModal").style.display="none"};
 $("browseSelect").onclick=()=>{
-  $("workspace").value=browsePath;
+  $(browseTarget).value=browsePath;
   $("browseModal").style.display="none";
 };
 $("browseModal").addEventListener("click",e=>{
