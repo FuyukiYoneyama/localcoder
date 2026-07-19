@@ -58,7 +58,7 @@ def _detect_version() -> str:
 
 
 SERVER_VERSION = _detect_version()
-MAX_ITER = 80          # 1リクエストあたりの最大ツールループ回数
+MAX_ITER = 160         # 1リクエストあたりの最大ツールループ回数
 TOOL_STUCK_LIMIT = 3   # 同じツール呼び出し(名前+引数)が同じエラーで連続失敗した回数の上限。
                        # 超えたら進展が見込めないと判断しMAX_ITERを待たずループを打ち切る
 TOOL_NAME_TOKEN_RE = re.compile(r"<\|[^|]*\|>")  # モデルが漏らす特殊トークンの除去用
