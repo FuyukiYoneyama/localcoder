@@ -211,6 +211,11 @@ RAW_HISTORY_DIR.mkdir(exist_ok=True)
 # (tools/show_thinking.py参照)。
 THINKING_LOG_DIR = HISTORY_DIR / "thinking"
 THINKING_LOG_DIR.mkdir(exist_ok=True)
+# サイドバーの「削除」は誤操作で戻せないため、まずここへ移動するだけの
+# アーカイブにする。一覧(list_sessions)からは自動的に外れる(HISTORY_DIR
+# 直下を非再帰globするため)。本当の削除はアーカイブ内からのみ行える。
+ARCHIVE_DIR = HISTORY_DIR / "archived"
+ARCHIVE_DIR.mkdir(exist_ok=True)
 
 # CSRF対策: 起動ごとのランダムトークン。index.html配信時に埋め込み、
 # 全POST APIで X-LocalCoder-Token ヘッダとして要求する。
@@ -659,9 +664,9 @@ def save_session(sid: str, model: str, workspace: str, messages: list,
     path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
 
 
-def list_sessions() -> list:
+def _list_sessions_in(directory: Path) -> list:
     out = []
-    for f in HISTORY_DIR.glob("*.json"):
+    for f in directory.glob("*.json"):
         try:
             d = json.loads(f.read_text(encoding="utf-8"))
             out.append({"sid": d["sid"], "title": d.get("title", "(無題)"),
@@ -672,6 +677,24 @@ def list_sessions() -> list:
             continue
     out.sort(key=lambda x: x["updated_at"], reverse=True)
     return out[:200]
+
+
+def list_sessions() -> list:
+    return _list_sessions_in(HISTORY_DIR)
+
+
+def list_archived_sessions() -> list:
+    return _list_sessions_in(ARCHIVE_DIR)
+
+
+def find_session_file(sid: str) -> Path | None:
+    """通常の履歴・アーカイブ済みのどちらにあるかを問わずファイルを探す。"""
+    sid = _safe_sid(sid)
+    for directory in (HISTORY_DIR, ARCHIVE_DIR):
+        f = directory / f"{sid}.json"
+        if f.exists():
+            return f
+    return None
 
 
 def resolve_path(ws: Path, p: str) -> Path:
@@ -2062,22 +2085,66 @@ def extract_original_user_goal(messages: list) -> str | None:
     「重要な状態はLLMの記憶ではなくパースではなく機械的に保持する」の適用)。
 
     空応答/未完了応答の自動nudge、圧縮マーカー自体はゴールとして扱わない。
+
+    「最初の実質的な発言」は単純に「最初のuser発言」ではない——実障害で、
+    ユーザーが本題の前に「こんにちは」とだけ挨拶したセッションがあり、
+    この挨拶(ツール呼び出しを一切伴わなかった)がそのまま不変のゴールとして
+    確定してしまった。その後、本題(PicoCalc向けビューワー作成、69回の
+    ツール呼び出しを伴う実質的な作業)が進んでいたにもかかわらず、方針
+    再評価が「'こんにちは'という目標への進捗がない」という誤った理由で
+    作業を打ち切り、無関係なファイルに挨拶文字列を書いて「ゴール達成」と
+    誤判定した。そのため、各user発言について**次のuser発言までの間に
+    ツール呼び出しが1回でもあったか**を確認し、あればそれを優先してゴールに
+    選ぶ(雑談・挨拶ターン自体は消さず、単に選ばれにくくするだけ)。
+
+    ただし、まだ一度もツール呼び出しが起きていない(=会話が本当にまだ雑談
+    段階)場合にNoneを返すと、`compact_history`側で`goal = prev_goal or
+    extract_original_user_goal(old) or new_goal`のフォールバック先である
+    LLM由来の`new_goal`(要約LLMの言い換え)がその場しのぎで採用され、
+    それが次回以降`prev_goal`として恒久的に固定されてしまう
+    ——ゴール破損を防ぐために作ったこの関数自体が、原文を返せない場面で
+    LLM言い換えの侵入経路になっては本末転倒である。そのため、ツール
+    呼び出しに繋がった発言が1つも無い場合は、機械的な最後の砦として
+    (ツール呼び出しの有無を問わない)最初の有効な発言をそのまま返す
+    ——結果が理想的でない可能性はあるが、常にLLMの言い換えより安全。
     """
-    for m in messages:
+    n = len(messages)
+    first_candidate: str | None = None
+    first_with_tools: str | None = None
+    i = 0
+    while i < n:
+        m = messages[i]
         if m.get("role") != "user":
+            i += 1
             continue
         c = m.get("content")
         if not isinstance(c, str):
+            i += 1
             continue
         c = c.strip()
         if not c or c in (EMPTY_RESPONSE_NUDGE, UNFINISHED_RESPONSE_NUDGE):
+            i += 1
             continue
         if c.startswith(MARKER_SUMMARY) or c.startswith(MARKER_OMIT):
+            i += 1
             continue
-        if len(c) > GOAL_MAX_CHARS:
-            c = c[:GOAL_MAX_CHARS] + "\n…(以下省略。原文は最初のユーザー発言を参照)"
-        return c
-    return None
+        if first_candidate is None:
+            first_candidate = c
+        j = i + 1
+        while j < n and messages[j].get("role") != "user":
+            if messages[j].get("role") == "assistant" and messages[j].get("tool_calls"):
+                first_with_tools = c
+                break
+            j += 1
+        if first_with_tools is not None:
+            break
+        i += 1
+    chosen = first_with_tools or first_candidate
+    if chosen is None:
+        return None
+    if len(chosen) > GOAL_MAX_CHARS:
+        chosen = chosen[:GOAL_MAX_CHARS] + "\n…(以下省略。原文は最初のユーザー発言を参照)"
+    return chosen
 
 
 def extract_current_goal(messages: list) -> str | None:
@@ -3111,14 +3178,19 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"error": "forbidden"}, 403)
                 return
             self._json({"sessions": list_sessions()})
+        elif self.path == "/api/sessions/archived":
+            if not self._token_ok():
+                self._json({"error": "forbidden"}, 403)
+                return
+            self._json({"sessions": list_archived_sessions()})
         elif self.path.startswith("/api/session?"):
             if not self._token_ok():
                 self._json({"error": "forbidden"}, 403)
                 return
             q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-            sid = _safe_sid(q.get("sid", [""])[0])
-            f = HISTORY_DIR / f"{sid}.json"
-            if f.exists():
+            sid = q.get("sid", [""])[0]
+            f = find_session_file(sid)
+            if f is not None:
                 self._json(json.loads(f.read_text(encoding="utf-8")))
             else:
                 self._json({"error": "not found"}, 404)
@@ -3158,23 +3230,52 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": True, "found": found})
             return
         if self.path == "/api/session/delete":
+            # 本当の(取り消せない)削除。誤操作防止のため通常はアーカイブ
+            # 経由でのみ辿り着く想定だが、どちらの場所にあっても削除できる
+            # ようにfind_session_fileで両方見る。
             body = self._read_body()
-            f = HISTORY_DIR / f"{_safe_sid(body.get('sid', ''))}.json"
-            if f.exists():
+            f = find_session_file(body.get("sid", ""))
+            if f is not None:
                 f.unlink()
+            self._json({"ok": True})
+            return
+        if self.path == "/api/session/archive":
+            # サイドバーの「✕」は削除ではなくアーカイブにする(誤操作からの
+            # 復旧手段を残すため)。history/直下からhistory/archived/へ移動
+            # するだけで、一覧(list_sessions)からは自動的に外れる。
+            body = self._read_body()
+            sid = _safe_sid(body.get("sid", ""))
+            src = HISTORY_DIR / f"{sid}.json"
+            if not src.exists():
+                self._json({"error": "not found"}, 404)
+                return
+            src.rename(ARCHIVE_DIR / f"{sid}.json")
+            self._json({"ok": True})
+            return
+        if self.path == "/api/session/unarchive":
+            # アーカイブ一覧からの「元に戻す」。history/archived/から
+            # history/直下へ戻すだけ。
+            body = self._read_body()
+            sid = _safe_sid(body.get("sid", ""))
+            src = ARCHIVE_DIR / f"{sid}.json"
+            if not src.exists():
+                self._json({"error": "not found"}, 404)
+                return
+            src.rename(HISTORY_DIR / f"{sid}.json")
             self._json({"ok": True})
             return
         if self.path == "/api/session/rename":
             # サイドバーの右クリック→名前を変更(codex/claude同様)。derive_title
             # による自動タイトルはexisting_title優先で上書きされないため
             # (save_session参照)、ここで書き込めばそのまま定着する。
+            # アーカイブ済みセッションでも動くようfind_session_fileで探す。
             body = self._read_body()
             title = str(body.get("title", "")).strip()[:60]
             if not title:
                 self._json({"error": "title is empty"}, 400)
                 return
-            f = HISTORY_DIR / f"{_safe_sid(body.get('sid', ''))}.json"
-            if not f.exists():
+            f = find_session_file(body.get("sid", ""))
+            if f is None:
                 self._json({"error": "not found"}, 404)
                 return
             try:

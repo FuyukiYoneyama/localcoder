@@ -23,6 +23,11 @@ def assistant(content=""):
     return {"role": "assistant", "content": content}
 
 
+def assistant_with_tool(name="list_dir"):
+    return {"role": "assistant", "content": "",
+            "tool_calls": [{"function": {"name": name, "arguments": {}}}]}
+
+
 class TestDedupeToolResults(unittest.TestCase):
     def test_keeps_latest_occurrence_only(self):
         big = "X" * 600
@@ -159,18 +164,20 @@ class TestExtractOriginalUserGoal(unittest.TestCase):
     """
 
     def test_returns_first_user_message_verbatim(self):
-        msgs = [user("PicoCalc向けエディタを作ってください"), assistant("了解")]
+        msgs = [user("PicoCalc向けエディタを作ってください"), assistant("了解"),
+                assistant_with_tool()]
         self.assertEqual(s.extract_original_user_goal(msgs),
                          "PicoCalc向けエディタを作ってください")
 
     def test_skips_empty_and_nudge_messages(self):
         msgs = [user(s.EMPTY_RESPONSE_NUDGE), user(s.UNFINISHED_RESPONSE_NUDGE),
-                user("   "), user("本物の最初の指示")]
+                user("   "), user("本物の最初の指示"), assistant_with_tool()]
         self.assertEqual(s.extract_original_user_goal(msgs), "本物の最初の指示")
 
     def test_skips_existing_compaction_markers(self):
         marker = s.build_marker("要約", [], [], "以前のゴール")
-        msgs = [{"role": "user", "content": marker}, user("新しい実質的な発言")]
+        msgs = [{"role": "user", "content": marker}, user("新しい実質的な発言"),
+                assistant_with_tool()]
         self.assertEqual(s.extract_original_user_goal(msgs), "新しい実質的な発言")
 
     def test_returns_none_when_no_real_user_message(self):
@@ -179,10 +186,45 @@ class TestExtractOriginalUserGoal(unittest.TestCase):
 
     def test_truncates_very_long_original_message(self):
         long_text = "x" * (s.GOAL_MAX_CHARS + 500)
-        msgs = [user(long_text)]
+        msgs = [user(long_text), assistant_with_tool()]
         goal = s.extract_original_user_goal(msgs)
         self.assertLessEqual(len(goal), s.GOAL_MAX_CHARS + 100)
         self.assertTrue(goal.startswith("x" * 100))
+
+    def test_skips_greeting_that_never_triggered_tool_calls(self):
+        """実障害: 最初の発言が単なる挨拶(こんにちは)で、その後に本題が
+        別ターンとして続いた。挨拶はツール呼び出しを一切伴わなかったのに
+        そのまま不変のゴールとして確定してしまい、方針再評価が「挨拶への
+        進捗がない」という誤った理由で本題の実質的な作業(69回のツール
+        呼び出し)を打ち切り、無関係なファイルに挨拶文字列を書いて
+        「ゴール達成」と誤判定する事故につながった。挨拶ターンはゴール
+        候補から除外し、実際にツール呼び出しへつながった発言を選ぶ。"""
+        msgs = [user("こんにちは"), assistant("こんにちは!お手伝いできることは?"),
+                user("PicoCalc向けのテキストビューワーを作ってください"),
+                assistant_with_tool()]
+        self.assertEqual(s.extract_original_user_goal(msgs),
+                         "PicoCalc向けのテキストビューワーを作ってください")
+
+    def test_regression_greeting_before_real_task_fixture(self):
+        """実障害の再発防止(パス匿名化済みの実データ)。最初の発言が挨拶
+        「こんにちは」で、本題(PicoCalcビューワー作成)は2番目のuser発言
+        だった。修正前はこの挨拶がそのまま不変のゴールとして確定し、方針
+        再評価が「'こんにちは'への進捗がない」という理由で69回のツール
+        呼び出しを伴う実質的な作業を打ち切り、無関係な場所に挨拶文字列を
+        書いて「ゴール達成」と誤判定した。"""
+        msgs = load_fixture_messages("greeting_before_real_task.json")
+        goal = s.extract_original_user_goal(msgs)
+        self.assertNotEqual(goal, "こんにちは")
+        self.assertIn("テキストビューワー", goal)
+
+    def test_falls_back_to_first_message_when_nothing_ever_triggered_tool_calls(self):
+        """まだ一度もツール呼び出しに至っていない(=会話がまだ雑談段階)場合は、
+        Noneを返してLLM由来のnew_goal(言い換え)に道を譲るのではなく、
+        機械的な最後の砦として最初の有効な発言をそのまま返す——結果が
+        理想的でなくても、常にLLMの言い換えより安全という設計。"""
+        msgs = [user("こんにちは"), assistant("こんにちは!"),
+                user("元気ですか"), assistant("元気です")]
+        self.assertEqual(s.extract_original_user_goal(msgs), "こんにちは")
 
 
 class TestCompactHistoryGoalImmutability(unittest.TestCase):
