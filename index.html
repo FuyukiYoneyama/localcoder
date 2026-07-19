@@ -120,6 +120,7 @@ footer{display:flex;gap:10px;padding:12px 16px;background:var(--panel);border-to
   <span id="version" title="実行中のserver.pyのgitコミット(先頭7桁)。git logの最新コミットと一致していれば最新版が動いている" style="font-size:11px;color:var(--dim)"></span>
   <label>モデル <select id="model"></select></label>
   <span id="visionBadge" style="font-size:12px;color:var(--dim)"></span>
+  <span id="cloudBadge" title="モデル名が:cloudで終わる場合、Ollama自体がその実処理を外部のクラウドへプロキシする(README.md参照)。完全ローカルで完結させたいなら:cloudの付かないモデルを選ぶこと" style="font-size:12px;color:var(--dim)"></span>
   <label>作業フォルダ <input type="text" id="workspace" placeholder="/home/youruser/project"></label>
   <button id="browseBtn" title="フォルダを選ぶ">📁 参照</button>
   <button id="newBtn">＋ 新規チャット</button>
@@ -213,6 +214,17 @@ function updateVisionBadge(){
   if(!name){badge.textContent="";return}
   badge.textContent=MODEL_VISION[name]?"👁 画像対応":"🚫 画像非対応";
 }
+function updateCloudBadge(){
+  // :cloudサフィックスのモデルは、Ollama自体がその実処理を外部クラウドへ
+  // プロキシする(README.md参照)。選ぶ前に気づけるよう、選択中のモデル名
+  // だけを見て判定する(サーバー問い合わせ不要)。
+  const name=$("model").value;
+  const badge=$("cloudBadge");
+  if(!name){badge.textContent="";badge.style.color="";return}
+  const isCloud=name.endsWith(":cloud");
+  badge.textContent=isCloud?"☁ クラウド(外部送信)":"🔒 完全ローカル";
+  badge.style.color=isCloud?"var(--red)":"var(--dim)";
+}
 async function loadModels(){
   try{
     const r=await fetch("/api/models"); const d=await r.json();
@@ -223,6 +235,7 @@ async function loadModels(){
     const pref=["gpt-oss:20b","glm-4.7-flash:latest","qwen3:8b"];
     for(const p of pref){if(names.includes(p)){sel.value=p;break}}
     updateVisionBadge();
+    updateCloudBadge();
   }catch(e){el("div","err","サーバに接続できません: "+e)}
 }
 async function loadSelfCheck(){
@@ -260,6 +273,7 @@ async function downloadDiagnosticBundle(){
   }catch(e){el("div","err","診断パッケージの生成に失敗: "+e)}
 }
 $("model").addEventListener("change",updateVisionBadge);
+$("model").addEventListener("change",updateCloudBadge);
 
 // ---------- 履歴サイドバー ----------
 // 通常一覧の「✕」は削除ではなくアーカイブ(history/archived/へ移動するだけ、
@@ -358,6 +372,7 @@ async function openSession(id){
     const sel=$("model");
     if(d.model&&[...sel.options].some(o=>o.value===d.model))sel.value=d.model;
     updateVisionBadge();
+    updateCloudBadge();
     renderHistory(history,d.turns);
     loadSessions();
   }catch(e){el("div","err","履歴の読み込みに失敗: "+e)}
