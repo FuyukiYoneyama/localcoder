@@ -502,6 +502,63 @@ class TestBuildReviewContext(unittest.TestCase):
         self.assertIn("不一致の有無が確定する", ctx)
         self.assertIn("ツール呼び出し: 4回", ctx)
 
+    def test_read_file_result_is_not_reduced_to_first_line(self):
+        """実障害: CMakeLists.txtの1行目は`cmake_minimum_required(...)`という
+        定型句で、project()/add_executable等の実質的な内容は後続行にあった。
+        従来は結果の1行目(80文字まで)しか渡していなかったため、reviewが
+        「まだcmake_minimum_requiredしか無い」と誤診断し、ADJUST判定が
+        8回連続で続いてモデルが既に書いた内容を無駄に書き直し続けた。"""
+        content = ("cmake_minimum_required(VERSION 3.13)\n"
+                   "project(text_viewer)\n"
+                   "add_executable(text_viewer main.c)\n")
+        msgs = [
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"function": {"name": "read_file", "arguments": {"path": "CMakeLists.txt"}}}]},
+            {"role": "tool", "content": content},
+        ]
+        st = s.ReviewState(turn_started_at=1000)
+        ctx = s.build_review_context(msgs, st, now=1010)
+        self.assertIn("add_executable", ctx)
+        self.assertIn("project(text_viewer)", ctx)
+
+    def test_read_file_cache_hit_notice_still_shown_as_one_line(self):
+        """差分中心の再読(§6.3)の短い「変わっていません」通知は、既に十分
+        短い一行なので従来通りそのまま表示する(文字数/行数プレフィックスを
+        付けない)。"""
+        notice = "(内容は前回read_fileした時から変わっていません。SHA256=abc、100文字。前回の内容をそのまま参照してください)"
+        msgs = [
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"function": {"name": "read_file", "arguments": {"path": "a.txt"}}}]},
+            {"role": "tool", "content": notice},
+        ]
+        st = s.ReviewState(turn_started_at=1000)
+        ctx = s.build_review_context(msgs, st, now=1010)
+        self.assertIn(notice, ctx)
+        self.assertNotIn("文字/", ctx)  # 独自の文字数/行数プレフィックスは付かない
+
+    def test_read_file_error_result_still_shown_as_one_line(self):
+        msgs = [
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"function": {"name": "read_file", "arguments": {"path": "missing.txt"}}}]},
+            {"role": "tool", "content": "ERROR: file not found: missing.txt"},
+        ]
+        st = s.ReviewState(turn_started_at=1000)
+        ctx = s.build_review_context(msgs, st, now=1010)
+        self.assertIn("ERROR: file not found: missing.txt", ctx)
+
+    def test_other_tools_still_use_first_line_only(self):
+        """read_file以外(例: write_file)は従来通り1行目(80文字まで)のまま。"""
+        msgs = [
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"function": {"name": "write_file",
+                              "arguments": {"path": "a.txt", "content": "x"}}}]},
+            {"role": "tool", "content": "OK: wrote 1 chars to /ws/a.txt\nsome extra line"},
+        ]
+        st = s.ReviewState(turn_started_at=1000)
+        ctx = s.build_review_context(msgs, st, now=1010)
+        self.assertIn("OK: wrote 1 chars to /ws/a.txt", ctx)
+        self.assertNotIn("some extra line", ctx)
+
 
 class TestErrorSignature(unittest.TestCase):
     """同種エラーの反復検知(§11.4)用のエラー署名正規化。"""

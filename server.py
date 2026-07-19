@@ -2789,7 +2789,20 @@ def build_review_context(messages: list, state: ReviewState,
     recent = []
     for name, args, result in _iter_tool_calls_with_results(messages):
         a = json.dumps(args, ensure_ascii=False)[:100]
-        r = (result or "").splitlines()[0][:80] if result else "(結果なし)"
+        if not result:
+            r = "(結果なし)"
+        elif name == "read_file" and not result.startswith(("ERROR", "(", "OK")):
+            # read_fileの生の中身は先頭行だけでは代表性が無い(例: CMakeLists.txtの
+            # 1行目は大抵cmake_minimum_requiredのような定型句で、project()や
+            # add_executable等の実質的な内容は後続行にある)。改行を空白に潰して
+            # より広い範囲を1行に収め、先頭行だけを見て「進捗が無い」と誤診断
+            # するのを防ぐ(実例: この誤診断がADJUST判定を連発させ、モデルが
+            # 既に書いた内容を無駄に書き直し続けるループの原因になっていた)。
+            n_chars, n_lines = len(result), result.count("\n") + 1
+            preview = " ".join(result.split())[:150]
+            r = f"({n_chars}文字/{n_lines}行) {preview}"
+        else:
+            r = result.splitlines()[0][:80]
         recent.append(f"  - {name} {a} → {r}")
     if recent:
         lines.append("直近のツール呼び出し:")
