@@ -183,5 +183,206 @@ class TestExecToolStillWorksAsThinWrapper(unittest.TestCase):
         self.assertIn("変わっていません", result)
 
 
+class TestResolvePathBoundary(unittest.TestCase):
+    """resolve_pathのboundary引数(読み取りは広く・書き込みは狭く、の実現手段)。"""
+
+    def test_boundary_none_behaves_like_before(self):
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d)
+            (ws / "sub").mkdir()
+            result = s.resolve_path(ws, "sub/a.txt")
+        self.assertEqual(result, (ws / "sub" / "a.txt").resolve())
+
+    def test_path_inside_boundary_is_allowed(self):
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d)
+            sub = ws / "sub"
+            sub.mkdir()
+            result = s.resolve_path(ws, "sub/a.txt", boundary=sub)
+        self.assertEqual(result, (sub / "a.txt").resolve())
+
+    def test_path_outside_boundary_but_inside_ws_is_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d)
+            sub = ws / "sub"
+            sub.mkdir()
+            with self.assertRaises(ValueError):
+                s.resolve_path(ws, "other.txt", boundary=sub)
+
+    def test_boundary_equal_to_path_itself_is_allowed(self):
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d)
+            sub = ws / "sub"
+            sub.mkdir()
+            result = s.resolve_path(ws, "sub", boundary=sub)
+        self.assertEqual(result, sub.resolve())
+
+
+class TestWriteRootRestriction(unittest.TestCase):
+    """write_root(IMPROVEMENTS.md記載の読み取り広く・書き込み狭くの実装)の
+    ツール単位の挙動確認。read系は常にws全体、write系だけがwrite_rootに従う。"""
+
+    def _ctx(self, ws, write_root=None):
+        return s.ToolContext(ws=ws, write_root=write_root)
+
+    def test_write_file_outside_write_root_is_rejected(self):
+        provider = s.BuiltinToolProvider()
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d)
+            sub = ws / "sub"
+            sub.mkdir()
+            ctx = self._ctx(ws, write_root=sub)
+            result = provider.call_tool("write_file", {"path": "../outside.txt", "content": "x"}, ctx)
+            self.assertTrue(result.startswith("ERROR:"))
+            self.assertFalse((Path(d) / "outside.txt").exists())
+
+    def test_write_file_inside_write_root_succeeds(self):
+        provider = s.BuiltinToolProvider()
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d)
+            sub = ws / "sub"
+            sub.mkdir()
+            ctx = self._ctx(ws, write_root=sub)
+            result = provider.call_tool("write_file", {"path": "sub/a.txt", "content": "x"}, ctx)
+            self.assertTrue(result.startswith("OK:"))
+            self.assertEqual((sub / "a.txt").read_text(), "x")
+
+    def test_edit_file_outside_write_root_is_rejected(self):
+        provider = s.BuiltinToolProvider()
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d)
+            (ws / "a.txt").write_text("hi")
+            sub = ws / "sub"
+            sub.mkdir()
+            ctx = self._ctx(ws, write_root=sub)
+            result = provider.call_tool(
+                "edit_file", {"path": "a.txt", "old_string": "hi", "new_string": "bye"}, ctx)
+            self.assertTrue(result.startswith("ERROR:"))
+            self.assertEqual((ws / "a.txt").read_text(), "hi")
+
+    def test_list_dir_is_unrestricted_even_with_write_root(self):
+        """list_dir(読み取り系)はwrite_rootが設定されていてもws全体を見られる。"""
+        provider = s.BuiltinToolProvider()
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d)
+            (ws / "outside.txt").write_text("x")
+            sub = ws / "sub"
+            sub.mkdir()
+            ctx = self._ctx(ws, write_root=sub)
+            result = provider.call_tool("list_dir", {"path": "."}, ctx)
+            self.assertIn("outside.txt", result)
+
+    def test_read_file_is_unrestricted_even_with_write_root(self):
+        provider = s.BuiltinToolProvider()
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d)
+            (ws / "outside.txt").write_text("secret")
+            sub = ws / "sub"
+            sub.mkdir()
+            ctx = self._ctx(ws, write_root=sub)
+            result = provider.call_tool("read_file", {"path": "outside.txt"}, ctx)
+            self.assertEqual(result, "secret")
+
+    def test_delete_file_outside_write_root_is_rejected(self):
+        provider = s.BuiltinToolProvider()
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d)
+            (ws / "outside.txt").write_text("x")
+            sub = ws / "sub"
+            sub.mkdir()
+            ctx = self._ctx(ws, write_root=sub)
+            result = provider.call_tool("delete_file", {"path": "outside.txt"}, ctx)
+            self.assertTrue(result.startswith("ERROR:"))
+            self.assertTrue((ws / "outside.txt").exists())
+
+    def test_delete_directory_outside_write_root_is_rejected(self):
+        provider = s.BuiltinToolProvider()
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d)
+            other = ws / "other"
+            other.mkdir()
+            sub = ws / "sub"
+            sub.mkdir()
+            ctx = self._ctx(ws, write_root=sub)
+            result = provider.call_tool("delete_directory", {"path": "other"}, ctx)
+            self.assertTrue(result.startswith("ERROR:"))
+            self.assertTrue(other.is_dir())
+
+    def test_delete_directory_refuses_write_root_itself(self):
+        provider = s.BuiltinToolProvider()
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d)
+            sub = ws / "sub"
+            sub.mkdir()
+            ctx = self._ctx(ws, write_root=sub)
+            result = provider.call_tool("delete_directory", {"path": "sub"}, ctx)
+            self.assertTrue(result.startswith("ERROR:"))
+            self.assertTrue(sub.is_dir())
+
+    def test_copy_file_src_may_come_from_outside_write_root(self):
+        """copy_fileは非対称: srcはws全体から読める(参考実装の取り込みワークフロー)。"""
+        provider = s.BuiltinToolProvider()
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d)
+            (ws / "reference.txt").write_text("template")
+            sub = ws / "sub"
+            sub.mkdir()
+            ctx = self._ctx(ws, write_root=sub)
+            result = provider.call_tool(
+                "copy_file", {"src": "reference.txt", "dst": "sub/copy.txt"}, ctx)
+            self.assertTrue(result.startswith("OK:"))
+            self.assertEqual((sub / "copy.txt").read_text(), "template")
+
+    def test_copy_file_dst_outside_write_root_is_rejected(self):
+        provider = s.BuiltinToolProvider()
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d)
+            (ws / "reference.txt").write_text("template")
+            sub = ws / "sub"
+            sub.mkdir()
+            ctx = self._ctx(ws, write_root=sub)
+            result = provider.call_tool(
+                "copy_file", {"src": "reference.txt", "dst": "copy.txt"}, ctx)
+            self.assertTrue(result.startswith("ERROR:"))
+            self.assertFalse((ws / "copy.txt").exists())
+
+    def test_move_file_src_outside_write_root_is_rejected(self):
+        """move_fileはcopy_fileと違い非対称にしない: srcを取り除く=書き込みの
+        一種なので、srcもwrite_root限定にする。"""
+        provider = s.BuiltinToolProvider()
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d)
+            (ws / "outside.txt").write_text("x")
+            sub = ws / "sub"
+            sub.mkdir()
+            ctx = self._ctx(ws, write_root=sub)
+            result = provider.call_tool(
+                "move_file", {"src": "outside.txt", "dst": "sub/moved.txt"}, ctx)
+            self.assertTrue(result.startswith("ERROR:"))
+            self.assertTrue((ws / "outside.txt").exists())
+            self.assertFalse((sub / "moved.txt").exists())
+
+    def test_move_file_within_write_root_succeeds(self):
+        provider = s.BuiltinToolProvider()
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d)
+            sub = ws / "sub"
+            sub.mkdir()
+            (sub / "a.txt").write_text("x")
+            ctx = self._ctx(ws, write_root=sub)
+            result = provider.call_tool(
+                "move_file", {"src": "sub/a.txt", "dst": "sub/b.txt"}, ctx)
+            self.assertTrue(result.startswith("OK:"))
+            self.assertTrue((sub / "b.txt").exists())
+
+    def test_write_root_none_means_ws_wide_as_before(self):
+        provider = s.BuiltinToolProvider()
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d)
+            ctx = self._ctx(ws, write_root=None)
+            result = provider.call_tool("write_file", {"path": "a.txt", "content": "x"}, ctx)
+            self.assertTrue(result.startswith("OK:"))
+
+
 if __name__ == "__main__":
     unittest.main()

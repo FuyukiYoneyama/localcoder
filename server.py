@@ -637,7 +637,7 @@ def log_thinking(sid: str, iteration: int, thinking: str, content_len: int) -> N
 
 
 def save_session(sid: str, model: str, workspace: str, messages: list,
-                  turn: dict | None = None):
+                  turn: dict | None = None, write_root: str | None = None):
     sid = _safe_sid(sid)
     path = HISTORY_DIR / f"{sid}.json"
     # turns: プロンプト受信〜完了/中断までの時刻ログ。既存ファイルがあれば読み継ぐ
@@ -660,7 +660,7 @@ def save_session(sid: str, model: str, workspace: str, messages: list,
     title = existing_title or derive_title(messages)
     data = {"sid": sid, "schema_version": SCHEMA_VERSION, "title": title[:60],
             "updated_at": time.time(), "model": model, "workspace": workspace,
-            "messages": messages, "turns": turns}
+            "write_root": write_root, "messages": messages, "turns": turns}
     path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
 
 
@@ -697,12 +697,19 @@ def find_session_file(sid: str) -> Path | None:
     return None
 
 
-def resolve_path(ws: Path, p: str) -> Path:
+def resolve_path(ws: Path, p: str, boundary: Path | None = None) -> Path:
+    """パスをws基準で解決し、boundary(省略時はws自身)の外なら拒否する。
+
+    boundaryは「読み取りは広く(ws全体)・書き込みは狭く(wsの部分木)」を
+    実現するために使う(書き込み系ツールだけboundary=write_rootを渡す)。
+    パスの表記(相対/絶対の解釈)自体は常にws基準のまま変えない——狭くなるのは
+    許可される場所だけで、モデルがパスを書く基準は変わらない。
+    """
     full = Path(p) if os.path.isabs(p) else ws / p
     full = full.resolve()
-    ws = ws.resolve()
-    if not (str(full) == str(ws) or str(full).startswith(str(ws) + os.sep)):
-        raise ValueError(f"path is outside the workspace: {p}")
+    boundary = (boundary or ws).resolve()
+    if not (str(full) == str(boundary) or str(full).startswith(str(boundary) + os.sep)):
+        raise ValueError(f"path is outside the allowed area: {p}")
     return full
 
 
@@ -1223,18 +1230,24 @@ class ToolContext:
     する。将来MCPツールプロバイダを追加する際も同じ形で渡せる。
     """
     __slots__ = ("ws", "cancel", "model", "pending_images", "sid", "call_id",
-                 "messages", "txn")
+                 "messages", "txn", "write_root")
 
     def __init__(self, ws: Path, cancel=None, model: str | None = None,
                  pending_images: list | None = None, sid: str | None = None,
                  call_id: str | None = None, messages: list | None = None,
-                 txn: Transaction | None = None):
+                 txn: Transaction | None = None, write_root: Path | None = None):
         self.ws = ws
         self.cancel = cancel
         self.model = model
         self.pending_images = pending_images
         self.sid = sid
         self.call_id = call_id
+        # 書き込み系ツールだけをwsより狭い範囲に絞るための追加境界(省略時は
+        # wsそのもの=従来通り)。読み取り系ツール(read_file/list_dir/
+        # view_image)には適用しない——「読み取りは広く、書き込みは狭く」を
+        # 実現するため(ユーザー要望: workspace全体は読ませたいが、成果物の
+        # 書き込み場所は特定のサブフォルダに限定したい)。
+        self.write_root = write_root
         # 差分中心の再読(IMPROVEMENTS.md §6.3)用。read_fileが「同じパスを前回
         # 読んだ時と内容が変わっていないか」を調べるために会話履歴を参照する。
         # Noneなら(exec_toolの既存呼び出し元・テスト等)チェックを単純に省略する。
@@ -1268,6 +1281,7 @@ class BuiltinToolProvider:
 
     def call_tool(self, name: str, args: dict, ctx: ToolContext) -> str:
         ws, cancel, model = ctx.ws, ctx.cancel, ctx.model
+        write_root = ctx.write_root
         pending_images = ctx.pending_images
         try:
             if name == "run_command":
@@ -1304,7 +1318,7 @@ class BuiltinToolProvider:
                                 "参照してください)")
                 return t
             if name == "write_file":
-                f = resolve_path(ws, args["path"])
+                f = resolve_path(ws, args["path"], boundary=write_root)
                 if in_ledger_area(ws, f):
                     return ("ERROR: .localcoder/ is LocalCoder's transaction ledger "
                             "and must not be modified by tools")
@@ -1319,7 +1333,7 @@ class BuiltinToolProvider:
                 # 進み、最終的に無関係な別の相対パス誤りでスタックした)。
                 return f"OK: wrote {len(args['content'])} chars to {f}"
             if name == "edit_file":
-                f = resolve_path(ws, args["path"])
+                f = resolve_path(ws, args["path"], boundary=write_root)
                 if in_ledger_area(ws, f):
                     return ("ERROR: .localcoder/ is LocalCoder's transaction ledger "
                             "and must not be modified by tools")
@@ -1354,7 +1368,7 @@ class BuiltinToolProvider:
                 body = "\n".join(items)[:8000] or "(empty)"
                 return f"{f}:\n{body}"
             if name == "delete_file":
-                f = resolve_path(ws, args["path"])
+                f = resolve_path(ws, args["path"], boundary=write_root)
                 if in_ledger_area(ws, f):
                     return "ERROR: .localcoder/ is LocalCoder's ledger and cannot be deleted"
                 if f.is_dir():
@@ -1366,20 +1380,25 @@ class BuiltinToolProvider:
                 f.unlink()
                 return f"OK: deleted {f} (reversible for this turn)"
             if name == "delete_directory":
-                f = resolve_path(ws, args["path"])
+                f = resolve_path(ws, args["path"], boundary=write_root)
                 if in_ledger_area(ws, f):
                     return "ERROR: .localcoder/ is LocalCoder's ledger and cannot be deleted"
                 if not f.is_dir():
                     return f"ERROR: directory not found: {args['path']}"
-                if f.resolve() == ws.resolve():
+                if f.resolve() == (write_root or ws).resolve():
                     return "ERROR: refusing to delete the workspace root itself"
                 if ctx.txn is not None:
                     ctx.txn.record_delete(f)
                 shutil.rmtree(f)
                 return f"OK: deleted directory {f} and its contents (reversible for this turn)"
             if name in ("move_file", "copy_file"):
-                src = resolve_path(ws, args["src"])
-                dst = resolve_path(ws, args["dst"])
+                # copy_fileのsrcだけは読み取り境界(ws全体)のまま許可する。
+                # 参考実装をwrite_root外からコピーしてくる既存ワークフローを
+                # 壊さないため(§write_root設計)。move_fileはsrcを取り除く=
+                # 実質的な書き込み操作なので両端ともwrite_root限定にする。
+                src_boundary = write_root if name == "move_file" else None
+                src = resolve_path(ws, args["src"], boundary=src_boundary)
+                dst = resolve_path(ws, args["dst"], boundary=write_root)
                 if in_ledger_area(ws, src) or in_ledger_area(ws, dst):
                     return "ERROR: .localcoder/ is LocalCoder's ledger and cannot be a move/copy target"
                 if not src.is_file():
@@ -1657,14 +1676,16 @@ def _provider_for_tool(name: str) -> ToolProvider | None:
 def exec_tool(name: str, args: dict, ws: Path, cancel=None, model: str | None = None,
               pending_images: list | None = None, sid: str | None = None,
               call_id: str | None = None, messages: list | None = None,
-              txn: Transaction | None = None) -> str:
+              txn: Transaction | None = None, write_root: Path | None = None) -> str:
     """後方互換の薄いエントリポイント。実際のディスパッチはToolProvider経由で行う
     (IMPROVEMENTS.md §13.2)。呼び出し側(handle_chat)・既存テストの引数はそのまま。
     messagesは差分中心の再読(§6.3)用、txnは可逆操作レイヤー
     (REVERSIBLE_OPERATIONS.md)用の追加引数で、省略時は従来通り動作する。
+    write_rootは書き込み系ツールをwsより狭い範囲に絞る追加引数(省略時はws全体)。
     """
     ctx = ToolContext(ws=ws, cancel=cancel, model=model, pending_images=pending_images,
-                      sid=sid, call_id=call_id, messages=messages, txn=txn)
+                      sid=sid, call_id=call_id, messages=messages, txn=txn,
+                      write_root=write_root)
     provider = _provider_for_tool(name)
     if provider is None:
         return f"ERROR: unknown tool {name}"
@@ -3339,10 +3360,39 @@ class Handler(BaseHTTPRequestHandler):
                        "message": f"ワークスペースは {roots} 配下のみ指定できます: {ws}"})
             return
 
+        # write_root(省略可): 読み取りはws全体のまま、書き込み系ツール
+        # (write_file/edit_file/delete_file/delete_directory/move_file/
+        # copy_fileのdst)だけをwsの部分木に限定するための追加境界。
+        # 未指定ならNoneのままでexec_tool/resolve_pathがws全体を許可する
+        # 従来通りの挙動になる。
+        write_root: Path | None = None
+        write_root_str = body.get("write_root")
+        if write_root_str:
+            try:
+                write_root = resolve_path(ws, write_root_str)
+            except ValueError:
+                self._sse({"type": "error",
+                           "message": f"書き込み範囲がワークスペース外です: {write_root_str}"})
+                return
+            if not write_root.is_dir():
+                self._sse({"type": "error",
+                           "message": f"書き込み範囲のフォルダが存在しません: {write_root}"})
+                return
+
         # ツール一覧は組み込み+接続済みMCPサーバーの合算(リクエスト開始時に1回
         # だけ確定させ、ターン途中で増減しないようにする)。MCP未設定ならTOOLSと同じ。
         tools = all_tools()
         sys_prompt = SYSTEM_PROMPT.format(ws=ws)
+        if write_root is not None:
+            # モデルがwsの他の場所に書き込もうとして失敗する前に、狭い書き込み
+            # 許可範囲を明示しておく(read_file/list_dirはws全体のまま読める)。
+            sys_prompt += (
+                f"\n\nWrite restriction: although you may read anywhere under "
+                f"{ws}, all write-type tools (write_file, edit_file, delete_file, "
+                f"delete_directory, move_file, and copy_file's destination) are "
+                f"restricted to {write_root}. copy_file's source may still be read "
+                f"from anywhere under {ws}. Attempts to write outside "
+                f"{write_root} will fail.")
         mcp_lines = []
         for provider in TOOL_PROVIDERS:
             if isinstance(provider, McpToolProvider):
@@ -3516,7 +3566,8 @@ class Handler(BaseHTTPRequestHandler):
                     result = exec_tool(name, args, ws, ev, model=model,
                                        pending_images=pending_images,
                                        sid=sid, call_id=tc.get("id"),
-                                       messages=messages, txn=txn)
+                                       messages=messages, txn=txn,
+                                       write_root=write_root)
                     diag_tool_call_count += 1
                     diag_tool_exec_seconds += time.time() - _tool_started
                     self._sse({"type": "tool_end", "name": name,
@@ -3659,7 +3710,8 @@ class Handler(BaseHTTPRequestHandler):
                     "review_json_retry_count": rev.json_retries}
             if len(messages) > 1:
                 try:
-                    save_session(sid, model, str(ws), messages[1:], turn=turn)
+                    save_session(sid, model, str(ws), messages[1:], turn=turn,
+                                 write_root=(str(write_root) if write_root else None))
                 except Exception:
                     pass
 
