@@ -30,6 +30,24 @@ def valid_continue():
     }
 
 
+class TestReviewStateCompactionCount(unittest.TestCase):
+    def test_note_compaction_increments_total(self):
+        st = s.ReviewState(turn_started_at=0)
+        st.note_compaction()
+        st.note_compaction()
+        self.assertEqual(st.total_compactions, 2)
+
+    def test_total_compactions_survives_note_review(self):
+        """他の圧縮由来カウンタ(compacted_since_review等)はnote_reviewで
+        リセットされるが、total_compactionsはターン全体の累計なのでリセット
+        しない。"""
+        st = s.ReviewState(turn_started_at=0)
+        st.note_compaction()
+        st.note_review(valid_continue(), ["no_progress"])
+        st.note_compaction()
+        self.assertEqual(st.total_compactions, 2)
+
+
 class TestReviewStateProgress(unittest.TestCase):
     def test_mutating_tool_success_is_progress(self):
         st = s.ReviewState(turn_started_at=0)
@@ -558,6 +576,31 @@ class TestBuildReviewContext(unittest.TestCase):
         ctx = s.build_review_context(msgs, st, now=1010)
         self.assertIn("OK: wrote 1 chars to /ws/a.txt", ctx)
         self.assertNotIn("some extra line", ctx)
+
+    def test_shows_compaction_count(self):
+        st = s.ReviewState(turn_started_at=1000)
+        st.note_compaction()
+        ctx = s.build_review_context([], st, now=1010)
+        self.assertIn("このターンでの文脈圧縮(要約)回数: 1", ctx)
+
+    def test_warns_when_compacted_three_or_more_times(self):
+        """圧縮を重ねるほど「要約の要約」化で情報が薄まりうるため、3回以上で
+        reviewに注意喚起する(海外の類似エージェントに関する研究知見を踏まえた
+        追加)。"""
+        st = s.ReviewState(turn_started_at=1000)
+        for _ in range(3):
+            st.note_compaction()
+        ctx = s.build_review_context([], st, now=1010)
+        self.assertIn("このターンでの文脈圧縮(要約)回数: 3", ctx)
+        self.assertIn("要約の要約", ctx)
+
+    def test_no_compaction_warning_below_three(self):
+        st = s.ReviewState(turn_started_at=1000)
+        st.note_compaction()
+        st.note_compaction()
+        ctx = s.build_review_context([], st, now=1010)
+        self.assertIn("このターンでの文脈圧縮(要約)回数: 2", ctx)
+        self.assertNotIn("要約の要約", ctx)
 
 
 class TestErrorSignature(unittest.TestCase):

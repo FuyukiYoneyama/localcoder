@@ -2417,6 +2417,11 @@ class ReviewState:
         self.same_tool_failure_count = 0
         self.compacted_since_review = False
         self.tools_after_compaction = 0
+        self.total_compactions = 0  # このターン内の圧縮回数の累計(リセットしない)。
+                                     # 圧縮=要約の生成であり、重ねるほど「要約の要約」化が
+                                     # 進んで内容が薄まりうる(海外の類似エージェントの知見)。
+                                     # reviewが今の文脈がどれだけ圧縮を経ているか把握できる
+                                     # ようbuild_review_contextに渡す。
         self.empty_response_recovered = False
         self.unchanged_reread_count = 0
         self.reviews_done = 0       # 採用された再評価の数
@@ -2462,6 +2467,7 @@ class ReviewState:
     def note_compaction(self) -> None:
         self.compacted_since_review = True
         self.tools_after_compaction = 0
+        self.total_compactions += 1
 
     def note_empty_recovery(self, compacted: bool = True) -> None:
         """空応答からの自動回復時に呼ぶ。§11.6が空応答回復に+3点を与えるのは
@@ -2820,6 +2826,11 @@ def build_review_context(messages: list, state: ReviewState,
     lines.append(f"  - 進捗イベントなしのツール呼び出し: {state.tools_since_last_progress}")
     lines.append(f"  - 内容が変わっていない同一ファイルの再読: {state.unchanged_reread_count}")
     lines.append(f"  - 同一ツール呼び出しの連続失敗: {state.same_tool_failure_count}")
+    lines.append(f"  - このターンでの文脈圧縮(要約)回数: {state.total_compactions}")
+    if state.total_compactions >= 3:
+        lines.append("    → 3回以上圧縮されている。圧縮のたびに古い文脈が要約に置き換わり"
+                     "「要約の要約」化が進むため、現在の文脈だけでは判断できない事実が"
+                     "失われている可能性がある。断定的な「進捗が無い」判定には慎重になること。")
     top_err = state.top_error_signature()
     if top_err:
         lines.append(f"  - 最多の同種エラー: {top_err[1]}回 「{top_err[0]}」")
